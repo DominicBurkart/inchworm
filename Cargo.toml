@@ -1,0 +1,10 @@
+[package]
+name = "inchworm"
+version = "0.1.0"
+edition = "2024"
+description = "local coding agent orchestrator"
+license = "MIT OR Apache-2.0"
+authors = ["Dominic Burkart"]
+repository = "https://github.com/DominicBurkart/inchworm"
+
+[dependencies]
