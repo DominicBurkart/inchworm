@@ -9,6 +9,7 @@ repository = "https://github.com/DominicBurkart/inchworm"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.149"
 thiserror = "2.0.21"
 toml = "1.1.8"
 

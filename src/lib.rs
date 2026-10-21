@@ -7,6 +7,7 @@ pub mod github;
 pub mod identities;
 pub mod journeys;
 pub mod nanna;
+pub mod nanna_mcp;
 pub mod offramp;
 pub mod path;
 pub mod registry;
