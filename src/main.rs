@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use inchworm::config::{CONFIG_FILE, Config};
+use inchworm::daemon::{Daemon, SystemClock};
 use inchworm::registry::Registry;
 
 const USAGE: &str = "usage: inchworm <command> [dir]
@@ -11,7 +14,8 @@ commands:
   check [dir]       validate dir/inchworm.toml
   register [dir]    register dir with the user-level daemon
   unregister [dir]  remove dir from the registry
-  list              list registered directories";
+  list              list registered directories
+  daemon [--once]   run the daemon loop (--once: a single pass)";
 
 fn run(args: &[String]) -> Result<(), String> {
     let dir = || PathBuf::from(args.get(1).map_or(".", String::as_str));
@@ -55,6 +59,26 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("list") => {
             for d in registry()?.list().map_err(|e| e.to_string())? {
                 println!("{}", d.display());
+            }
+        }
+        Some("daemon") => {
+            let once = match args.get(1).map(String::as_str) {
+                None => false,
+                Some("--once") => true,
+                Some(_) => return Err(USAGE.into()),
+            };
+            // No journeys are wired yet; the loop just tracks registered dirs.
+            let mut daemon = Daemon::new(registry()?, vec![]);
+            let stop = Arc::new(AtomicBool::new(false));
+            if once {
+                daemon.tick(&stop);
+            } else {
+                let flag = stop.clone();
+                ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
+                    .map_err(|e| e.to_string())?;
+                eprintln!("inchworm daemon started");
+                daemon.run(&SystemClock, &stop);
+                eprintln!("inchworm daemon stopped");
             }
         }
         _ => return Err(USAGE.into()),
