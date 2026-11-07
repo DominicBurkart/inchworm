@@ -8,3 +8,8 @@ authors = ["Dominic Burkart"]
 repository = "https://github.com/DominicBurkart/inchworm"
 
 [dependencies]
+
+[dev-dependencies.cargo-husky]
+version = "1"
+default-features = false
+features = ["user-hooks"]

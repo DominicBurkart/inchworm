@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --doc
+cargo test --all-features
+cargo audit
+cargo deny check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+review="$(mktemp)"
+trap 'rm -f "$review"' EXIT
+git diff --cached | claude "You are a security engineer. Review the code being committed to determine if it can be committed/pushed. Does this commit leak any secrets, tokens, sensitive internals, or PII? Your response MUST start with exactly 'VERDICT: SAFE' or 'VERDICT: UNSAFE'. If UNSAFE, follow with a list of problems to fix before the commit can be completed." | tee "$review"
+if grep -qi "^VERDICT: UNSAFE" "$review"; then
+    echo "Security issues found above. Please fix before committing."
+    exit 1
+fi
+
+"$(git rev-parse --show-toplevel)/scripts/coverage-no-regression.sh" main
