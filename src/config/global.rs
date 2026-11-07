@@ -10,6 +10,11 @@ pub enum GlobalConfigError {
     Parse(#[from] toml::de::Error),
     #[error("{0}")]
     Invalid(String),
+    #[error("cannot read {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +104,21 @@ impl GlobalConfig {
         let config: GlobalConfig = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn load(path: &Path, home: &Path) -> Result<GlobalConfig, GlobalConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| GlobalConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(GlobalConfig::parse(&text)?.expanded(home))
+    }
+
+    pub fn default_path(xdg_config_home: Option<&Path>, home: &Path) -> PathBuf {
+        match xdg_config_home {
+            Some(xdg) if xdg.is_absolute() => xdg.join("inchworm/config.toml"),
+            _ => home.join(".config/inchworm/config.toml"),
+        }
     }
 
     pub fn validate(&self) -> Result<(), GlobalConfigError> {
@@ -263,6 +283,42 @@ path = "~/code/nanna-coder"
             PathBuf::from("~other/x")
         );
         assert_eq!(expand(Path::new("/a/~/b"), home), PathBuf::from("/a/~/b"));
+    }
+
+    #[test]
+    fn load_reads_and_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, FULL).unwrap();
+        let config = GlobalConfig::load(&path, Path::new("/home/me")).unwrap();
+        assert_eq!(
+            config.repo[1].path,
+            PathBuf::from("/home/me/code/nanna-coder")
+        );
+        let missing = GlobalConfig::load(&dir.path().join("nope.toml"), Path::new("/h"));
+        assert!(matches!(missing, Err(GlobalConfigError::Io { .. })));
+        std::fs::write(&path, "garbage = [").unwrap();
+        assert!(matches!(
+            GlobalConfig::load(&path, Path::new("/h")),
+            Err(GlobalConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn default_path_prefers_an_absolute_xdg_dir() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            GlobalConfig::default_path(Some(Path::new("/xdg")), home),
+            PathBuf::from("/xdg/inchworm/config.toml")
+        );
+        assert_eq!(
+            GlobalConfig::default_path(Some(Path::new("relative")), home),
+            PathBuf::from("/home/me/.config/inchworm/config.toml")
+        );
+        assert_eq!(
+            GlobalConfig::default_path(None, home),
+            PathBuf::from("/home/me/.config/inchworm/config.toml")
+        );
     }
 
     proptest! {
