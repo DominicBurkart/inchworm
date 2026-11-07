@@ -16,9 +16,11 @@ CREATE TABLE runs (
     flow TEXT NOT NULL,
     state TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE (repo, issue, flow)
+    updated_at INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX runs_one_open_per_issue
+    ON runs (repo, issue, flow)
+    WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging');
 CREATE TABLE attempts (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -409,6 +411,49 @@ mod tests {
         assert!(store.enqueue_run("o/r", 2, "issue", 11).unwrap().is_some());
         assert!(store.enqueue_run("o/x", 1, "issue", 11).unwrap().is_some());
         assert_eq!(store.run(id).unwrap().state, RunState::Queued);
+    }
+
+    #[test]
+    fn a_finished_issue_can_be_enqueued_again_but_an_open_one_cannot() {
+        let (store, first) = store_with_run();
+        store.set_run_state(first, RunState::Running, 11).unwrap();
+        assert!(store.enqueue_run("o/r", 1, "issue", 12).unwrap().is_none());
+        for state in [RunState::AwaitingCi, RunState::Judging] {
+            store.set_run_state(first, state, 13).unwrap();
+            assert!(store.enqueue_run("o/r", 1, "issue", 14).unwrap().is_none());
+        }
+        store.set_run_state(first, RunState::Failed, 15).unwrap();
+
+        let second = store.enqueue_run("o/r", 1, "issue", 16).unwrap().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(store.run(first).unwrap().state, RunState::Failed);
+        assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, second);
+        assert!(store.enqueue_run("o/r", 1, "issue", 17).unwrap().is_none());
+    }
+
+    #[test]
+    fn every_terminal_state_allows_a_rerun() {
+        for terminal in [
+            RunState::PrOpen,
+            RunState::Merged,
+            RunState::Escalated,
+            RunState::Failed,
+        ] {
+            let (store, run) = store_with_run();
+            store.set_run_state(run, RunState::Running, 11).unwrap();
+            match terminal {
+                RunState::PrOpen | RunState::Merged => {
+                    store.set_run_state(run, RunState::AwaitingCi, 12).unwrap();
+                    store.set_run_state(run, RunState::Judging, 13).unwrap();
+                }
+                _ => {}
+            }
+            store.set_run_state(run, terminal, 14).unwrap();
+            assert!(
+                store.enqueue_run("o/r", 1, "issue", 15).unwrap().is_some(),
+                "{terminal}"
+            );
+        }
     }
 
     #[test]
