@@ -17,7 +17,7 @@ coverage() {
 
 new="$(coverage "$root")"
 tmp="$(mktemp -d)"
-trap 'git -C "$root" worktree remove --force "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+trap 'git -C "$root" worktree remove --force "$tmp/base" 2>/dev/null || true; rm -rf "$tmp"; git -C "$root" worktree prune' EXIT
 git -C "$root" worktree add --detach -q "$tmp/base" "$base"
 old="$(coverage "$tmp/base")"
 
