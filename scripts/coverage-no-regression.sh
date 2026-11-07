@@ -7,7 +7,12 @@ base="${1:-main}"
 root="$(git rev-parse --show-toplevel)"
 
 coverage() {
-    (cd "$1" && cargo tarpaulin --skip-clean --ignore-tests -q 2>&1 | grep -oP '\d+\.\d+(?=% coverage)' | tail -1) || true
+    local output
+    output="$(cd "$1" && cargo tarpaulin --skip-clean --ignore-tests 2>&1)" || {
+        printf '%s\n' "$output" >&2
+        return 1
+    }
+    printf '%s\n' "$output" | grep -oP '\d+\.\d+(?=% coverage)' | tail -1
 }
 
 new="$(coverage "$root")"
@@ -16,8 +21,6 @@ trap 'git -C "$root" worktree remove --force "$tmp" 2>/dev/null || true; rm -rf 
 git -C "$root" worktree add --detach -q "$tmp/base" "$base"
 old="$(coverage "$tmp/base")"
 
-new="${new:-0}"
-old="${old:-0}"
 if awk -v n="$new" -v o="$old" 'BEGIN { exit !(n >= o) }'; then
     echo "Coverage: ${new}% >= ${old}%"
 else
