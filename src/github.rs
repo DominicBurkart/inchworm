@@ -293,7 +293,7 @@ impl<R: Runner> GitHub for GhCli<R> {
 
     fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError> {
         let number = number.to_string();
-        self.run(&["pr", "diff", &number, "-R", repo, "--patch"])
+        self.run(&["pr", "diff", &number, "-R", repo])
     }
 
     fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
@@ -832,7 +832,7 @@ mod tests {
             gh.runner.calls(),
             [
                 "gh pr view 9 -R o/r --json number,headRefOid,isDraft,state,url",
-                "gh pr diff 9 -R o/r --patch"
+                "gh pr diff 9 -R o/r"
             ]
         );
     }

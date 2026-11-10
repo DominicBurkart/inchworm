@@ -106,6 +106,12 @@ With `--online` it also checks that every step identity resolves with `nanna age
 5. `policy::decide` picks the outcome. `draft_pr`: comment on the issue with the outcome, swap the labels to `inchworm:done`, leave the PR a draft, run ends `pr_open`. `merge_when`: `gh pr ready` then `gh pr merge <n> --match-head-commit <sha> --merge|--squash|--rebase`; never `--admin`; run ends `merged`. A rejection fails the attempt as `judge_rejected` or `merge_blocked` and retries if allowed.
 6. After the last attempt the issue gets `inchworm:failed` and a comment with the failure class.
 
+## Known limitations
+
+- CI is read from check-runs on the head SHA. Legacy commit-status contexts (some coverage bots post those) are not read, so a `required_checks` entry that branch protection satisfies with a status context would wait until the CI timeout and fail as `timeout`.
+- The PR of a rejected attempt stays open, and a merge refused after `gh pr ready` leaves the PR non-draft.
+- The human gate is never consulted.
+
 ## Daemon
 
 `inchworm daemon` polls every `poll_secs`. On start it marks attempts that were still `dispatched` as `orchestrator_lost`, then resumes queued, running, `awaiting_ci` and `judging` runs from the store (published attempts continue from their stored head SHA; a lost dispatch retries if `orchestrator_lost` is in `retry_on`, else the run fails). Each poll lists open issues with the flow's trigger label, creates a run, and swaps `inchworm` for `inchworm:running`. One run is active per repo (FIFO) and the model permit (`concurrency`, default 1) is shared across repos. SIGTERM or ctrl-c stop polling and give an in-flight run 20 seconds; a run still in flight is recovered on the next start. To retry an issue after `inchworm:failed`, add the `inchworm` label again.
