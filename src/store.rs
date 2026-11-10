@@ -254,9 +254,18 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
-        let current = self.schema_version()?;
-        for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-            let tx = self.conn.unchecked_transaction()?;
+        for (index, sql) in MIGRATIONS.iter().enumerate() {
+            if self.schema_version()? > index {
+                continue;
+            }
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if usize::try_from(current).unwrap_or(0) > index {
+                continue;
+            }
             tx.execute_batch(sql)?;
             tx.pragma_update(
                 None,
@@ -915,6 +924,21 @@ mod tests {
             store.attempt(attempt.id).unwrap().failure_class,
             Some(FailureClass::OrchestratorLost)
         );
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_fresh_database_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).map(|s| s.schema_version().unwrap()))
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), MIGRATIONS.len());
+        }
     }
 
     #[test]

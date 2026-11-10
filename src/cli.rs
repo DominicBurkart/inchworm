@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::{FlowFile, GlobalConfig, RepoEntry};
+use crate::daemon::{DaemonDeps, DaemonSettings, NannaFactory, run_daemon};
 use crate::github::GhCli;
 use crate::judges::OllamaClient;
 use crate::model::RunState;
@@ -50,6 +51,10 @@ pub enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         class: Option<String>,
+    },
+    Daemon {
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Run {
         repo: String,
@@ -111,6 +116,41 @@ fn report_command(
 ) -> Result<bool> {
     let store = open_store(config)?;
     print!("{}", report(&store)?);
+    Ok(true)
+}
+
+async fn termination_signal() {
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    match terminate {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+fn daemon_command(
+    config: GlobalConfig,
+    tools: &Tools,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<bool> {
+    drop(open_store(&config)?);
+    let settings = DaemonSettings::from_config(&config);
+    let deps = DaemonDeps {
+        github: Arc::new(GhCli::with_program(tools.gh.as_str())),
+        clock: Arc::new(SystemClock),
+        dispatchers: Arc::new(NannaFactory::new(config.nanna_bin.clone())),
+        scorer: Arc::new(OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_daemon(settings, deps, shutdown))?;
     Ok(true)
 }
 
@@ -234,6 +274,9 @@ pub fn execute(cli: Cli, tools: &Tools) -> Result<bool> {
             report_command(&load_config(config, tools)?, |store| {
                 Ok(render_failures(store, class)?)
             })
+        }
+        Command::Daemon { config } => {
+            daemon_command(load_config(config, tools)?, tools, termination_signal())
         }
         Command::Run {
             repo,
@@ -407,6 +450,14 @@ mod tests {
             store.success_rates(SystemClock.now(), None).unwrap()[0].total,
             2
         );
+    }
+
+    #[test]
+    fn the_daemon_starts_polls_and_stops_on_shutdown() {
+        let env = env();
+        let config = GlobalConfig::load(&env.config, &env.tools.home).unwrap();
+        assert!(daemon_command(config, &env.tools, std::future::ready(())).unwrap());
+        assert!(env.dir.path().join("state/state.db").exists());
     }
 
     #[test]

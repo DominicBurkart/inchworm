@@ -10,7 +10,7 @@ use crate::github::{GitHub, PullRequest};
 use crate::judges::{NannaReport, Scorer, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
 use crate::policy::{CheckConclusion, CheckRun, Decision, HumanGate, PolicyInput, decide};
-use crate::run::RUNNING_LABEL;
+use crate::run::{RUNNING_LABEL, trigger_label};
 use crate::store::{AttemptId, RunId, Store, StoreError};
 
 pub const DONE_LABEL: &str = "inchworm:done";
@@ -372,7 +372,7 @@ pub async fn conclude<S: Scorer>(
             warn_label_comment(
                 ctx,
                 &[DONE_LABEL],
-                &[RUNNING_LABEL],
+                &[RUNNING_LABEL, trigger_label(flow)],
                 &format!(
                     "inchworm outcome `draft_pr` after attempt {}: {} stays a draft at `{sha}`. Required checks are green on that commit. Judges: {}.",
                     published.attempt_n,
@@ -402,7 +402,7 @@ pub async fn conclude<S: Scorer>(
                     warn_label_comment(
                         ctx,
                         &[DONE_LABEL],
-                        &[RUNNING_LABEL],
+                        &[RUNNING_LABEL, trigger_label(flow)],
                         &format!(
                             "inchworm outcome `merge` after attempt {}: merged {} at `{head_sha}` (--match-head-commit). Judges: {}.",
                             published.attempt_n,

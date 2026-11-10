@@ -52,7 +52,7 @@ pub struct RunContext<'a> {
     pub clock: &'a dyn Clock,
 }
 
-fn trigger_label(flow: &Flow) -> &str {
+pub(crate) fn trigger_label(flow: &Flow) -> &str {
     let Trigger::Label { label } = &flow.trigger;
     label
 }
@@ -129,6 +129,7 @@ pub fn enqueue_issue(
 
 fn give_up(
     ctx: &RunContext<'_>,
+    flow: &Flow,
     run_id: RunId,
     issue: u64,
     attempts: u32,
@@ -138,7 +139,13 @@ fn give_up(
     let (class, raw, attempt_n) = failure;
     ctx.store
         .set_run_state(run_id, RunState::Failed, ctx.clock.now())?;
-    relabel(ctx, issue, &[FAILED_LABEL], &[RUNNING_LABEL], &mut warnings);
+    relabel(
+        ctx,
+        issue,
+        &[FAILED_LABEL],
+        &[RUNNING_LABEL, trigger_label(flow)],
+        &mut warnings,
+    );
     note(
         ctx,
         issue,
@@ -323,7 +330,7 @@ pub async fn execute_run<S: Scorer>(
                 let retry = flow.retry_on.contains(class) && attempts < flow.max_attempts;
                 if !retry {
                     let failure = (*class, raw.clone(), *n);
-                    return give_up(ctx, run_id, issue_number, attempts, failure, warnings);
+                    return give_up(ctx, flow, run_id, issue_number, attempts, failure, warnings);
                 }
                 if ctx.store.run(run_id)?.state == RunState::Judging {
                     ctx.store
@@ -356,6 +363,7 @@ pub async fn execute_run<S: Scorer>(
                         )?;
                         return give_up(
                             ctx,
+                            flow,
                             run_id,
                             issue_number,
                             attempts,

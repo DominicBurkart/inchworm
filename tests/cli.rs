@@ -321,3 +321,41 @@ fn run_fails_cleanly_when_nanna_cannot_start_or_flows_are_missing() {
         .code(2)
         .stderr(predicates_contains("cannot read"));
 }
+
+#[test]
+fn daemon_stops_cleanly_on_sigterm() {
+    let fakes = fakes();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("inchworm"))
+        .args(["daemon", "--config"])
+        .arg(&fakes.config)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fakes.bin().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "daemon exited early");
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon ignored SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+}
