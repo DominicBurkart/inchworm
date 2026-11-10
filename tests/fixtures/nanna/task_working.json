@@ -1,0 +1,9 @@
+{
+  "taskId": "task-1",
+  "status": "working",
+  "createdAt": "2026-11-10T10:00:00+00:00",
+  "lastUpdatedAt": "2026-11-10T10:00:05+00:00",
+  "ttl": null,
+  "pollInterval": 1,
+  "statusMessage": "Working (3 iterations completed)."
+}

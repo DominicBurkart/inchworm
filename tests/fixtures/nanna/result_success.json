@@ -1,0 +1,14 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\n  \"result_summary\": \"Added a doc comment to f.\",\n  \"changes_patch\": \"diff --git a/src/lib.rs b/src/lib.rs\\n--- a/src/lib.rs\\n+++ b/src/lib.rs\\n@@ -1 +1,2 @@\\n+/// doc\\n pub fn f() {}\\n\",\n  \"format_patch\": null,\n  \"files_modified\": [\n    \"src/lib.rs\"\n  ],\n  \"tool_calls_made\": [],\n  \"max_effect_class\": \"workspace\",\n  \"denials\": [],\n  \"denial_count\": 0,\n  \"action_audit\": [],\n  \"iterations\": 4,\n  \"model_used\": \"gemma4:e4b\",\n  \"blast_radius\": null,\n  \"qa_summary\": {\n    \"endpoint_runs\": 0,\n    \"endpoint_checks_passed\": 0,\n    \"endpoint_checks_failed\": 0,\n    \"browser_runs\": 0,\n    \"browser_steps_passed\": 0,\n    \"browser_steps_failed\": 0,\n    \"console_errors\": 0,\n    \"artifacts\": []\n  },\n  \"budget\": {}\n}"
+    }
+  ],
+  "isError": false,
+  "_meta": {
+    "io.modelcontextprotocol/related-task": {
+      "taskId": "task-1"
+    }
+  }
+}

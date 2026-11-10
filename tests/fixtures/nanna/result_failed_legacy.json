@@ -1,0 +1,14 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Maximum iterations (100) exceeded\n\n{\n  \"error_type\": \"MaxIterationsExceeded\",\n  \"iterations_completed\": 100,\n  \"last_tool_call\": null,\n  \"partial_changes\": null,\n  \"tool_call_history\": [],\n  \"last_agent_state\": null,\n  \"conversation_snapshot\": null,\n  \"action_audit\": [],\n  \"denials\": []\n}"
+    }
+  ],
+  "isError": true,
+  "_meta": {
+    "io.modelcontextprotocol/related-task": {
+      "taskId": "task-1"
+    }
+  }
+}

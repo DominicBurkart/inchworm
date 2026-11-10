@@ -1,0 +1,19 @@
+{
+  "capabilities": {
+    "tasks": {
+      "cancel": {},
+      "list": {},
+      "requests": {
+        "tools": {
+          "call": {}
+        }
+      }
+    },
+    "tools": {}
+  },
+  "protocolVersion": "2025-11-25",
+  "serverInfo": {
+    "name": "nanna",
+    "version": "0.1.0"
+  }
+}

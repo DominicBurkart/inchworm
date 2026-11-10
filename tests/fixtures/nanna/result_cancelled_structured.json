@@ -1,0 +1,18 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Task was cancelled after 4 iterations."
+    }
+  ],
+  "isError": true,
+  "structuredContent": {
+    "failure_kind": "cancelled",
+    "iterations_completed": 4
+  },
+  "_meta": {
+    "io.modelcontextprotocol/related-task": {
+      "taskId": "task-1"
+    }
+  }
+}

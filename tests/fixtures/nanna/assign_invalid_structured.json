@@ -1,0 +1,7 @@
+{
+  "code": -32602,
+  "message": "Missing required field: identity",
+  "data": {
+    "failure_kind": "invalid_request"
+  }
+}

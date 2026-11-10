@@ -1,0 +1,7 @@
+{
+  "code": -32602,
+  "message": "spawn refused: block: unknown_identity: no identity `nonexistent` in the catalog",
+  "data": {
+    "failure_kind": "spawn_refused"
+  }
+}
