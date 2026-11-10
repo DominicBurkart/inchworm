@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::classify::{classify_outcome, raw_error};
 use crate::config::Flow;
+use crate::judges::NannaReport;
 use crate::model::FailureClass;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskDone, TaskOutcome};
 
@@ -44,6 +45,34 @@ pub struct StepRecord {
     pub identity: String,
     pub summary: String,
     pub files_modified: Vec<String>,
+    pub denial_count: u64,
+    pub qa_ok: Option<bool>,
+}
+
+/// ```
+/// use inchworm::flow::{nanna_report, StepRecord};
+///
+/// let step = |denials, qa_ok| StepRecord {
+///     name: "s".into(), identity: "i".into(), summary: String::new(),
+///     files_modified: vec![], denial_count: denials, qa_ok,
+/// };
+/// let report = nanna_report(&[step(1, Some(true)), step(2, None)]);
+/// assert_eq!((report.denial_count, report.qa_ok), (3, Some(true)));
+/// assert_eq!(nanna_report(&[step(0, Some(true)), step(0, Some(false))]).qa_ok, Some(false));
+/// assert_eq!(nanna_report(&[]).qa_ok, None);
+/// ```
+pub fn nanna_report(steps: &[StepRecord]) -> NannaReport {
+    let qa_ok = if steps.iter().any(|s| s.qa_ok == Some(false)) {
+        Some(false)
+    } else if steps.iter().any(|s| s.qa_ok == Some(true)) {
+        Some(true)
+    } else {
+        None
+    };
+    NannaReport {
+        denial_count: steps.iter().map(|s| s.denial_count).sum(),
+        qa_ok,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -322,6 +351,8 @@ pub fn run_flow(
             identity: step.identity.clone(),
             summary: done.result_summary.clone(),
             files_modified: done.files_modified.clone(),
+            denial_count: done.denial_count as u64,
+            qa_ok: done.qa_ok(),
         });
         forwarded_patch = done
             .changes_patch

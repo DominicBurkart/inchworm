@@ -236,14 +236,14 @@ fn run_dispatches_the_flow_and_records_the_pr() {
         .arg(&fakes.config)
         .assert()
         .success()
-        .stdout(predicates_contains("awaiting_ci after 1 attempt(s)"))
+        .stdout(predicates_contains("pr_open after 1 attempt(s)"))
         .stdout(predicates_contains("pull/9"));
-    let again = inchworm(&fakes)
+    inchworm(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
-        .code(2);
-    again.stderr(predicates_contains("already has a run"));
+        .success()
+        .stdout(predicates_contains("run 2 for o/r#5"));
 }
 
 #[test]

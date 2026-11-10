@@ -1,14 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
+use crate::clock::SystemClock;
 use crate::config::{FlowFile, GlobalConfig, RepoEntry};
 use crate::github::GhCli;
+use crate::judges::OllamaClient;
 use crate::model::RunState;
 use crate::nanna_client::NannaClient;
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
+use crate::outcome::{CiPolicy, OutcomeEnv};
 use crate::run::{RunContext, run_issue};
 use crate::store::Store;
 use crate::validate::validate;
@@ -74,12 +78,7 @@ fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEnt
         .ok_or_else(|| anyhow!("repo `{selector}` is not in the config"))
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
+const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_images: bool) -> bool {
     let report = if online || build_images {
@@ -133,15 +132,24 @@ fn run_command(
         .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
     client.initialize()?;
 
-    let clock = now;
+    let clock = SystemClock;
     let ctx = RunContext {
         store: &store,
         github: &github,
         slug: &repo.slug,
         repo_path: &repo.path,
-        now: &clock,
+        clock: &clock,
     };
-    let summary = run_issue(&ctx, selected, issue, &mut client)?;
+    let scorer = OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT);
+    let env = OutcomeEnv {
+        scorer: &scorer,
+        model_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        ci: CiPolicy::default(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let summary = runtime.block_on(run_issue(&ctx, &env, selected, issue, &mut client))?;
     println!(
         "run {} for {}#{issue}: {} after {} attempt(s)",
         summary.run_id, repo.slug, summary.state, summary.attempts
@@ -154,9 +162,6 @@ fn run_command(
     }
     for warning in &summary.warnings {
         eprintln!("warning: {warning}");
-    }
-    if summary.state == RunState::AwaitingCi {
-        println!("CI, judges and the outcome policy are not run by this command yet");
     }
     Ok(summary.state != RunState::Failed)
 }
@@ -332,8 +337,8 @@ mod tests {
         let env = env();
         assert!(env.exec(&["run", "o/r", "5"]).unwrap());
         let store = Store::open(&env.dir.path().join("state/state.db")).unwrap();
-        let run = store.active_run("o/r").unwrap().unwrap();
-        assert_eq!(run.state, RunState::AwaitingCi);
+        let run = store.recent_runs(1).unwrap().remove(0);
+        assert_eq!(run.state, RunState::PrOpen);
         assert_eq!(store.attempts(run.id).unwrap()[0].pr_number, Some(9));
     }
 
@@ -369,6 +374,9 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("flow nope not found"));
         assert!(env.exec(&["run", "o/r", "5"]).unwrap());
+        let store = Store::open(&env.dir.path().join("state/state.db")).unwrap();
+        store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        drop(store);
         let err = env.exec(&["run", "o/r", "5"]).unwrap_err();
         assert!(err.to_string().contains("already has a run"));
     }

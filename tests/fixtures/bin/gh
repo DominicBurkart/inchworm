@@ -6,6 +6,20 @@ case "$1 $2" in
   "issue edit"|"issue comment") ;;
   "label list") cfg labels '[{"name":"inchworm"},{"name":"inchworm:running"},{"name":"inchworm:failed"},{"name":"inchworm:done"}]'; echo ;;
   "pr list") cfg prs '[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]'; echo ;;
-  "api --paginate") cfg files 'src/lib.rs'; echo ;;
+  "pr view") cfg prview '{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}'; echo ;;
+  "pr diff") cfg patch 'diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1,2 @@
++/// doc
+ pub fn f() {}'; echo ;;
+  "api --paginate") case "$3" in
+    */check-runs) cfg checks ''; echo ;;
+    *) cfg files 'src/lib.rs'; echo ;;
+  esac ;;
+  "api repos/"*) case "$2" in
+    */required_status_checks) if [ -f "$D/protection" ]; then cat "$D/protection"; else echo "gh: Branch not protected (HTTP 404)" >&2; exit 1; fi ;;
+    *) echo "unexpected gh $*" >&2; exit 1 ;;
+  esac ;;
   *) echo "unexpected gh $*" >&2; exit 1 ;;
 esac

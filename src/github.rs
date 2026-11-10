@@ -376,6 +376,8 @@ struct FakeState {
     merges: Vec<(String, u64, String, MergeMethod)>,
     protection: BTreeMap<(String, String), Vec<String>>,
     merge_error: Option<String>,
+    patch_error: Option<String>,
+    check_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -461,6 +463,14 @@ impl FakeGitHub {
 
     pub fn fail_merges_with(&self, message: &str) {
         self.state.lock().unwrap().merge_error = Some(message.to_string());
+    }
+
+    pub fn fail_patches_with(&self, message: &str) {
+        self.state.lock().unwrap().patch_error = Some(message.to_string());
+    }
+
+    pub fn fail_check_runs_with(&self, message: &str) {
+        self.state.lock().unwrap().check_error = Some(message.to_string());
     }
 
     pub fn ready_calls(&self) -> Vec<(String, u64)> {
@@ -576,6 +586,12 @@ impl GitHub for FakeGitHub {
 
     fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError> {
         self.pr(repo, number)?;
+        if let Some(message) = self.state.lock().unwrap().patch_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh pr diff {number}"),
+                detail: message,
+            });
+        }
         Ok(self
             .state
             .lock()
@@ -588,6 +604,12 @@ impl GitHub for FakeGitHub {
 
     fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
         let mut state = self.state.lock().unwrap();
+        if let Some(message) = state.check_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh api check-runs {sha}"),
+                detail: message,
+            });
+        }
         let polls = state
             .check_polls
             .entry((repo.to_string(), sha.to_string()))

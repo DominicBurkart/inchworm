@@ -132,6 +132,29 @@ pub struct TaskDone {
 }
 
 impl TaskDone {
+    /// ```
+    /// use inchworm::nanna_client::parse_result;
+    /// use inchworm::nanna_client::TaskState;
+    /// use serde_json::json;
+    ///
+    /// let body = json!({"qa_summary": {"endpoint_checks_failed": 0, "console_errors": 2}}).to_string();
+    /// let value = json!({"isError": false, "content": [{"type": "text", "text": body}]});
+    /// let outcome = parse_result(TaskState::Completed, &value).unwrap();
+    /// let inchworm::nanna_client::TaskOutcome::Completed(done) = outcome else { panic!() };
+    /// assert_eq!(done.qa_ok(), Some(false));
+    /// ```
+    pub fn qa_ok(&self) -> Option<bool> {
+        let qa = self.raw.get("qa_summary")?.as_object()?;
+        let failed = [
+            "endpoint_checks_failed",
+            "browser_steps_failed",
+            "console_errors",
+        ]
+        .iter()
+        .any(|key| qa.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
+        Some(!failed)
+    }
+
     pub fn has_changes(&self) -> bool {
         let non_empty = |p: &Option<String>| p.as_deref().is_some_and(|s| !s.trim().is_empty());
         non_empty(&self.changes_patch)
