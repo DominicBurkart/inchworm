@@ -262,8 +262,10 @@ pub fn run_issue(
 mod tests {
     use super::*;
     use crate::config::FlowFile;
+    use crate::config::MergeMethod;
     use crate::github::{FakeGitHub, Issue, PrState};
     use crate::nanna_client::fake::{Scenario, connect};
+    use crate::policy::CheckRun;
 
     fn flow(max_attempts: u32, retry_on: &str) -> Flow {
         FlowFile::parse(&format!(
@@ -396,6 +398,24 @@ mode = "draft_pr"
         }
         fn pr_files(&self, r: &str, n: u64) -> Result<Vec<String>, GitHubError> {
             self.0.pr_files(r, n)
+        }
+        fn pr(&self, r: &str, n: u64) -> Result<PullRequest, GitHubError> {
+            self.0.pr(r, n)
+        }
+        fn pr_patch(&self, r: &str, n: u64) -> Result<String, GitHubError> {
+            self.0.pr_patch(r, n)
+        }
+        fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.0.check_runs(r, s)
+        }
+        fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
+            self.0.mark_ready(r, n)
+        }
+        fn merge_pr(&self, r: &str, n: u64, s: &str, m: MergeMethod) -> Result<(), GitHubError> {
+            self.0.merge_pr(r, n, s, m)
+        }
+        fn required_checks(&self, r: &str, b: &str) -> Result<Option<Vec<String>>, GitHubError> {
+            self.0.required_checks(r, b)
         }
     }
 

@@ -4,7 +4,9 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::config::MergeMethod;
 use crate::exec::{CmdSpec, Runner, SystemRunner};
+use crate::policy::{CheckConclusion, CheckRun, merge_args};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum GitHubError {
@@ -55,6 +57,46 @@ pub trait GitHub {
     fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), GitHubError>;
     fn pr_for_branch(&self, repo: &str, branch: &str) -> Result<Option<PullRequest>, GitHubError>;
     fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError>;
+    fn pr(&self, repo: &str, number: u64) -> Result<PullRequest, GitHubError>;
+    fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError>;
+    fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError>;
+    fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError>;
+    fn merge_pr(
+        &self,
+        repo: &str,
+        number: u64,
+        head_sha: &str,
+        method: MergeMethod,
+    ) -> Result<(), GitHubError>;
+    fn required_checks(&self, repo: &str, branch: &str)
+    -> Result<Option<Vec<String>>, GitHubError>;
+}
+
+#[derive(Deserialize)]
+struct WireCheckRun {
+    name: String,
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+/// ```
+/// use inchworm::github::check_conclusion;
+/// use inchworm::policy::CheckConclusion;
+///
+/// assert_eq!(check_conclusion("completed", Some("success")), CheckConclusion::Success);
+/// assert_eq!(check_conclusion("completed", Some("skipped")), CheckConclusion::Success);
+/// assert_eq!(check_conclusion("completed", Some("timed_out")), CheckConclusion::Failure);
+/// assert_eq!(check_conclusion("in_progress", None), CheckConclusion::Pending);
+/// ```
+pub fn check_conclusion(status: &str, conclusion: Option<&str>) -> CheckConclusion {
+    if status != "completed" {
+        return CheckConclusion::Pending;
+    }
+    match conclusion {
+        Some("success" | "neutral" | "skipped") => CheckConclusion::Success,
+        _ => CheckConclusion::Failure,
+    }
 }
 
 #[derive(Deserialize)]
@@ -234,6 +276,91 @@ impl<R: Runner> GitHub for GhCli<R> {
             .map(str::to_string)
             .collect())
     }
+
+    fn pr(&self, repo: &str, number: u64) -> Result<PullRequest, GitHubError> {
+        let number = number.to_string();
+        #[rustfmt::skip]
+        let args = ["pr", "view", &number, "-R", repo, "--json", "number,headRefOid,isDraft,state,url"];
+        let pr: WirePr = self.json(&args)?;
+        Ok(PullRequest {
+            number: pr.number,
+            head_sha: pr.head_ref_oid,
+            is_draft: pr.is_draft,
+            state: parse_pr_state(&pr.state),
+            url: pr.url,
+        })
+    }
+
+    fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError> {
+        let number = number.to_string();
+        self.run(&["pr", "diff", &number, "-R", repo, "--patch"])
+    }
+
+    fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
+        let endpoint = format!("repos/{repo}/commits/{sha}/check-runs");
+        #[rustfmt::skip]
+        let args = ["api", "--paginate", &endpoint, "--jq", ".check_runs[] | {name, status, conclusion}"];
+        let out = self.run(&args)?;
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|line| {
+                let wire: WireCheckRun =
+                    serde_json::from_str(line).map_err(|err| GitHubError::Parse {
+                        command: format!("{} {}", self.program, args.join(" ")),
+                        detail: err.to_string(),
+                    })?;
+                Ok(CheckRun {
+                    conclusion: check_conclusion(&wire.status, wire.conclusion.as_deref()),
+                    name: wire.name,
+                    head_sha: sha.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError> {
+        let number = number.to_string();
+        self.run(&["pr", "ready", &number, "-R", repo]).map(|_| ())
+    }
+
+    fn merge_pr(
+        &self,
+        repo: &str,
+        number: u64,
+        head_sha: &str,
+        method: MergeMethod,
+    ) -> Result<(), GitHubError> {
+        let mut args = merge_args(number, head_sha, method);
+        args.extend(["-R".to_string(), repo.to_string()]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&args).map(|_| ())
+    }
+
+    fn required_checks(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Vec<String>>, GitHubError> {
+        let endpoint = format!("repos/{repo}/branches/{branch}/protection/required_status_checks");
+        #[rustfmt::skip]
+        let args = ["api", &endpoint, "--jq", "[.contexts[]?, .checks[]?.context] | unique | .[]"];
+        match self.run(&args) {
+            Ok(out) => Ok(Some(
+                out.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )),
+            Err(GitHubError::Command { detail, .. })
+                if detail.contains("404") || detail.contains("not protected") =>
+            {
+                Ok(None)
+            }
+            Err(other) => Err(other),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -243,6 +370,12 @@ struct FakeState {
     prs: BTreeMap<(String, String), PullRequest>,
     pr_files: BTreeMap<(String, u64), Vec<String>>,
     comments: Vec<(String, u64, String)>,
+    patches: BTreeMap<(String, u64), String>,
+    check_polls: BTreeMap<(String, String), Vec<Vec<CheckRun>>>,
+    ready: Vec<(String, u64)>,
+    merges: Vec<(String, u64, String, MergeMethod)>,
+    protection: BTreeMap<(String, String), Vec<String>>,
+    merge_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -290,6 +423,58 @@ impl FakeGitHub {
 
     pub fn comments(&self) -> Vec<(String, u64, String)> {
         self.state.lock().unwrap().comments.clone()
+    }
+
+    pub fn set_pr_patch(&self, repo: &str, number: u64, patch: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .patches
+            .insert((repo.to_string(), number), patch.to_string());
+    }
+
+    pub fn push_check_poll(&self, repo: &str, sha: &str, runs: Vec<CheckRun>) {
+        self.state
+            .lock()
+            .unwrap()
+            .check_polls
+            .entry((repo.to_string(), sha.to_string()))
+            .or_default()
+            .push(runs);
+    }
+
+    pub fn set_head_sha(&self, repo: &str, number: u64, sha: &str) {
+        let mut state = self.state.lock().unwrap();
+        for ((r, _), pr) in state.prs.iter_mut() {
+            if r == repo && pr.number == number {
+                pr.head_sha = sha.to_string();
+            }
+        }
+    }
+
+    pub fn set_protection(&self, repo: &str, branch: &str, contexts: &[&str]) {
+        self.state.lock().unwrap().protection.insert(
+            (repo.to_string(), branch.to_string()),
+            contexts.iter().map(|c| c.to_string()).collect(),
+        );
+    }
+
+    pub fn fail_merges_with(&self, message: &str) {
+        self.state.lock().unwrap().merge_error = Some(message.to_string());
+    }
+
+    pub fn ready_calls(&self) -> Vec<(String, u64)> {
+        self.state.lock().unwrap().ready.clone()
+    }
+
+    pub fn merge_calls(&self) -> Vec<(String, u64, String, MergeMethod)> {
+        self.state.lock().unwrap().merges.clone()
+    }
+
+    pub fn issue_labels(&self, repo: &str, number: u64) -> Vec<String> {
+        self.issue(repo, number)
+            .map(|i| i.labels)
+            .unwrap_or_default()
     }
 }
 
@@ -376,6 +561,102 @@ impl GitHub for FakeGitHub {
             .get(&(repo.to_string(), number))
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn pr(&self, repo: &str, number: u64) -> Result<PullRequest, GitHubError> {
+        self.state
+            .lock()
+            .unwrap()
+            .prs
+            .iter()
+            .find(|((r, _), pr)| r == repo && pr.number == number)
+            .map(|(_, pr)| pr.clone())
+            .ok_or_else(|| GitHubError::NotFound(format!("{repo}!{number}")))
+    }
+
+    fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError> {
+        self.pr(repo, number)?;
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .patches
+            .get(&(repo.to_string(), number))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
+        let mut state = self.state.lock().unwrap();
+        let polls = state
+            .check_polls
+            .entry((repo.to_string(), sha.to_string()))
+            .or_default();
+        Ok(if polls.len() > 1 {
+            polls.remove(0)
+        } else {
+            polls.first().cloned().unwrap_or_default()
+        })
+    }
+
+    fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError> {
+        let mut state = self.state.lock().unwrap();
+        let pr = state
+            .prs
+            .iter_mut()
+            .find(|((r, _), pr)| r == repo && pr.number == number)
+            .map(|(_, pr)| pr)
+            .ok_or_else(|| GitHubError::NotFound(format!("{repo}!{number}")))?;
+        pr.is_draft = false;
+        state.ready.push((repo.to_string(), number));
+        Ok(())
+    }
+
+    fn merge_pr(
+        &self,
+        repo: &str,
+        number: u64,
+        head_sha: &str,
+        method: MergeMethod,
+    ) -> Result<(), GitHubError> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(message) = state.merge_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh pr merge {number}"),
+                detail: message,
+            });
+        }
+        let pr = state
+            .prs
+            .iter_mut()
+            .find(|((r, _), pr)| r == repo && pr.number == number)
+            .map(|(_, pr)| pr)
+            .ok_or_else(|| GitHubError::NotFound(format!("{repo}!{number}")))?;
+        if !pr.head_sha.eq_ignore_ascii_case(head_sha) {
+            return Err(GitHubError::Command {
+                command: format!("gh pr merge {number} --match-head-commit {head_sha}"),
+                detail: "head branch was modified".to_string(),
+            });
+        }
+        pr.state = PrState::Merged;
+        state
+            .merges
+            .push((repo.to_string(), number, head_sha.to_string(), method));
+        Ok(())
+    }
+
+    fn required_checks(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Vec<String>>, GitHubError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .protection
+            .get(&(repo.to_string(), branch.to_string()))
+            .cloned())
     }
 }
 
@@ -488,6 +769,174 @@ mod tests {
                 "gh api --paginate repos/o/r/pulls/9/files --jq .[] | .filename, (.previous_filename // empty)"
             ]
         );
+    }
+
+    #[test]
+    fn gh_views_one_pr_and_reads_its_patch() {
+        let pr = r#"{"number":9,"headRefOid":"abc123","isDraft":false,"state":"MERGED","url":"u"}"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(pr),
+            ScriptedRunner::ok("diff --git a/x b/x\n"),
+        ]));
+        let found = gh.pr("o/r", 9).unwrap();
+        assert_eq!(
+            (found.head_sha.as_str(), found.state),
+            ("abc123", PrState::Merged)
+        );
+        assert_eq!(gh.pr_patch("o/r", 9).unwrap(), "diff --git a/x b/x\n");
+        assert_eq!(
+            gh.runner.calls(),
+            [
+                "gh pr view 9 -R o/r --json number,headRefOid,isDraft,state,url",
+                "gh pr diff 9 -R o/r --patch"
+            ]
+        );
+    }
+
+    #[test]
+    fn gh_reads_check_runs_for_the_exact_sha() {
+        let lines = concat!(
+            r#"{"name":"build","status":"completed","conclusion":"success"}"#,
+            "\n",
+            r#"{"name":"test","status":"in_progress","conclusion":null}"#,
+            "\n",
+            r#"{"name":"lint","status":"completed","conclusion":"failure"}"#,
+            "\n",
+        );
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(lines),
+            ScriptedRunner::ok("not json\n"),
+        ]));
+        let runs = gh.check_runs("o/r", "abc123").unwrap();
+        let summary: Vec<_> = runs
+            .iter()
+            .map(|r| (r.name.as_str(), r.conclusion))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("build", CheckConclusion::Success),
+                ("test", CheckConclusion::Pending),
+                ("lint", CheckConclusion::Failure)
+            ]
+        );
+        assert!(runs.iter().all(|r| r.head_sha == "abc123"));
+        assert_eq!(
+            gh.runner.calls()[0],
+            "gh api --paginate repos/o/r/commits/abc123/check-runs --jq .check_runs[] | {name, status, conclusion}"
+        );
+        assert!(matches!(
+            gh.check_runs("o/r", "abc123").unwrap_err(),
+            GitHubError::Parse { .. }
+        ));
+    }
+
+    #[test]
+    fn gh_marks_ready_and_merges_only_with_match_head_commit_and_never_admin() {
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(""),
+            ScriptedRunner::ok(""),
+        ]));
+        gh.mark_ready("o/r", 9).unwrap();
+        gh.merge_pr("o/r", 9, "abc123", MergeMethod::Squash)
+            .unwrap();
+        let calls = gh.runner.calls();
+        assert_eq!(calls[0], "gh pr ready 9 -R o/r");
+        assert_eq!(
+            calls[1],
+            "gh pr merge 9 --match-head-commit abc123 --squash -R o/r"
+        );
+        assert!(!calls[1].contains("--admin"));
+    }
+
+    #[test]
+    fn gh_reads_branch_protection_and_treats_404_as_unprotected() {
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok("build\ntest\n"),
+            ScriptedRunner::fail("gh: Branch not protected (HTTP 404)"),
+            ScriptedRunner::fail("HTTP 500"),
+        ]));
+        assert_eq!(
+            gh.required_checks("o/r", "main").unwrap(),
+            Some(vec!["build".to_string(), "test".to_string()])
+        );
+        assert_eq!(gh.required_checks("o/r", "main").unwrap(), None);
+        assert!(gh.required_checks("o/r", "main").is_err());
+        assert_eq!(
+            gh.runner.calls()[0],
+            "gh api repos/o/r/branches/main/protection/required_status_checks --jq [.contexts[]?, .checks[]?.context] | unique | .[]"
+        );
+    }
+
+    #[test]
+    fn fake_pr_actions_track_draft_merge_and_exact_head() {
+        let fake = FakeGitHub::new();
+        let sha = "a".repeat(40);
+        let pr = PullRequest {
+            number: 3,
+            head_sha: sha.clone(),
+            is_draft: true,
+            state: PrState::Open,
+            url: "u".into(),
+        };
+        fake.add_pr("o/r", "b", pr);
+        assert!(fake.pr("o/r", 4).is_err());
+        assert!(fake.pr_patch("o/r", 4).is_err());
+        assert_eq!(fake.pr_patch("o/r", 3).unwrap(), "");
+        fake.set_pr_patch("o/r", 3, "diff");
+        assert_eq!(fake.pr_patch("o/r", 3).unwrap(), "diff");
+        assert!(fake.mark_ready("o/r", 4).is_err());
+        fake.mark_ready("o/r", 3).unwrap();
+        assert!(!fake.pr("o/r", 3).unwrap().is_draft);
+        assert_eq!(fake.ready_calls(), [("o/r".to_string(), 3)]);
+
+        assert!(fake.merge_pr("o/r", 9, &sha, MergeMethod::Merge).is_err());
+        fake.set_head_sha("o/r", 3, &"b".repeat(40));
+        let err = fake
+            .merge_pr("o/r", 3, &sha, MergeMethod::Merge)
+            .unwrap_err();
+        assert!(err.to_string().contains("head branch was modified"));
+        fake.merge_pr("o/r", 3, &"B".repeat(40), MergeMethod::Rebase)
+            .unwrap();
+        assert_eq!(fake.pr("o/r", 3).unwrap().state, PrState::Merged);
+        assert_eq!(fake.merge_calls().len(), 1);
+        fake.fail_merges_with("blocked");
+        assert!(fake.merge_pr("o/r", 3, &sha, MergeMethod::Merge).is_err());
+    }
+
+    #[test]
+    fn fake_check_polls_replay_in_order_and_then_repeat_the_last() {
+        let fake = FakeGitHub::new();
+        assert!(fake.check_runs("o/r", "s").unwrap().is_empty());
+        let run = |c| CheckRun {
+            name: "build".into(),
+            head_sha: "s".into(),
+            conclusion: c,
+        };
+        fake.push_check_poll("o/r", "s", vec![run(CheckConclusion::Pending)]);
+        fake.push_check_poll("o/r", "s", vec![run(CheckConclusion::Success)]);
+        assert_eq!(
+            fake.check_runs("o/r", "s").unwrap()[0].conclusion,
+            CheckConclusion::Pending
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                fake.check_runs("o/r", "s").unwrap()[0].conclusion,
+                CheckConclusion::Success
+            );
+        }
+    }
+
+    #[test]
+    fn fake_protection_and_labels_accessors() {
+        let fake = FakeGitHub::new();
+        assert_eq!(fake.required_checks("o/r", "main").unwrap(), None);
+        fake.set_protection("o/r", "main", &["a"]);
+        assert_eq!(
+            fake.required_checks("o/r", "main").unwrap(),
+            Some(vec!["a".to_string()])
+        );
+        assert!(fake.issue_labels("o/r", 1).is_empty());
     }
 
     #[test]

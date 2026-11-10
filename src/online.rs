@@ -223,8 +223,10 @@ fn check_repo_online(repo: &RepoEntry, online: &Online<'_>, report: &mut Report)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MergeMethod;
     use crate::exec::testing::ScriptedRunner;
     use crate::github::{FakeGitHub, GitHub, GitHubError, Issue, PullRequest};
+    use crate::policy::CheckRun;
     use std::cell::RefCell;
 
     const FLOWS: &str = r#"
@@ -286,6 +288,24 @@ mode = "draft_pr"
             unreachable!()
         }
         fn pr_files(&self, _: &str, _: u64) -> Result<Vec<String>, GitHubError> {
+            unreachable!()
+        }
+        fn pr(&self, _: &str, _: u64) -> Result<PullRequest, GitHubError> {
+            unreachable!()
+        }
+        fn pr_patch(&self, _: &str, _: u64) -> Result<String, GitHubError> {
+            unreachable!()
+        }
+        fn check_runs(&self, _: &str, _: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            unreachable!()
+        }
+        fn mark_ready(&self, _: &str, _: u64) -> Result<(), GitHubError> {
+            unreachable!()
+        }
+        fn merge_pr(&self, _: &str, _: u64, _: &str, _: MergeMethod) -> Result<(), GitHubError> {
+            unreachable!()
+        }
+        fn required_checks(&self, _: &str, _: &str) -> Result<Option<Vec<String>>, GitHubError> {
             unreachable!()
         }
     }
