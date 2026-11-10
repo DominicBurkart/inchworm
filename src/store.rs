@@ -287,6 +287,27 @@ impl Store {
             .ok_or(StoreError::AttemptNotFound(id))?
     }
 
+    /// ```
+    /// use inchworm::store::Store;
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let run = store.enqueue_run("o/r", 1, "issue", 0).unwrap().unwrap();
+    /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 0);
+    /// store.start_attempt(run, 1).unwrap();
+    /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 1);
+    /// assert_eq!(store.issue_attempt_count("o/r", 2).unwrap(), 0);
+    /// ```
+    pub fn issue_attempt_count(&self, repo: &str, issue: u64) -> Result<u32, StoreError> {
+        let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts a JOIN runs r ON r.id = a.run_id
+             WHERE r.repo = ?1 AND r.issue = ?2",
+            params![repo, issue],
+            |row| row.get(0),
+        )?;
+        u32::try_from(count).map_err(corrupt("attempt count"))
+    }
+
     pub fn attempts(&self, run_id: RunId) -> Result<Vec<Attempt>, StoreError> {
         let mut statement = self
             .conn

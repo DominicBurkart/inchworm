@@ -54,6 +54,7 @@ pub trait GitHub {
     ) -> Result<(), GitHubError>;
     fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), GitHubError>;
     fn pr_for_branch(&self, repo: &str, branch: &str) -> Result<Option<PullRequest>, GitHubError>;
+    fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError>;
 }
 
 #[derive(Deserialize)]
@@ -227,7 +228,7 @@ impl<R: Runner> GitHub for GhCli<R> {
             "--head",
             branch,
             "--state",
-            "all",
+            "open",
             "--limit",
             "1",
             "--json",
@@ -241,6 +242,23 @@ impl<R: Runner> GitHub for GhCli<R> {
             url: pr.url,
         }))
     }
+
+    fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
+        let endpoint = format!("repos/{repo}/pulls/{number}/files");
+        let out = self.run(&[
+            "api",
+            "--paginate",
+            &endpoint,
+            "--jq",
+            ".[] | .filename, (.previous_filename // empty)",
+        ])?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
 }
 
 #[derive(Default)]
@@ -248,6 +266,7 @@ struct FakeState {
     issues: BTreeMap<(String, u64), Issue>,
     repo_labels: BTreeMap<String, BTreeSet<String>>,
     prs: BTreeMap<(String, String), PullRequest>,
+    pr_files: BTreeMap<(String, u64), Vec<String>>,
     comments: Vec<(String, u64, String)>,
 }
 
@@ -285,6 +304,13 @@ impl FakeGitHub {
             .unwrap()
             .prs
             .insert((repo.to_string(), branch.to_string()), pr);
+    }
+
+    pub fn set_pr_files(&self, repo: &str, number: u64, files: &[&str]) {
+        self.state.lock().unwrap().pr_files.insert(
+            (repo.to_string(), number),
+            files.iter().map(|f| f.to_string()).collect(),
+        );
     }
 
     pub fn comments(&self) -> Vec<(String, u64, String)> {
@@ -364,6 +390,17 @@ impl GitHub for FakeGitHub {
             .prs
             .get(&(repo.to_string(), branch.to_string()))
             .cloned())
+    }
+
+    fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .pr_files
+            .get(&(repo.to_string(), number))
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -457,7 +494,24 @@ mod tests {
         assert_eq!(gh.pr_for_branch("o/r", "none").unwrap(), None);
         assert_eq!(
             gh.runner.calls()[0],
-            "gh pr list -R o/r --head inchworm/7-a1 --state all --limit 1 --json number,headRefOid,isDraft,state,url"
+            "gh pr list -R o/r --head inchworm/7-a1 --state open --limit 1 --json number,headRefOid,isDraft,state,url"
+        );
+    }
+
+    #[test]
+    fn gh_lists_every_file_of_a_pr_including_rename_sources() {
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(
+            "src/a.rs\n.inchworm/old.toml\n\nsrc/b.rs\n",
+        )]));
+        assert_eq!(
+            gh.pr_files("o/r", 9).unwrap(),
+            ["src/a.rs", ".inchworm/old.toml", "src/b.rs"]
+        );
+        assert_eq!(
+            gh.runner.calls(),
+            [
+                "gh api --paginate repos/o/r/pulls/9/files --jq .[] | .filename, (.previous_filename // empty)"
+            ]
         );
     }
 
@@ -550,5 +604,8 @@ mod tests {
         };
         fake.add_pr("o/r", "b", pr.clone());
         assert_eq!(fake.pr_for_branch("o/r", "b").unwrap(), Some(pr));
+        assert!(fake.pr_files("o/r", 3).unwrap().is_empty());
+        fake.set_pr_files("o/r", 3, &["a", "b"]);
+        assert_eq!(fake.pr_files("o/r", 3).unwrap(), ["a", "b"]);
     }
 }
