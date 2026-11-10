@@ -116,6 +116,7 @@ impl<R: Runner> ImageBuilder for NixBuilder<R> {
 pub struct Online<'a> {
     pub catalog: &'a dyn IdentityCatalog,
     pub github: &'a dyn GitHub,
+    pub branch_protection: bool,
     pub builder: Option<&'a dyn ImageBuilder>,
 }
 
@@ -135,7 +136,7 @@ pub struct Online<'a> {
 ///
 /// let config = GlobalConfig::parse("nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"/gone\"\n").unwrap();
 /// let github = FakeGitHub::new();
-/// let online = Online { catalog: &Empty, github: &github, builder: None };
+/// let online = Online { catalog: &Empty, github: &github, branch_protection: true, builder: None };
 /// assert!(!validate_online(&config, &online).is_ok());
 /// ```
 pub fn validate_online(config: &GlobalConfig, online: &Online<'_>) -> Report {
@@ -153,6 +154,57 @@ fn required_labels(file: &FlowFile) -> BTreeSet<String> {
         labels.insert(label.clone());
     }
     labels
+}
+
+fn check_branch_protection(
+    repo: &RepoEntry,
+    flow: &crate::config::Flow,
+    online: &Online<'_>,
+    report: &mut Report,
+) {
+    let slug = Some(repo.slug.as_str());
+    let listed = &flow.outcome.required_checks;
+    if listed.is_empty() {
+        return;
+    }
+    let merging = flow.outcome.mode == crate::config::OutcomeMode::MergeWhen;
+    match online.github.required_checks(&repo.slug, &flow.base) {
+        Ok(Some(protected)) => {
+            for check in listed.iter().filter(|c| !protected.contains(c)) {
+                report.push(
+                    slug,
+                    Severity::Error,
+                    format!(
+                        "flow `{}`: required check `{check}` is not required by the branch protection of `{}`",
+                        flow.name, flow.base
+                    ),
+                );
+            }
+            for check in protected.iter().filter(|c| !listed.contains(c)) {
+                report.push(
+                    slug,
+                    if merging { Severity::Error } else { Severity::Warning },
+                    format!(
+                        "flow `{}`: branch protection of `{}` also requires `{check}`, which the flow does not wait for",
+                        flow.name, flow.base
+                    ),
+                );
+            }
+        }
+        Ok(None) => report.push(
+            slug,
+            if merging { Severity::Error } else { Severity::Warning },
+            format!(
+                "flow `{}`: branch `{}` has no required status checks, so required_checks cannot match branch protection",
+                flow.name, flow.base
+            ),
+        ),
+        Err(err) => report.push(
+            slug,
+            Severity::Error,
+            format!("cannot read the branch protection of `{}`: {err}", flow.base),
+        ),
+    }
 }
 
 fn check_repo_online(repo: &RepoEntry, online: &Online<'_>, report: &mut Report) {
@@ -207,6 +259,12 @@ fn check_repo_online(repo: &RepoEntry, online: &Online<'_>, report: &mut Report)
             }
         }
         Err(err) => report.push(slug, Severity::Error, format!("cannot list labels: {err}")),
+    }
+
+    if online.branch_protection {
+        for flow in &file.flow {
+            check_branch_protection(repo, flow, online, report);
+        }
     }
 
     if let Some(builder) = online.builder
@@ -356,6 +414,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: None,
         };
         let report = validate_online(&config, &online);
@@ -371,6 +430,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: None,
         };
         let report = validate_online(&config, &online);
@@ -392,6 +452,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: None,
         };
         let report = validate_online(&config, &online);
@@ -399,6 +460,98 @@ mode = "draft_pr"
         assert!(
             messages(&report)[0].contains("cannot list identities")
                 && messages(&report)[0].contains("boom")
+        );
+    }
+
+    fn protection_flow(mode: &str, checks: &str) -> String {
+        FLOWS.replace(
+            "[flow.outcome]\nmode = \"draft_pr\"",
+            &format!(
+                "[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"{mode}\"\nrequired_checks = [{checks}]"
+            ),
+        )
+    }
+
+    fn protection_findings(
+        flows: &str,
+        github: &FakeGitHub,
+        enabled: bool,
+    ) -> Vec<(Severity, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        std::fs::write(dir.path().join(".inchworm/flows.toml"), flows).unwrap();
+        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let online = Online {
+            catalog: &catalog,
+            github,
+            branch_protection: enabled,
+            builder: None,
+        };
+        validate_online(&config, &online)
+            .findings
+            .into_iter()
+            .filter(|f| f.message.contains("branch"))
+            .map(|f| (f.severity, f.message))
+            .collect()
+    }
+
+    #[test]
+    fn required_checks_must_match_branch_protection() {
+        let github = github_with_labels(ALL_LABELS);
+        github.set_protection("o/r", "main", &["build", "test"]);
+        let matching = protection_findings(
+            &protection_flow("draft_pr", "\"build\", \"test\""),
+            &github,
+            true,
+        );
+        assert!(matching.is_empty(), "{matching:?}");
+
+        let missing = protection_findings(
+            &protection_flow("draft_pr", "\"build\", \"lint\""),
+            &github,
+            true,
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|(s, m)| *s == Severity::Error && m.contains("`lint` is not required"))
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|(s, m)| *s == Severity::Warning && m.contains("also requires `test`"))
+        );
+
+        let merging =
+            protection_findings(&protection_flow("merge_when", "\"build\""), &github, true);
+        assert!(
+            merging
+                .iter()
+                .any(|(s, m)| *s == Severity::Error && m.contains("also requires `test`"))
+        );
+    }
+
+    #[test]
+    fn unprotected_branches_and_api_errors_are_reported_and_skippable() {
+        let github = github_with_labels(ALL_LABELS);
+        let flows = protection_flow("draft_pr", "\"build\"");
+        let warned = protection_findings(&flows, &github, true);
+        assert!(
+            warned
+                .iter()
+                .any(|(s, m)| *s == Severity::Warning && m.contains("no required status checks"))
+        );
+        let blocked =
+            protection_findings(&protection_flow("merge_when", "\"build\""), &github, true);
+        assert!(blocked.iter().any(|(s, _)| *s == Severity::Error));
+        assert!(protection_findings(&flows, &github, false).is_empty());
+        assert!(protection_findings(FLOWS, &github, true).is_empty());
+        github.fail_protection_with("HTTP 403");
+        let denied = protection_findings(&flows, &github, true);
+        assert!(
+            denied
+                .iter()
+                .any(|(s, m)| *s == Severity::Error && m.contains("HTTP 403"))
         );
     }
 
@@ -411,6 +564,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: None,
         };
         let report = validate_online(&config, &online);
@@ -429,6 +583,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &BrokenGitHub,
+            branch_protection: true,
             builder: None,
         };
         let report = validate_online(&config, &online);
@@ -449,6 +604,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: Some(&ok),
         };
         assert!(validate_online(&config, &online).findings.is_empty());
@@ -461,6 +617,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: Some(&bad),
         };
         let report = validate_online(&config, &online);
@@ -469,6 +626,7 @@ mode = "draft_pr"
         let off = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: None,
         };
         validate_online(&config, &off);
@@ -485,6 +643,7 @@ mode = "draft_pr"
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: true,
             builder: None,
         };
         let report = validate_online(&config, &online);

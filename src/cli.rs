@@ -35,6 +35,8 @@ pub enum Command {
         online: bool,
         #[arg(long)]
         build_images: bool,
+        #[arg(long)]
+        skip_branch_protection: bool,
     },
     Status {
         #[arg(long)]
@@ -154,7 +156,18 @@ fn daemon_command(
     Ok(true)
 }
 
-fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_images: bool) -> bool {
+struct ValidateMode {
+    online: bool,
+    build_images: bool,
+    branch_protection: bool,
+}
+
+fn validate_command(config: GlobalConfig, tools: &Tools, mode: ValidateMode) -> bool {
+    let ValidateMode {
+        online,
+        build_images,
+        branch_protection,
+    } = mode;
     let report = if online || build_images {
         let catalog = NannaCatalog::new(&config.nanna_bin);
         let github = GhCli::with_program(tools.gh.as_str());
@@ -162,6 +175,7 @@ fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_ima
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection,
             builder: build_images.then_some(&builder as &dyn ImageBuilder),
         };
         validate_online(&config, &online)
@@ -255,11 +269,15 @@ pub fn execute(cli: Cli, tools: &Tools) -> Result<bool> {
             config,
             online,
             build_images,
+            skip_branch_protection,
         } => Ok(validate_command(
             load_config(config, tools)?,
             tools,
-            online,
-            build_images,
+            ValidateMode {
+                online,
+                build_images,
+                branch_protection: !skip_branch_protection,
+            },
         )),
         Command::Status { config } => report_command(&load_config(config, tools)?, |store| {
             Ok(render_status(store)?)
@@ -400,6 +418,28 @@ mod tests {
         env.set("identities", "rust-implementer");
         env.set("labels", "[]");
         assert!(!env.exec(&["validate", "--online"]).unwrap());
+    }
+
+    #[test]
+    fn online_validate_compares_required_checks_with_branch_protection() {
+        let env = env();
+        write(
+            &env.repo,
+            ".inchworm/flows.toml",
+            &FLOWS.replace(
+                "mode = \"draft_pr\"",
+                "mode = \"draft_pr\"\nrequired_checks = [\"build\"]",
+            ),
+        );
+        assert!(env.exec(&["validate", "--online"]).unwrap());
+        env.set("protection", "test\n");
+        assert!(!env.exec(&["validate", "--online"]).unwrap());
+        assert!(
+            env.exec(&["validate", "--online", "--skip-branch-protection"])
+                .unwrap()
+        );
+        env.set("protection", "build\n");
+        assert!(env.exec(&["validate", "--online"]).unwrap());
     }
 
     #[test]

@@ -378,6 +378,7 @@ struct FakeState {
     merge_error: Option<String>,
     patch_error: Option<String>,
     check_error: Option<String>,
+    protection_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -467,6 +468,10 @@ impl FakeGitHub {
 
     pub fn fail_patches_with(&self, message: &str) {
         self.state.lock().unwrap().patch_error = Some(message.to_string());
+    }
+
+    pub fn fail_protection_with(&self, message: &str) {
+        self.state.lock().unwrap().protection_error = Some(message.to_string());
     }
 
     pub fn fail_check_runs_with(&self, message: &str) {
@@ -672,6 +677,12 @@ impl GitHub for FakeGitHub {
         repo: &str,
         branch: &str,
     ) -> Result<Option<Vec<String>>, GitHubError> {
+        if let Some(message) = self.state.lock().unwrap().protection_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh api branches/{branch}/protection"),
+                detail: message,
+            });
+        }
         Ok(self
             .state
             .lock()
