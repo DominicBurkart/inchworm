@@ -4,12 +4,13 @@ A daemon and CLI for configuring fallible, repeated agentic processes on local m
 
 ## Status
 
-Milestone 1 of the MVP: configuration, run state, the SQLite store and offline validation. Dispatch to nanna, judges, the daemon and stats are not implemented yet.
+Milestones 1 and 2 of the MVP: configuration, run state, the SQLite store, offline and online validation, and dispatch of a flow to nanna through `inchworm run`. CI waiting, judges, the outcome policy, the daemon and stats are not implemented yet.
 
 ## Commands
 
 ```
-inchworm validate [--config PATH]
+inchworm validate [--config PATH] [--online] [--build-images]
+inchworm run <repo-slug-or-path> <issue> [--flow NAME] [--config PATH]
 ```
 
 Exit codes: `0` valid, `1` the repos have errors, `2` the config could not be read.
@@ -21,6 +22,10 @@ Exit codes: `0` valid, `1` the repos have errors, `2` the config could not be re
 - every rubric file referenced by an `llm` judge exists
 - `.nanna/protected.toml` lists `.inchworm/**` so agents cannot edit their own flows or judges
 - `.nanna/prompt.md` exists (warning only)
+
+With `--online` it also checks that every step identity resolves with `nanna agents list --repo <path>` and that the trigger label and the `inchworm:running`, `inchworm:failed` and `inchworm:done` labels exist on GitHub (through `gh`). `--build-images` implies `--online` and runs `nix build path:<repo>#devContainerImage --no-link` for each repo; it only builds.
+
+`run` executes one flow for one issue in the foreground. It starts `nanna mcp-serve`, sends each step as an `assign_task` to the step's identity (passing the previous step's summary and patch forward), stops at the first failing step, classifies the failure into a `FailureClass`, retries per `retry_on` and `max_attempts`, and records everything in the SQLite store. After the final step it looks up the pull request on `inchworm/<issue>-a<attempt>` with `gh`, records its head SHA, and leaves the run in `awaiting_ci`. A step output that touches `.inchworm/**` is rejected as `protected_path_violation` regardless of nanna's own protected set. A step other than the last (or the only step) that produces no changes fails as `empty_patch`. Exit codes: `0` PR recorded, `1` the run failed, `2` setup error.
 
 ## Global config
 
