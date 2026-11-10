@@ -201,7 +201,11 @@ fn check_branch_protection(
         ),
         Err(err) => report.push(
             slug,
-            Severity::Error,
+            if err.is_plan_limit() && !merging {
+                Severity::Warning
+            } else {
+                Severity::Error
+            },
             format!("cannot read the branch protection of `{}`: {err}", flow.base),
         ),
     }
@@ -553,6 +557,24 @@ mode = "draft_pr"
                 .iter()
                 .any(|(s, m)| *s == Severity::Error && m.contains("HTTP 403"))
         );
+    }
+
+    #[test]
+    fn plan_limited_branch_protection_is_a_warning_only_for_draft_pr_flows() {
+        let github = github_with_labels(ALL_LABELS);
+        github.fail_protection_with(
+            "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)",
+        );
+        let drafted = protection_findings(&protection_flow("draft_pr", "\"build\""), &github, true);
+        assert_eq!(drafted.len(), 1, "{drafted:?}");
+        assert_eq!(drafted[0].0, Severity::Warning);
+        assert!(drafted[0].1.contains("Upgrade to GitHub Pro"));
+        let merging =
+            protection_findings(&protection_flow("merge_when", "\"build\""), &github, true);
+        assert!(merging.iter().any(|(s, _)| *s == Severity::Error));
+        github.fail_protection_with("HTTP 500 Upgrade to GitHub Pro");
+        let other = protection_findings(&protection_flow("draft_pr", "\"build\""), &github, true);
+        assert!(other.iter().any(|(s, _)| *s == Severity::Error));
     }
 
     #[test]

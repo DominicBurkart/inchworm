@@ -18,6 +18,16 @@ pub enum GitHubError {
     NotFound(String),
 }
 
+impl GitHubError {
+    pub fn is_plan_limit(&self) -> bool {
+        matches!(
+            self,
+            GitHubError::Command { detail, .. }
+                if detail.contains("403") && detail.contains("Upgrade to GitHub Pro")
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
     pub number: u64,
@@ -708,6 +718,22 @@ impl GitHub for FakeGitHub {
 mod tests {
     use super::*;
     use crate::exec::testing::ScriptedRunner;
+
+    fn command_error(detail: &str) -> GitHubError {
+        GitHubError::Command {
+            command: "gh api".to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_limit_needs_both_the_403_and_the_upgrade_message() {
+        assert!(command_error("gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)").is_plan_limit());
+        assert!(!command_error("gh: Forbidden (HTTP 403)").is_plan_limit());
+        assert!(!command_error("Upgrade to GitHub Pro (HTTP 500)").is_plan_limit());
+        assert!(!command_error("gh: Not Found (HTTP 404)").is_plan_limit());
+        assert!(!GitHubError::NotFound("Upgrade to GitHub Pro 403".to_string()).is_plan_limit());
+    }
 
     const ISSUE_JSON: &str = r#"{"number":7,"title":"T","body":null,"labels":[{"name":"inchworm"},{"name":"bug"}],"url":"https://github.com/o/r/issues/7"}"#;
 

@@ -188,6 +188,58 @@ fn online_validate_reports_unknown_identities_and_missing_labels() {
         ));
 }
 
+const PLAN_LIMIT: &str =
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n";
+
+fn require_build_check(fakes: &Fakes, outcome: &str) {
+    let flows = std::fs::read_to_string(fakes.repo.join(".inchworm/flows.toml")).unwrap();
+    let flows = flows.replace(
+        "[flow.outcome]\nmode = \"draft_pr\"",
+        &format!("[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\n{outcome}\nrequired_checks = [\"build\"]"),
+    );
+    write(&fakes.repo, ".inchworm/flows.toml", &flows);
+}
+
+#[test]
+fn online_validate_warns_when_branch_protection_is_plan_limited_for_draft_pr() {
+    let fakes = fakes();
+    require_build_check(&fakes, "mode = \"draft_pr\"");
+    fakes.set("protection_error", PLAN_LIMIT);
+    inchworm(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("0 error(s), 1 warning(s)"))
+        .stdout(predicates_contains("Upgrade to GitHub Pro"));
+}
+
+#[test]
+fn online_validate_keeps_plan_limited_branch_protection_an_error_for_merge_when() {
+    let fakes = fakes();
+    require_build_check(&fakes, "mode = \"merge_when\"");
+    fakes.set("protection_error", PLAN_LIMIT);
+    inchworm(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(1)
+        .stdout(predicates_contains("Upgrade to GitHub Pro"));
+}
+
+#[test]
+fn online_validate_keeps_other_branch_protection_failures_errors_for_draft_pr() {
+    let fakes = fakes();
+    require_build_check(&fakes, "mode = \"draft_pr\"");
+    fakes.set("protection_error", "gh: Bad credentials (HTTP 401)\n");
+    inchworm(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(1)
+        .stdout(predicates_contains("HTTP 401"));
+}
+
 #[test]
 fn build_images_runs_nix_build_and_reports_failures() {
     let fakes = fakes();

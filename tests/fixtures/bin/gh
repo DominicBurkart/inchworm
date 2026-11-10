@@ -20,7 +20,7 @@ case "$1 $2" in
     *) cfg files 'src/lib.rs'; echo ;;
   esac ;;
   "api repos/"*) case "$2" in
-    */required_status_checks) if [ -f "$D/protection" ]; then cat "$D/protection"; else echo "gh: Branch not protected (HTTP 404)" >&2; exit 1; fi ;;
+    */required_status_checks) if [ -f "$D/protection_error" ]; then cat "$D/protection_error" >&2; exit 1; elif [ -f "$D/protection" ]; then cat "$D/protection"; else echo "gh: Branch not protected (HTTP 404)" >&2; exit 1; fi ;;
     *) echo "unexpected gh $*" >&2; exit 1 ;;
   esac ;;
   *) echo "unexpected gh $*" >&2; exit 1 ;;
