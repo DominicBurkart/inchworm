@@ -112,6 +112,7 @@ pub struct Lease<T> {
     seq: u64,
     shared: Arc<Shared<T>>,
     permit: Option<OwnedSemaphorePermit>,
+    started: bool,
 }
 
 impl<T> Lease<T> {
@@ -124,11 +125,33 @@ impl<T> Lease<T> {
             .as_ref()
             .expect("lease item is present until drop")
     }
+
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use inchworm::scheduler::Scheduler;
+    ///
+    /// let scheduler = Scheduler::new(1);
+    /// scheduler.enqueue("a/x", 7u32);
+    /// let mut lease = scheduler.next().await;
+    /// let permit = lease.take_permit().unwrap();
+    /// assert!(lease.take_permit().is_none());
+    /// drop(permit);
+    /// assert_eq!(scheduler.model_permit().available_permits(), 1);
+    /// assert!(scheduler.is_active("a/x"));
+    /// drop(lease);
+    /// assert_eq!(scheduler.queued_len("a/x"), 0);
+    /// # }
+    /// ```
+    pub fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self.permit.take()
+    }
 }
 
 impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
-        let started = self.permit.take().is_some();
+        let started = self.started;
+        self.permit.take();
         {
             let mut queues = self.shared.queues();
             if !started && let Some(item) = self.item.take() {
@@ -196,9 +219,11 @@ impl<T> Scheduler<T> {
                     seq,
                     shared: Arc::clone(&self.shared),
                     permit: None,
+                    started: false,
                 };
                 if let Ok(permit) = Arc::clone(&self.shared.permit).acquire_owned().await {
                     lease.permit = Some(permit);
+                    lease.started = true;
                 }
                 return lease;
             }
@@ -339,6 +364,37 @@ mod tests {
         assert_eq!(s.model_permit().available_permits(), 0);
         drop(lease);
         assert_eq!(s.model_permit().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_llm_judge_can_take_the_permit_once_the_lease_hands_it_over() {
+        let s = Scheduler::new(1);
+        s.enqueue("a", 1);
+        let mut lease = s.next().await;
+        assert!(
+            timeout(SHORT, s.model_permit().acquire_owned())
+                .await
+                .is_err()
+        );
+        drop(lease.take_permit());
+        let judge = timeout(SHORT, s.model_permit().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(judge);
+        assert!(s.is_active("a"));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_lease_after_handing_over_the_permit_does_not_requeue() {
+        let s = Scheduler::new(1);
+        s.enqueue("a", 1);
+        let mut lease = s.next().await;
+        drop(lease.take_permit());
+        drop(lease);
+        assert_eq!(s.queued_len("a"), 0);
+        assert!(!s.is_active("a"));
+        assert!(timeout(SHORT, s.next()).await.is_err());
     }
 
     #[tokio::test]
