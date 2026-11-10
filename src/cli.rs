@@ -122,17 +122,11 @@ fn report_command(
 }
 
 async fn termination_signal() {
-    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-    match terminate {
-        Ok(mut terminate) => {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
-        }
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("a SIGTERM handler can be installed");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
     }
 }
 
@@ -507,6 +501,13 @@ mod tests {
         assert!(err.to_string().contains("unknown window"));
         let err = env.exec(&["failures", "--class", "nope"]).unwrap_err();
         assert!(err.to_string().contains("unknown failure class"));
+    }
+
+    #[test]
+    fn run_prints_label_failures_as_warnings_and_still_succeeds() {
+        let env = env();
+        env.set("fail_edit", "1");
+        assert!(env.exec(&["run", "o/r", "5"]).unwrap());
     }
 
     #[test]

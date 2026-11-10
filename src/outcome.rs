@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use crate::clock::Clock;
 use crate::config::{Flow, Judge};
 use crate::github::{GitHub, PullRequest};
-use crate::judges::{NannaReport, Scorer, Verdict, diff_judge, llm_judge, nanna_clean_judge};
+use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
 use crate::policy::{CheckConclusion, CheckRun, Decision, HumanGate, PolicyInput, decide};
 use crate::run::{RUNNING_LABEL, trigger_label};
@@ -30,8 +30,8 @@ impl Default for CiPolicy {
     }
 }
 
-pub struct OutcomeEnv<'a, S: Scorer> {
-    pub scorer: &'a S,
+pub struct OutcomeEnv<'a> {
+    pub scorer: &'a dyn DynScorer,
     pub model_permit: Arc<Semaphore>,
     pub ci: CiPolicy,
 }
@@ -150,9 +150,9 @@ pub struct JudgeInputs<'a> {
     pub report: &'a NannaReport,
 }
 
-pub async fn run_judges<S: Scorer>(
+pub async fn run_judges(
     flow: &Flow,
-    env: &OutcomeEnv<'_, S>,
+    env: &OutcomeEnv<'_>,
     inputs: &JudgeInputs<'_>,
 ) -> Vec<Verdict> {
     let mut verdicts = Vec::new();
@@ -170,7 +170,7 @@ pub async fn run_judges<S: Scorer>(
             } => match std::fs::read_to_string(inputs.repo_path.join(rubric)) {
                 Ok(text) => {
                     llm_judge(
-                        env.scorer,
+                        &env.scorer,
                         &env.model_permit,
                         &text,
                         model,
@@ -203,19 +203,12 @@ pub struct ConcludeContext<'a> {
 }
 
 fn failed_verdicts(verdicts: &[Verdict]) -> String {
-    let failed: Vec<String> = verdicts
+    verdicts
         .iter()
         .filter(|v| !v.passed)
         .map(|v| format!("{}: {}", v.judge, v.detail))
-        .collect();
-    if failed.is_empty() {
-        format!(
-            "expected judge verdicts were missing ({} recorded)",
-            verdicts.len()
-        )
-    } else {
-        failed.join("; ")
-    }
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn summarise(verdicts: &[Verdict]) -> String {
@@ -244,9 +237,9 @@ fn warn_label_comment(
     }
 }
 
-pub async fn conclude<S: Scorer>(
+pub async fn conclude(
     ctx: &ConcludeContext<'_>,
-    env: &OutcomeEnv<'_, S>,
+    env: &OutcomeEnv<'_>,
     flow: &Flow,
     published: &Published<'_>,
     warnings: &mut Vec<String>,
@@ -423,17 +416,15 @@ pub async fn conclude<S: Scorer>(
                 ),
             }
         }
-        Decision::AwaitCi => reject(
-            ctx,
-            published,
-            FailureClass::MergeBlocked,
-            "required checks were not green when the merge was decided".to_string(),
-        ),
-        Decision::Reject(class) => {
-            let raw = match class {
-                FailureClass::JudgeRejected => failed_verdicts(&verdicts),
-                FailureClass::CiRed => format!("required checks are red on {sha}"),
-                _ => format!("policy refused the outcome for {sha}"),
+        other => {
+            let class = match other {
+                Decision::Reject(class) => class,
+                _ => FailureClass::MergeBlocked,
+            };
+            let raw = if class == FailureClass::JudgeRejected {
+                failed_verdicts(&verdicts)
+            } else {
+                format!("policy refused the outcome for {sha}")
             };
             reject(ctx, published, class, raw)
         }
@@ -984,6 +975,16 @@ mod tests {
     }
 
     async fn conclude_with(rig: &Rig, flow: &Flow, pr: &PullRequest, judged: &str) -> Concluded {
+        conclude_for(rig, flow, pr, judged, 5).await.0
+    }
+
+    async fn conclude_for(
+        rig: &Rig,
+        flow: &Flow,
+        pr: &PullRequest,
+        judged: &str,
+        issue: u64,
+    ) -> (Concluded, Vec<String>) {
         let run = rig
             .store
             .enqueue_run("o/r", 5, "issue", 1)
@@ -1001,7 +1002,7 @@ mod tests {
             clock: &rig.clock,
             slug: "o/r",
             repo_path: rig.dir.path(),
-            issue: 5,
+            issue,
         };
         let published = Published {
             run_id: run,
@@ -1014,9 +1015,71 @@ mod tests {
                 qa_ok: Some(true),
             },
         };
-        conclude(&ctx, &env(&rig.scorer), flow, &published, &mut Vec::new())
+        let mut warnings = Vec::new();
+        let concluded = conclude(&ctx, &env(&rig.scorer), flow, &published, &mut warnings)
             .await
-            .unwrap()
+            .unwrap();
+        (concluded, warnings)
+    }
+
+    #[tokio::test]
+    async fn label_and_comment_failures_on_the_issue_are_warnings_not_errors() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "b", pr_at(77, SHA));
+        rig.github.set_pr_patch("o/r", 77, &patch(2));
+        let (concluded, warnings) = conclude_for(
+            &rig,
+            &flow_with(1, "", DRAFT_OUTCOME),
+            &pr_at(77, SHA),
+            SHA,
+            99,
+        )
+        .await;
+        assert_eq!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::PrOpen
+            }
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_judging_run_with_a_red_check_fails_as_ci_red() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        rig.github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![check("build", SHA, CheckConclusion::Failure)],
+        );
+        let run = published_run(&rig, RunState::Judging);
+        let summary = execute_run(
+            &rig.ctx(),
+            &env(&rig.scorer),
+            &flow_with(1, "", &outcome_toml("draft_pr", &["build"])),
+            run,
+            &mut MustNotDispatch,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.failure.unwrap().0, FailureClass::CiRed);
+    }
+
+    #[tokio::test]
+    async fn github_errors_while_waiting_are_reported_when_the_wait_times_out() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        rig.github.fail_check_runs_with("HTTP 503");
+        let extra = outcome_toml("draft_pr", &["build"]);
+        let summary = rig.run(&flow_with(1, "", &extra), two_successes(1)).await;
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::Timeout);
+        assert!(
+            raw.contains("last github error") && raw.contains("HTTP 503"),
+            "{raw}"
+        );
     }
 
     #[tokio::test]

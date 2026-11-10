@@ -10,7 +10,6 @@ use crate::flow::{
     protected_paths_in, run_flow,
 };
 use crate::github::{GitHub, GitHubError, PullRequest};
-use crate::judges::Scorer;
 use crate::model::{FailureClass, RunState};
 use crate::outcome::{ConcludeContext, Concluded, OutcomeEnv, Published, conclude};
 use crate::store::{AttemptState, RunId, Store, StoreError};
@@ -108,22 +107,19 @@ pub fn enqueue_issue(
     flow: &Flow,
     issue_number: u64,
     warnings: &mut Vec<String>,
-) -> Result<RunId, RunError> {
+) -> Result<Option<RunId>, StoreError> {
     let run_id = ctx
         .store
-        .enqueue_run(ctx.slug, issue_number, &flow.name, ctx.clock.now())?
-        .ok_or_else(|| RunError::AlreadyRun {
-            repo: ctx.slug.to_string(),
-            issue: issue_number,
-            flow: flow.name.clone(),
-        })?;
-    relabel(
-        ctx,
-        issue_number,
-        &[RUNNING_LABEL],
-        &[trigger_label(flow)],
-        warnings,
-    );
+        .enqueue_run(ctx.slug, issue_number, &flow.name, ctx.clock.now())?;
+    if run_id.is_some() {
+        relabel(
+            ctx,
+            issue_number,
+            &[RUNNING_LABEL],
+            &[trigger_label(flow)],
+            warnings,
+        );
+    }
     Ok(run_id)
 }
 
@@ -172,9 +168,9 @@ fn published_pr(ctx: &RunContext<'_>, attempt_pr: Option<u64>) -> Result<PullReq
     Ok(ctx.github.pr(ctx.slug, number)?)
 }
 
-async fn settle_published<S: Scorer>(
+async fn settle_published(
     ctx: &RunContext<'_>,
-    env: &OutcomeEnv<'_, S>,
+    env: &OutcomeEnv<'_>,
     flow: &Flow,
     issue: u64,
     attempt: &crate::store::Attempt,
@@ -265,25 +261,31 @@ async fn settle_published<S: Scorer>(
 /// assert_eq!(summary.state, inchworm::model::RunState::Failed);
 /// # }
 /// ```
-pub async fn run_issue<S: Scorer>(
+pub async fn run_issue(
     ctx: &RunContext<'_>,
-    env: &OutcomeEnv<'_, S>,
+    env: &OutcomeEnv<'_>,
     flow: &Flow,
     issue_number: u64,
     dispatcher: &mut dyn Dispatcher,
 ) -> Result<RunSummary, RunError> {
     ctx.github.issue(ctx.slug, issue_number)?;
     let mut warnings = Vec::new();
-    let run_id = enqueue_issue(ctx, flow, issue_number, &mut warnings)?;
+    let run_id = enqueue_issue(ctx, flow, issue_number, &mut warnings)?.ok_or_else(|| {
+        RunError::AlreadyRun {
+            repo: ctx.slug.to_string(),
+            issue: issue_number,
+            flow: flow.name.clone(),
+        }
+    })?;
     let mut summary = execute_run(ctx, env, flow, run_id, dispatcher, None).await?;
     warnings.append(&mut summary.warnings);
     summary.warnings = warnings;
     Ok(summary)
 }
 
-pub async fn execute_run<S: Scorer>(
+pub async fn execute_run(
     ctx: &RunContext<'_>,
-    env: &OutcomeEnv<'_, S>,
+    env: &OutcomeEnv<'_>,
     flow: &Flow,
     run_id: RunId,
     dispatcher: &mut dyn Dispatcher,
@@ -474,7 +476,7 @@ mod tests {
     use crate::github::{FakeGitHub, Issue};
     use crate::nanna_client::fake::{Scenario, connect};
     use crate::policy::CheckRun;
-    use crate::store::AttemptState;
+    use crate::store::{AttemptState, StoreError};
     use crate::testing::{DRAFT_OUTCOME, FakeScorer, env, flow_with, github_with_issue, pr_at};
 
     fn flow(max_attempts: u32, retry_on: &str) -> Flow {
@@ -816,5 +818,81 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0].starts_with("could not update labels"));
         assert!(warnings[1].starts_with("could not comment"));
+    }
+
+    #[tokio::test]
+    async fn a_closed_model_permit_fails_the_attempt_instead_of_hanging() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        let scorer = FakeScorer::new();
+        let env = env(&scorer);
+        env.model_permit.close();
+        let (mut client, _fake) = connect(vec![]);
+        let summary = run_issue(
+            &ctx(&store, &github, &clock),
+            &env,
+            &flow(1, ""),
+            5,
+            &mut client,
+        )
+        .await
+        .unwrap();
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::OrchestratorLost);
+        assert!(raw.contains("permit was closed"));
+    }
+
+    #[tokio::test]
+    async fn a_published_attempt_without_a_pr_number_is_a_corrupt_store() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        store.mark_published(attempt.id, 0, None).unwrap();
+        let scorer = FakeScorer::new();
+        let (mut client, _fake) = connect(vec![]);
+        let err = execute_run(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &flow(1, ""),
+            run,
+            &mut client,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::Store(StoreError::Corrupt(_))),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecovered_dispatched_attempt_does_not_block_a_fresh_attempt() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a2", pr("cafe"));
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        store.start_attempt(run, 3).unwrap();
+        let scorer = FakeScorer::new();
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = execute_run(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &flow(2, ""),
+            run,
+            &mut client,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::PrOpen);
+        assert_eq!(summary.attempts, 2);
     }
 }

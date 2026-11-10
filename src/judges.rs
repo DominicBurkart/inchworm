@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use globset::{Glob, GlobSetBuilder};
+use globset::Glob;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -153,19 +154,13 @@ pub fn patch_stats(patch: &str) -> PatchStats {
 /// ```
 pub fn diff_judge(patch: &str, max_lines: u32, forbid_paths: &[String]) -> Verdict {
     const NAME: &str = "diff";
-    let mut builder = GlobSetBuilder::new();
+    let mut forbidden = Vec::new();
     for pattern in forbid_paths {
         match Glob::new(pattern) {
-            Ok(glob) => {
-                builder.add(glob);
-            }
+            Ok(glob) => forbidden.push(glob.compile_matcher()),
             Err(err) => return Verdict::fail(NAME, &format!("invalid forbid_paths glob: {err}")),
         }
     }
-    let forbidden = match builder.build() {
-        Ok(set) => set,
-        Err(err) => return Verdict::fail(NAME, &format!("invalid forbid_paths globs: {err}")),
-    };
     let stats = patch_stats(patch);
     if stats.unparsable_header {
         return Verdict::fail(NAME, "patch header could not be parsed");
@@ -179,7 +174,11 @@ pub fn diff_judge(patch: &str, max_lines: u32, forbid_paths: &[String]) -> Verdi
     let hits: Vec<&str> = stats
         .paths
         .iter()
-        .filter(|path| forbidden.is_match(path.as_str()))
+        .filter(|path| {
+            forbidden
+                .iter()
+                .any(|matcher| matcher.is_match(path.as_str()))
+        })
         .map(String::as_str)
         .collect();
     if !hits.is_empty() {
@@ -274,6 +273,25 @@ pub trait Scorer {
         model: &str,
         prompt: &str,
     ) -> impl Future<Output = Result<String, LlmError>> + Send;
+}
+
+pub type ScoreFuture<'a> = Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + 'a>>;
+
+pub trait DynScorer: Send + Sync {
+    fn complete_dyn<'a>(&'a self, model: &'a str, prompt: &'a str) -> ScoreFuture<'a>;
+}
+
+impl<S: Scorer + Send + Sync> DynScorer for S {
+    fn complete_dyn<'a>(&'a self, model: &'a str, prompt: &'a str) -> ScoreFuture<'a> {
+        Box::pin(self.complete(model, prompt))
+    }
+}
+
+impl Scorer for &dyn DynScorer {
+    async fn complete(&self, model: &str, prompt: &str) -> Result<String, LlmError> {
+        let inner: &dyn DynScorer = *self;
+        inner.complete_dyn(model, prompt).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +475,31 @@ mod tests {
         assert!(!diff_judge(mode, 100, &["publish.sh".to_string()]).passed);
         let deleted = "diff --git a/publish.sh b/publish.sh\ndeleted file mode 100644\n--- a/publish.sh\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
         assert!(!diff_judge(deleted, 100, &["publish.sh".to_string()]).passed);
+    }
+
+    #[test]
+    fn git_headers_with_quotes_or_missing_halves_are_unparsable_and_fail_closed() {
+        for header in [
+            "diff --git \"a/x y\" \"b/x y\"\n",
+            "diff --git a\\x b\\x\n",
+            "diff --git x\n",
+            "diff --git aaaaaaaa\n",
+        ] {
+            assert!(patch_stats(header).unparsable_header, "{header}");
+            assert!(!diff_judge(header, 10, &[]).passed);
+        }
+    }
+
+    #[test]
+    fn invalid_forbid_globs_fail_closed() {
+        let verdict = diff_judge(&patch("a.rs", 1, 0), 10, &["[".to_string()]);
+        assert!(!verdict.passed && verdict.detail.contains("invalid forbid_paths"));
+    }
+
+    #[test]
+    fn the_ollama_client_normalises_its_base_url() {
+        let client = OllamaClient::new("http://h:1//", Duration::from_secs(1));
+        assert_eq!(client.base_url(), "http://h:1");
     }
 
     #[test]

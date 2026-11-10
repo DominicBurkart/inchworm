@@ -42,7 +42,7 @@ impl Scorer for FakeScorer {
     }
 }
 
-pub fn env(scorer: &FakeScorer) -> OutcomeEnv<'_, FakeScorer> {
+pub fn env(scorer: &FakeScorer) -> OutcomeEnv<'_> {
     OutcomeEnv {
         scorer,
         model_permit: Arc::new(Semaphore::new(1)),

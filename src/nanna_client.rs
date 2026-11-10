@@ -217,17 +217,12 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 fn spawn_reader(mut reader: impl BufRead + Send + 'static) -> Receiver<io::Result<String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        loop {
+        let mut open = true;
+        while open {
             let mut line = String::new();
-            let message = match reader.read_line(&mut line) {
-                Ok(0) => Ok(String::new()),
-                Ok(_) => Ok(line),
-                Err(err) => Err(err),
-            };
-            let last = !matches!(&message, Ok(line) if !line.is_empty());
-            if tx.send(message).is_err() || last {
-                break;
-            }
+            let message = reader.read_line(&mut line).map(|_| line);
+            open = matches!(&message, Ok(line) if !line.is_empty());
+            open &= tx.send(message).is_ok();
         }
     });
     rx
@@ -319,13 +314,13 @@ impl NannaClient {
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         loop {
-            let line = match self.lines.recv_timeout(self.read_timeout) {
-                Ok(line) => line?,
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(ClientError::ReadTimeout(self.read_timeout));
+            let line = self.lines.recv_timeout(self.read_timeout).map_err(|err| {
+                if err == RecvTimeoutError::Timeout {
+                    ClientError::ReadTimeout(self.read_timeout)
+                } else {
+                    ClientError::Eof
                 }
-                Err(RecvTimeoutError::Disconnected) => return Err(ClientError::Eof),
-            };
+            })??;
             if line.is_empty() {
                 return Err(ClientError::Eof);
             }

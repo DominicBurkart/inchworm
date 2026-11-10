@@ -384,6 +384,35 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::VecDeque;
 
+    fn record(denials: u64, qa_ok: Option<bool>) -> StepRecord {
+        StepRecord {
+            name: "s".into(),
+            identity: "i".into(),
+            summary: String::new(),
+            files_modified: vec![],
+            denial_count: denials,
+            qa_ok,
+        }
+    }
+
+    #[test]
+    fn the_nanna_report_sums_denials_and_lets_any_failed_qa_win() {
+        assert_eq!(nanna_report(&[]).qa_ok, None);
+        assert_eq!(nanna_report(&[record(0, None)]).qa_ok, None);
+        assert_eq!(
+            nanna_report(&[record(0, None), record(0, Some(true))]).qa_ok,
+            Some(true)
+        );
+        assert_eq!(
+            nanna_report(&[record(0, Some(true)), record(0, Some(false))]).qa_ok,
+            Some(false)
+        );
+        assert_eq!(
+            nanna_report(&[record(2, None), record(3, None)]).denial_count,
+            5
+        );
+    }
+
     fn flow(steps: &[(&str, &str)]) -> Flow {
         let mut text = String::from(
             "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\nbase = \"develop\"\n",

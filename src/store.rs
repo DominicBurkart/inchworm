@@ -418,9 +418,9 @@ impl Store {
     ) -> Result<(), StoreError> {
         let denials = i64::try_from(denials).map_err(corrupt("nanna denials"))?;
         let changed = self.conn.execute(
-            "UPDATE attempts SET state = 'published', nanna_denials = ?1, nanna_qa_ok = ?2
-             WHERE id = ?3 AND state = 'dispatched'",
-            params![denials, qa_ok, id],
+            "UPDATE attempts SET state = ?1, nanna_denials = ?2, nanna_qa_ok = ?3
+             WHERE id = ?4 AND state = 'dispatched'",
+            params![AttemptState::Published.as_str(), denials, qa_ok, id],
         )?;
         if changed == 1 {
             return Ok(());
@@ -966,6 +966,30 @@ mod tests {
         let failed = store.attempt(attempt.id).unwrap();
         assert_eq!(failed.state, AttemptState::Failed);
         assert_eq!(failed.failure_class, Some(FailureClass::CiRed));
+    }
+
+    #[test]
+    fn corrupt_rows_are_reported_not_trusted() {
+        let (store, run) = store_with_run();
+        let attempt = store.start_attempt(run, 1).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET state = 'bogus' WHERE id = ?1",
+                [attempt.id],
+            )
+            .unwrap();
+        let err = store.attempt(attempt.id).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(m) if m.contains("bogus")));
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET state = 'dispatched', pr_number = -4 WHERE id = ?1",
+                [attempt.id],
+            )
+            .unwrap();
+        let err = store.attempt(attempt.id).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(m) if m.contains("pr number")));
     }
 
     #[test]

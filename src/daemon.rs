@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,11 +11,11 @@ use crate::clock::Clock;
 use crate::config::{FlowFile, GlobalConfig, RepoEntry, Trigger};
 use crate::flow::Dispatcher;
 use crate::github::GitHub;
-use crate::judges::Scorer;
+use crate::judges::DynScorer;
 use crate::model::RunState;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskOutcome};
 use crate::outcome::{CiPolicy, OutcomeEnv};
-use crate::run::{RunContext, RunError, enqueue_issue, execute_run};
+use crate::run::{RunContext, enqueue_issue, execute_run};
 use crate::scheduler::Scheduler;
 use crate::store::{RunId, Store, StoreError};
 
@@ -94,17 +95,18 @@ impl Dispatcher for Unavailable {
     }
 }
 
-pub struct DaemonDeps<S> {
+pub struct DaemonDeps {
     pub github: Arc<dyn GitHub + Send + Sync>,
     pub clock: Arc<dyn Clock>,
     pub dispatchers: Arc<dyn DispatcherFactory>,
-    pub scorer: Arc<S>,
+    pub scorer: Arc<dyn DynScorer>,
 }
 
 #[derive(Debug, Clone)]
 struct Job {
     run_id: RunId,
     flow: String,
+    repo: RepoEntry,
 }
 
 fn log(message: &str) {
@@ -118,15 +120,15 @@ fn load_flows(repo: &RepoEntry) -> Result<FlowFile, String> {
     FlowFile::parse(&text).map_err(|err| format!("{}: {err}", path.display()))
 }
 
-async fn process<S: Scorer>(
+async fn process(
     job: Job,
-    repo: &RepoEntry,
     store: &Store,
-    deps: &DaemonDeps<S>,
+    deps: &DaemonDeps,
     scheduler: &Scheduler<Job>,
     ci: CiPolicy,
     mut lease: crate::scheduler::Lease<Job>,
 ) {
+    let repo = &job.repo;
     let file = match load_flows(repo) {
         Ok(file) => file,
         Err(err) => return log(&format!("{}: {err}", repo.slug)),
@@ -163,35 +165,31 @@ async fn process<S: Scorer>(
     }
 }
 
-async fn worker<S: Scorer>(
+async fn worker(
     settings: DaemonSettings,
-    deps: Arc<DaemonDeps<S>>,
+    store: Store,
+    deps: Arc<DaemonDeps>,
     scheduler: Scheduler<Job>,
     stop: Arc<Notify>,
 ) {
-    let store = match Store::open(&settings.state_db) {
-        Ok(store) => store,
-        Err(err) => return log(&format!("worker cannot open the state db: {err}")),
-    };
     loop {
         let lease = tokio::select! {
-            biased;
             () = stop.notified() => return,
             lease = scheduler.next() => lease,
         };
         let job = lease.item().clone();
-        let Some(repo) = settings.repos.iter().find(|r| r.slug == lease.repo()) else {
-            continue;
-        };
-        process(job, repo, &store, &deps, &scheduler, settings.ci, lease).await;
+        process(job, &store, &deps, &scheduler, settings.ci, lease).await;
     }
 }
 
-fn poll_repo<S>(
+type Unswapped = HashSet<(String, u64)>;
+
+fn poll_repo(
     repo: &RepoEntry,
     store: &Store,
-    deps: &DaemonDeps<S>,
+    deps: &DaemonDeps,
     scheduler: &Scheduler<Job>,
+    unswapped: &mut Unswapped,
 ) -> Result<(), String> {
     let file = load_flows(repo)?;
     let ctx = RunContext {
@@ -207,10 +205,19 @@ fn poll_repo<S>(
             .github
             .open_issues_with_label(&repo.slug, label)
             .map_err(|err| err.to_string())?;
+        let listed: HashSet<u64> = issues.iter().map(|issue| issue.number).collect();
+        unswapped.retain(|(slug, number)| *slug != repo.slug || listed.contains(number));
         for issue in issues {
+            let key = (repo.slug.clone(), issue.number);
+            if unswapped.contains(&key) {
+                continue;
+            }
             let mut warnings = Vec::new();
             match enqueue_issue(&ctx, flow, issue.number, &mut warnings) {
-                Ok(run_id) => {
+                Ok(Some(run_id)) => {
+                    if !warnings.is_empty() {
+                        unswapped.insert(key);
+                    }
                     log(&format!(
                         "{}#{}: queued run {run_id} for flow `{}`",
                         repo.slug, issue.number, flow.name
@@ -220,11 +227,12 @@ fn poll_repo<S>(
                         Job {
                             run_id,
                             flow: flow.name.clone(),
+                            repo: repo.clone(),
                         },
                     );
                 }
-                Err(RunError::AlreadyRun { .. }) => {}
-                Err(err) => log(&format!("{}#{}: {err}", repo.slug, issue.number)),
+                Ok(None) => {}
+                Err(err) => return Err(format!("{}#{}: {err}", repo.slug, issue.number)),
             }
             for warning in warnings {
                 log(&format!("{}#{}: {warning}", repo.slug, issue.number));
@@ -234,10 +242,10 @@ fn poll_repo<S>(
     Ok(())
 }
 
-fn resume<S>(
+fn resume(
     settings: &DaemonSettings,
     store: &Store,
-    deps: &DaemonDeps<S>,
+    deps: &DaemonDeps,
     scheduler: &Scheduler<Job>,
 ) -> Result<(), StoreError> {
     let lost = store.recover_after_crash(deps.clock.now())?;
@@ -253,7 +261,7 @@ fn resume<S>(
         RunState::Judging,
     ])?;
     for run in open {
-        if settings.repos.iter().any(|repo| repo.slug == run.repo) {
+        if let Some(repo) = settings.repos.iter().find(|repo| repo.slug == run.repo) {
             log(&format!(
                 "resuming run {} ({}#{})",
                 run.id, run.repo, run.issue
@@ -263,6 +271,7 @@ fn resume<S>(
                 Job {
                     run_id: run.id,
                     flow: run.flow,
+                    repo: repo.clone(),
                 },
             );
         }
@@ -270,18 +279,16 @@ fn resume<S>(
     Ok(())
 }
 
-pub async fn run_daemon<S>(
+pub async fn run_daemon(
     settings: DaemonSettings,
-    deps: DaemonDeps<S>,
+    deps: DaemonDeps,
     shutdown: impl Future<Output = ()>,
-) -> Result<(), DaemonError>
-where
-    S: Scorer + Send + Sync + 'static,
-{
+) -> Result<(), DaemonError> {
     let store = Store::open(&settings.state_db)?;
     let scheduler: Scheduler<Job> = Scheduler::new(settings.concurrency);
     resume(&settings, &store, &deps, &scheduler)?;
 
+    let worker_store = Store::open(&settings.state_db)?;
     let deps = Arc::new(deps);
     let stop = Arc::new(Notify::new());
     let handle = {
@@ -292,21 +299,20 @@ where
         std::thread::Builder::new()
             .name("inchworm-worker".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build();
-                match runtime {
-                    Ok(runtime) => runtime.block_on(worker(settings, deps, scheduler, stop)),
-                    Err(err) => log(&format!("cannot build the worker runtime: {err}")),
-                }
+                    .build()
+                    .expect("a current-thread runtime can always be built")
+                    .block_on(worker(settings, worker_store, deps, scheduler, stop));
             })
             .map_err(|err| DaemonError::Worker(err.to_string()))?
     };
 
     tokio::pin!(shutdown);
+    let mut unswapped = Unswapped::new();
     let outcome = loop {
         for repo in &settings.repos {
-            if let Err(err) = poll_repo(repo, &store, &deps, &scheduler) {
+            if let Err(err) = poll_repo(repo, &store, &deps, &scheduler, &mut unswapped) {
                 log(&format!("{}: {err}", repo.slug));
             }
         }
@@ -749,6 +755,117 @@ required_checks = ["build"]
         let handle = running.handle;
         let result = handle.join().unwrap();
         assert!(matches!(result, Err(DaemonError::WorkerDied)), "{result:?}");
+    }
+
+    fn script(dir: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("nanna");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn make_with_retry(factory: &NannaFactory) -> Result<Box<dyn Dispatcher>, String> {
+        for _ in 0..50 {
+            match factory.make() {
+                Err(err) if err.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        factory.make()
+    }
+
+    #[test]
+    fn nanna_factory_starts_and_initializes_a_server_or_reports_why_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = script(
+            dir.path(),
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nread line\nsleep 5\n",
+        );
+        assert!(make_with_retry(&NannaFactory::new(ok)).is_ok());
+        let dead = script(dir.path(), "#!/bin/sh\nexit 3\n");
+        let err = make_with_retry(&NannaFactory::new(dead)).err().unwrap();
+        assert!(err.contains("initialize failed"), "{err}");
+    }
+
+    #[test]
+    fn jobs_that_cannot_run_are_logged_and_do_not_block_the_queue() {
+        let rig = Rig::new(FLOWS);
+        rig.github.add_issue(
+            "o/r",
+            crate::github::Issue {
+                number: 99,
+                title: "ghost".into(),
+                body: String::new(),
+                labels: vec![],
+                url: "u".into(),
+            },
+        );
+        let store = rig.store();
+        store
+            .enqueue_run("o/r", 5, "retired-flow", 1)
+            .unwrap()
+            .unwrap();
+        let missing_issue = store.enqueue_run("o/r", 98, "issue", 2).unwrap().unwrap();
+        drop(store);
+        rig.green(77, 5, 1, SHA);
+        let running = rig.start(
+            rig.settings(),
+            ScriptedFactory::with(vec![vec![], successes()]),
+        );
+        wait_for("the healthy issue to finish", || {
+            rig.store()
+                .runs_in_states(&[RunState::PrOpen])
+                .unwrap()
+                .len()
+                == 1
+        });
+        running.stop().unwrap();
+        let store = rig.store();
+        assert_eq!(store.run(missing_issue).unwrap().state, RunState::Queued);
+        assert_eq!(store.runs_in_states(&[RunState::Queued]).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_run_whose_flows_file_disappeared_is_left_queued() {
+        let rig = Rig::new(FLOWS);
+        rig.store()
+            .enqueue_run("o/r", 5, "issue", 1)
+            .unwrap()
+            .unwrap();
+        rig.github.set_labels("o/r", 5, &[], &["inchworm"]).unwrap();
+        std::fs::remove_file(rig.dir.path().join("repo/.inchworm/flows.toml")).unwrap();
+        let factory = ScriptedFactory::default();
+        let running = rig.start(rig.settings(), factory);
+        std::thread::sleep(Duration::from_millis(300));
+        running.stop().unwrap();
+        assert_eq!(
+            rig.store()
+                .runs_in_states(&[RunState::Queued])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn label_failures_are_warnings_and_do_not_cause_the_issue_to_be_rerun() {
+        let rig = Rig::new(FLOWS);
+        rig.github.fail_labels_with("denied");
+        rig.green(77, 5, 1, SHA);
+        let running = rig.start(rig.settings(), ScriptedFactory::with(vec![successes()]));
+        wait_for("the run to finish", || {
+            rig.store()
+                .runs_in_states(&[RunState::PrOpen])
+                .unwrap()
+                .len()
+                == 1
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        running.stop().unwrap();
+        assert_eq!(rig.store().recent_runs(10).unwrap().len(), 1);
     }
 
     #[test]

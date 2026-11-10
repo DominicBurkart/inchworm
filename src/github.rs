@@ -379,6 +379,7 @@ struct FakeState {
     patch_error: Option<String>,
     check_error: Option<String>,
     protection_error: Option<String>,
+    label_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -470,6 +471,10 @@ impl FakeGitHub {
         self.state.lock().unwrap().patch_error = Some(message.to_string());
     }
 
+    pub fn fail_labels_with(&self, message: &str) {
+        self.state.lock().unwrap().label_error = Some(message.to_string());
+    }
+
     pub fn fail_protection_with(&self, message: &str) {
         self.state.lock().unwrap().protection_error = Some(message.to_string());
     }
@@ -533,6 +538,12 @@ impl GitHub for FakeGitHub {
         remove: &[&str],
     ) -> Result<(), GitHubError> {
         let mut state = self.state.lock().unwrap();
+        if let Some(message) = state.label_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh issue edit {number}"),
+                detail: message,
+            });
+        }
         let issue = state
             .issues
             .get_mut(&(repo.to_string(), number))
