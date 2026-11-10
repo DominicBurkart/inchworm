@@ -113,6 +113,13 @@ impl GhCli<SystemRunner> {
     pub fn new() -> Self {
         GhCli::with_runner(SystemRunner)
     }
+
+    pub fn with_program(program: impl Into<String>) -> Self {
+        GhCli {
+            runner: SystemRunner,
+            program: program.into(),
+        }
+    }
 }
 
 impl Default for GhCli<SystemRunner> {
@@ -157,34 +164,17 @@ impl<R: Runner> GhCli<R> {
 
 impl<R: Runner> GitHub for GhCli<R> {
     fn open_issues_with_label(&self, repo: &str, label: &str) -> Result<Vec<Issue>, GitHubError> {
-        let issues: Vec<WireIssue> = self.json(&[
-            "issue",
-            "list",
-            "-R",
-            repo,
-            "--label",
-            label,
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            "number,title,body,labels,url",
-        ])?;
+        #[rustfmt::skip]
+        let args = ["issue", "list", "-R", repo, "--label", label, "--state", "open", "--limit", "100", "--json", "number,title,body,labels,url"];
+        let issues: Vec<WireIssue> = self.json(&args)?;
         Ok(issues.into_iter().map(Issue::from).collect())
     }
 
     fn issue(&self, repo: &str, number: u64) -> Result<Issue, GitHubError> {
         let number = number.to_string();
-        let issue: WireIssue = self.json(&[
-            "issue",
-            "view",
-            &number,
-            "-R",
-            repo,
-            "--json",
-            "number,title,body,labels,url",
-        ])?;
+        #[rustfmt::skip]
+        let args = ["issue", "view", &number, "-R", repo, "--json", "number,title,body,labels,url"];
+        let issue: WireIssue = self.json(&args)?;
         Ok(issue.into())
     }
 
@@ -220,20 +210,9 @@ impl<R: Runner> GitHub for GhCli<R> {
     }
 
     fn pr_for_branch(&self, repo: &str, branch: &str) -> Result<Option<PullRequest>, GitHubError> {
-        let prs: Vec<WirePr> = self.json(&[
-            "pr",
-            "list",
-            "-R",
-            repo,
-            "--head",
-            branch,
-            "--state",
-            "open",
-            "--limit",
-            "1",
-            "--json",
-            "number,headRefOid,isDraft,state,url",
-        ])?;
+        #[rustfmt::skip]
+        let args = ["pr", "list", "-R", repo, "--head", branch, "--state", "open", "--limit", "1", "--json", "number,headRefOid,isDraft,state,url"];
+        let prs: Vec<WirePr> = self.json(&args)?;
         Ok(prs.into_iter().next().map(|pr| PullRequest {
             number: pr.number,
             head_sha: pr.head_ref_oid,
@@ -245,13 +224,9 @@ impl<R: Runner> GitHub for GhCli<R> {
 
     fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
         let endpoint = format!("repos/{repo}/pulls/{number}/files");
-        let out = self.run(&[
-            "api",
-            "--paginate",
-            &endpoint,
-            "--jq",
-            ".[] | .filename, (.previous_filename // empty)",
-        ])?;
+        #[rustfmt::skip]
+        let args = ["api", "--paginate", &endpoint, "--jq", ".[] | .filename, (.previous_filename // empty)"];
+        let out = self.run(&args)?;
         Ok(out
             .lines()
             .map(str::trim)

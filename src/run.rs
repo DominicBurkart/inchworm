@@ -373,6 +373,51 @@ mode = "draft_pr"
         assert!(github.comments()[0].2.contains("protected_path_violation"));
     }
 
+    struct LookupFails(FakeGitHub);
+
+    impl GitHub for LookupFails {
+        fn open_issues_with_label(&self, r: &str, l: &str) -> Result<Vec<Issue>, GitHubError> {
+            self.0.open_issues_with_label(r, l)
+        }
+        fn issue(&self, r: &str, n: u64) -> Result<Issue, GitHubError> {
+            self.0.issue(r, n)
+        }
+        fn labels(&self, r: &str) -> Result<Vec<String>, GitHubError> {
+            self.0.labels(r)
+        }
+        fn set_labels(&self, r: &str, n: u64, a: &[&str], d: &[&str]) -> Result<(), GitHubError> {
+            self.0.set_labels(r, n, a, d)
+        }
+        fn comment(&self, r: &str, n: u64, b: &str) -> Result<(), GitHubError> {
+            self.0.comment(r, n, b)
+        }
+        fn pr_for_branch(&self, _: &str, _: &str) -> Result<Option<PullRequest>, GitHubError> {
+            Err(GitHubError::NotFound("pr lookup".into()))
+        }
+        fn pr_files(&self, r: &str, n: u64) -> Result<Vec<String>, GitHubError> {
+            self.0.pr_files(r, n)
+        }
+    }
+
+    #[test]
+    fn a_failing_pr_lookup_fails_the_attempt() {
+        let store = Store::open_in_memory().unwrap();
+        let github = LookupFails(github());
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let context = RunContext {
+            store: &store,
+            github: &github,
+            slug: "o/r",
+            repo_path: Path::new("/repo"),
+            now: &|| 1,
+        };
+        let summary = run_issue(&context, &flow(1, ""), 5, &mut client).unwrap();
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::AgentFailed);
+        assert!(raw.contains("pr lookup"));
+    }
+
     #[test]
     fn branches_stay_unique_across_runs_of_the_same_issue() {
         let store = Store::open_in_memory().unwrap();

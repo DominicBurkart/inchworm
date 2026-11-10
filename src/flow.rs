@@ -286,16 +286,12 @@ pub fn run_flow(
                 );
             }
         };
-        if let Some(class) = classify_outcome(&outcome) {
-            return failed(records, &step.name, class, raw_error(&outcome));
-        }
-        let TaskOutcome::Completed(done) = outcome else {
-            return failed(
-                records,
-                &step.name,
-                FailureClass::AgentFailed,
-                "unexpected non-terminal outcome".to_string(),
-            );
+        let done = match outcome {
+            TaskOutcome::Completed(done) => done,
+            other => {
+                let class = classify_outcome(&other).unwrap_or(FailureClass::AgentFailed);
+                return failed(records, &step.name, class, raw_error(&other));
+            }
         };
         let violations = protected_paths_in(
             &done.files_modified,

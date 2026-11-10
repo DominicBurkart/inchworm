@@ -93,40 +93,20 @@ fn predicates_contains(needle: &'static str) -> impl predicates::Predicate<[u8]>
     predicates::str::contains(needle).from_utf8()
 }
 
-const FAKE_NANNA: &str = r#"#!/bin/sh
-if [ "$1" = agents ]; then
-  printf 'NAME LOOP MODEL MAX_EFFECT\n'
-  for name in $FAKE_IDENTITIES; do printf '%s inner m workspace\n' "$name"; done
-  exit 0
-fi
-[ "$1" = mcp-serve ] || exit 9
-reply() { printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$1" "$(tr -d '\n' < "$FIXTURES/$2.json")"; }
-while read -r line; do
-  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-  case "$line" in
-    *'"method":"initialize"'*) reply "$id" initialize_result ;;
-    *'"method":"tools/call"'*) reply "$id" create_task_result ;;
-    *'"method":"tasks/get"'*) reply "$id" "$FAKE_STATE" ;;
-    *'"method":"tasks/result"'*) reply "$id" "$FAKE_RESULT" ;;
-  esac
-done
-"#;
-
-const FAKE_GH: &str = r#"#!/bin/sh
-case "$1 $2" in
-  "issue view") echo '{"number":5,"title":"Do it","body":"please","labels":[{"name":"inchworm"}],"url":"https://github.com/o/r/issues/5"}' ;;
-  "issue edit"|"issue comment") ;;
-  "label list") printf '%s\n' "$FAKE_LABELS" ;;
-  "pr list") printf '%s\n' "$FAKE_PRS" ;;
-  "api --paginate") printf '%s\n' "$FAKE_FILES" ;;
-  *) echo "unexpected gh $*" >&2; exit 1 ;;
-esac
-"#;
-
 struct Fakes {
     dir: tempfile::TempDir,
     repo: std::path::PathBuf,
     config: std::path::PathBuf,
+}
+
+impl Fakes {
+    fn bin(&self) -> std::path::PathBuf {
+        self.dir.path().join("bin")
+    }
+
+    fn set(&self, name: &str, value: &str) {
+        std::fs::write(self.bin().join(name), value).unwrap();
+    }
 }
 
 fn script(dir: &Path, name: &str, body: &str) {
@@ -142,8 +122,18 @@ fn fakes() -> Fakes {
     good_repo(&repo);
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    script(&bin, "nanna", FAKE_NANNA);
-    script(&bin, "gh", FAKE_GH);
+    for name in ["nanna", "gh"] {
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/").to_string() + name,
+            bin.join(name),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        bin.join("fixtures"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/nanna"),
+    )
+    .unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
@@ -162,27 +152,10 @@ fn inchworm(fakes: &Fakes) -> Command {
     let mut command = Command::cargo_bin("inchworm").unwrap();
     let path = format!(
         "{}:{}",
-        fakes.dir.path().join("bin").display(),
+        fakes.bin().display(),
         std::env::var("PATH").unwrap()
     );
-    command
-        .env("PATH", path)
-        .env(
-            "FIXTURES",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/nanna"),
-        )
-        .env("FAKE_IDENTITIES", "rust-implementer")
-        .env(
-            "FAKE_LABELS",
-            r#"[{"name":"inchworm"},{"name":"inchworm:running"},{"name":"inchworm:failed"},{"name":"inchworm:done"}]"#,
-        )
-        .env("FAKE_FILES", "src/lib.rs")
-        .env("FAKE_STATE", "task_completed")
-        .env("FAKE_RESULT", "result_success")
-        .env(
-            "FAKE_PRS",
-            r#"[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]"#,
-        );
+    command.env("PATH", path);
     command
 }
 
@@ -200,9 +173,9 @@ fn online_validate_passes_when_identities_and_labels_resolve() {
 #[test]
 fn online_validate_reports_unknown_identities_and_missing_labels() {
     let fakes = fakes();
+    fakes.set("identities", "reviewer");
+    fakes.set("labels", r#"[{"name":"inchworm"}]"#);
     inchworm(&fakes)
-        .env("FAKE_IDENTITIES", "reviewer")
-        .env("FAKE_LABELS", r#"[{"name":"inchworm"}]"#)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -276,8 +249,8 @@ fn run_dispatches_the_flow_and_records_the_pr() {
 #[test]
 fn run_rejects_a_pr_that_touches_inchworm_files() {
     let fakes = fakes();
+    fakes.set("files", "src/lib.rs\n.inchworm/flows.toml");
     inchworm(&fakes)
-        .env("FAKE_FILES", "src/lib.rs\n.inchworm/flows.toml")
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -288,9 +261,9 @@ fn run_rejects_a_pr_that_touches_inchworm_files() {
 #[test]
 fn run_reports_a_failed_task_with_exit_one() {
     let fakes = fakes();
+    fakes.set("state", "task_failed");
+    fakes.set("result", "result_failed_structured");
     inchworm(&fakes)
-        .env("FAKE_STATE", "task_failed")
-        .env("FAKE_RESULT", "result_failed_structured")
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()

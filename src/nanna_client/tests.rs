@@ -222,6 +222,15 @@ fn garbage_and_malformed_responses_are_errors() {
 }
 
 #[test]
+fn transport_errors_during_assign_are_not_mistaken_for_refusals() {
+    let mut client = NannaClient::new(BufReader::new(&b""[..]), io::sink());
+    assert!(matches!(
+        client.assign_task(&request("x")).unwrap_err(),
+        ClientError::Eof
+    ));
+}
+
+#[test]
 fn completed_result_that_is_not_json_is_a_protocol_error() {
     let wire = json!({"isError": false, "content": [{"type": "text", "text": "plain"}]});
     assert!(matches!(

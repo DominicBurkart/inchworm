@@ -55,15 +55,8 @@ pub fn parse_agents_table(table: &str) -> BTreeSet<String> {
 
 impl<R: Runner> IdentityCatalog for NannaCatalog<R> {
     fn identities(&self, repo: &Path) -> Result<BTreeSet<String>, String> {
-        let spec = CmdSpec::new(
-            &self.nanna_bin,
-            [
-                std::ffi::OsStr::new("agents"),
-                std::ffi::OsStr::new("list"),
-                std::ffi::OsStr::new("--repo"),
-                repo.as_os_str(),
-            ],
-        );
+        let mut spec = CmdSpec::new(&self.nanna_bin, ["agents", "list", "--repo"]);
+        spec.args.push(repo.as_os_str().to_os_string());
         let out = self.runner.run(&spec).map_err(|e| e.to_string())?;
         if out.success() {
             Ok(parse_agents_table(&out.stdout))
@@ -75,11 +68,19 @@ impl<R: Runner> IdentityCatalog for NannaCatalog<R> {
 
 pub struct NixBuilder<R: Runner = SystemRunner> {
     runner: R,
+    program: String,
 }
 
 impl NixBuilder<SystemRunner> {
     pub fn new() -> Self {
         NixBuilder::with_runner(SystemRunner)
+    }
+
+    pub fn with_program(program: impl Into<String>) -> Self {
+        NixBuilder {
+            runner: SystemRunner,
+            program: program.into(),
+        }
     }
 }
 
@@ -91,14 +92,17 @@ impl Default for NixBuilder<SystemRunner> {
 
 impl<R: Runner> NixBuilder<R> {
     pub fn with_runner(runner: R) -> Self {
-        NixBuilder { runner }
+        NixBuilder {
+            runner,
+            program: "nix".to_string(),
+        }
     }
 }
 
 impl<R: Runner> ImageBuilder for NixBuilder<R> {
     fn build(&self, repo: &Path) -> Result<(), String> {
         let flake = format!("path:{}#devContainerImage", repo.display());
-        let spec = CmdSpec::new("nix", ["build", flake.as_str(), "--no-link"]);
+        let spec = CmdSpec::new(&self.program, ["build", flake.as_str(), "--no-link"]);
         let out = self.runner.run(&spec).map_err(|e| e.to_string())?;
         if out.success() {
             Ok(())
