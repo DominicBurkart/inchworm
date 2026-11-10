@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
-use crate::clock::SystemClock;
+use crate::clock::{Clock, SystemClock};
 use crate::config::{FlowFile, GlobalConfig, RepoEntry};
 use crate::github::GhCli;
 use crate::judges::OllamaClient;
@@ -14,6 +14,7 @@ use crate::nanna_client::NannaClient;
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
 use crate::outcome::{CiPolicy, OutcomeEnv};
 use crate::run::{RunContext, run_issue};
+use crate::stats::{parse_class, render_failures, render_stats, render_status};
 use crate::store::Store;
 use crate::validate::validate;
 
@@ -33,6 +34,22 @@ pub enum Command {
         online: bool,
         #[arg(long)]
         build_images: bool,
+    },
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Stats {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        window: Option<String>,
+    },
+    Failures {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        class: Option<String>,
     },
     Run {
         repo: String,
@@ -80,6 +97,23 @@ fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEnt
 
 const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
 
+fn open_store(config: &GlobalConfig) -> Result<Store> {
+    if let Some(parent) = config.state_db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    Ok(Store::open(&config.state_db)?)
+}
+
+fn report_command(
+    config: &GlobalConfig,
+    report: impl FnOnce(&Store) -> Result<String>,
+) -> Result<bool> {
+    let store = open_store(config)?;
+    print!("{}", report(&store)?);
+    Ok(true)
+}
+
 fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_images: bool) -> bool {
     let report = if online || build_images {
         let catalog = NannaCatalog::new(&config.nanna_bin);
@@ -122,11 +156,7 @@ fn run_command(
         )
     })?;
 
-    if let Some(parent) = config.state_db.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-    let store = Store::open(&config.state_db)?;
+    let store = open_store(&config)?;
     let github = GhCli::with_program(tools.gh.as_str());
     let mut client = NannaClient::spawn(&config.nanna_bin)
         .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
@@ -191,6 +221,20 @@ pub fn execute(cli: Cli, tools: &Tools) -> Result<bool> {
             online,
             build_images,
         )),
+        Command::Status { config } => report_command(&load_config(config, tools)?, |store| {
+            Ok(render_status(store)?)
+        }),
+        Command::Stats { config, window } => {
+            report_command(&load_config(config, tools)?, |store| {
+                Ok(render_stats(store, SystemClock.now(), window.as_deref())?)
+            })
+        }
+        Command::Failures { config, class } => {
+            let class = class.as_deref().map(parse_class).transpose()?;
+            report_command(&load_config(config, tools)?, |store| {
+                Ok(render_failures(store, class)?)
+            })
+        }
         Command::Run {
             repo,
             issue,
@@ -340,6 +384,38 @@ mod tests {
         let run = store.recent_runs(1).unwrap().remove(0);
         assert_eq!(run.state, RunState::PrOpen);
         assert_eq!(store.attempts(run.id).unwrap()[0].pr_number, Some(9));
+    }
+
+    #[test]
+    fn status_stats_and_failures_read_the_store_after_a_run() {
+        let env = env();
+        assert!(env.exec(&["status"]).unwrap());
+        assert!(env.exec(&["stats"]).unwrap());
+        assert!(env.exec(&["failures"]).unwrap());
+        assert!(env.exec(&["run", "o/r", "5"]).unwrap());
+        env.set("state", "task_failed");
+        env.set("result", "result_failed_structured");
+        assert!(!env.exec(&["run", "o/r", "5"]).unwrap());
+        assert!(env.exec(&["status"]).unwrap());
+        assert!(env.exec(&["stats", "--window", "24h"]).unwrap());
+        assert!(
+            env.exec(&["failures", "--class", "max_iterations"])
+                .unwrap()
+        );
+        let store = Store::open(&env.dir.path().join("state/state.db")).unwrap();
+        assert_eq!(
+            store.success_rates(SystemClock.now(), None).unwrap()[0].total,
+            2
+        );
+    }
+
+    #[test]
+    fn stats_and_failures_reject_unknown_arguments() {
+        let env = env();
+        let err = env.exec(&["stats", "--window", "1y"]).unwrap_err();
+        assert!(err.to_string().contains("unknown window"));
+        let err = env.exec(&["failures", "--class", "nope"]).unwrap_err();
+        assert!(err.to_string().contains("unknown failure class"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod outcome;
 pub mod policy;
 pub mod run;
 pub mod scheduler;
+pub mod stats;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
