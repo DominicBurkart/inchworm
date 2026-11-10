@@ -359,3 +359,181 @@ fn daemon_stops_cleanly_on_sigterm() {
     };
     assert!(status.success(), "{status:?}");
 }
+
+fn ollama_fixture(score: u8) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                request.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let inner = format!("{{\"score\": {score}, \"reason\": \"tidy\"}}");
+            let body = serde_json::json!({"response": inner}).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    (url, handle)
+}
+
+#[test]
+fn end_to_end_dry_run_issue_to_judged_draft_pr_and_stats() {
+    let fakes = fakes();
+    let (ollama, _server) = ollama_fixture(9);
+    write(
+        &fakes.repo,
+        ".inchworm/flows.toml",
+        r#"[[flow]]
+name = "issue"
+trigger = { kind = "label", label = "inchworm" }
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+[[flow.judge]]
+kind = "diff"
+max_lines = 50
+forbid_paths = [".github/**"]
+[[flow.judge]]
+kind = "nanna_clean"
+[[flow.judge]]
+kind = "llm"
+rubric = ".inchworm/rubric.md"
+model = "gemma4:e4b"
+min_score = 7
+[flow.outcome]
+mode = "draft_pr"
+required_checks = ["build"]
+"#,
+    );
+    write(
+        &fakes.repo,
+        ".inchworm/rubric.md",
+        "Prefer small, tidy changes.",
+    );
+    let mut text = std::fs::read_to_string(&fakes.config).unwrap();
+    text = format!("ollama_url = \"{ollama}\"\n{text}");
+    std::fs::write(&fakes.config, text).unwrap();
+    fakes.set(
+        "checks",
+        "{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\"}",
+    );
+    fakes.set("protection", "build\n");
+
+    inchworm(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success();
+
+    inchworm(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("pr_open after 1 attempt(s)"))
+        .stdout(predicates_contains("pull/9"));
+
+    inchworm(&fakes)
+        .args(["stats", "--window", "all", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("o/r"))
+        .stdout(predicates_contains("100.0%"));
+    inchworm(&fakes)
+        .args(["status", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("pr_open"));
+    inchworm(&fakes)
+        .args(["failures", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("no failures recorded"));
+
+    let store = inchworm::store::Store::open(&fakes.dir.path().join("state/state.db")).unwrap();
+    let run = store.recent_runs(1).unwrap().remove(0);
+    assert_eq!(run.state, inchworm::model::RunState::PrOpen);
+    let attempt = &store.attempts(run.id).unwrap()[0];
+    assert_eq!(attempt.state, inchworm::store::AttemptState::Succeeded);
+    let verdicts = store.verdicts(attempt.id).unwrap();
+    let names: Vec<_> = verdicts
+        .iter()
+        .map(|v| (v.judge.as_str(), v.passed))
+        .collect();
+    assert_eq!(
+        names,
+        [("diff", true), ("nanna_clean", true), ("llm", true)]
+    );
+    assert_eq!(verdicts[2].score, Some(9));
+    let rates = store.success_rates(i64::MAX / 2, None).unwrap();
+    assert_eq!((rates[0].total, rates[0].succeeded), (1, 1));
+}
+
+#[test]
+fn end_to_end_with_a_low_llm_score_rejects_the_attempt_and_records_it() {
+    let fakes = fakes();
+    let (ollama, _server) = ollama_fixture(2);
+    write(
+        &fakes.repo,
+        ".inchworm/flows.toml",
+        r#"[[flow]]
+name = "issue"
+max_attempts = 1
+trigger = { kind = "label", label = "inchworm" }
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+[[flow.judge]]
+kind = "llm"
+rubric = ".inchworm/rubric.md"
+model = "gemma4:e4b"
+min_score = 7
+[flow.outcome]
+mode = "draft_pr"
+"#,
+    );
+    write(&fakes.repo, ".inchworm/rubric.md", "Be good.");
+    let text = std::fs::read_to_string(&fakes.config).unwrap();
+    std::fs::write(&fakes.config, format!("ollama_url = \"{ollama}\"\n{text}")).unwrap();
+    inchworm(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(1)
+        .stdout(predicates_contains("failure: judge_rejected"));
+    inchworm(&fakes)
+        .args(["failures", "--class", "judge_rejected", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("llm: score 2 below min_score 7"));
+}

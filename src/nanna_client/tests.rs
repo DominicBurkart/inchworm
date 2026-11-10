@@ -283,7 +283,14 @@ fn spawn_runs_a_binary_with_mcp_serve_and_talks_to_it() {
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut client = NannaClient::spawn(&script).unwrap();
+    let mut client = loop {
+        match NannaClient::spawn(&script) {
+            Err(ClientError::Io(err)) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => break other.unwrap(),
+        }
+    };
     assert_eq!(
         client.initialize().unwrap()["protocolVersion"],
         PROTOCOL_VERSION
