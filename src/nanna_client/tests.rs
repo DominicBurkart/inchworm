@@ -94,6 +94,64 @@ fn failed_task_with_legacy_text_recovers_the_error_type() {
     );
 }
 
+fn failed_wire(text: &str) -> serde_json::Value {
+    json!({"isError": true, "content": [{"type": "text", "text": text}]})
+}
+
+#[test]
+fn a_multi_paragraph_failure_message_keeps_all_paragraphs_and_recovers_the_error_type() {
+    let diagnostics = "{\n  \"error_type\": \"ProtectedPathViolation\",\n  \"denials\": []\n}";
+    let text = format!("first paragraph\n\nsecond paragraph\n\n{diagnostics}");
+    let outcome = parse_result(TaskState::Failed, &failed_wire(&text)).unwrap();
+    assert_eq!(
+        outcome,
+        TaskOutcome::Failed(NannaFailure {
+            failure_kind: None,
+            error_type: Some("ProtectedPathViolation".into()),
+            message: "first paragraph\n\nsecond paragraph".into(),
+        })
+    );
+}
+
+#[test]
+fn a_failure_without_a_diagnostics_block_keeps_its_whole_text() {
+    let text = "Task was interrupted\n\nsee the operator log";
+    let outcome = parse_result(TaskState::Failed, &failed_wire(text)).unwrap();
+    assert_eq!(
+        outcome,
+        TaskOutcome::Failed(NannaFailure {
+            failure_kind: None,
+            error_type: None,
+            message: text.into(),
+        })
+    );
+}
+
+#[test]
+fn a_message_that_itself_contains_a_json_looking_block_is_not_mistaken_for_diagnostics() {
+    let text = "went wrong\n\n{not json at all}\n\n{\"error_type\": \"StateError\"}";
+    let outcome = parse_result(TaskState::Failed, &failed_wire(text)).unwrap();
+    assert_eq!(
+        outcome,
+        TaskOutcome::Failed(NannaFailure {
+            failure_kind: None,
+            error_type: Some("StateError".into()),
+            message: "went wrong\n\n{not json at all}".into(),
+        })
+    );
+}
+
+proptest::proptest! {
+    #[test]
+    fn the_message_in_front_of_the_diagnostics_block_always_round_trips(message in "[a-z \n{}]{0,40}") {
+        let text = format!("{message}\n\n{{\"error_type\": \"StateError\"}}");
+        let outcome = parse_result(TaskState::Failed, &failed_wire(&text)).unwrap();
+        let TaskOutcome::Failed(failure) = outcome else { panic!("expected a failure") };
+        proptest::prop_assert_eq!(failure.error_type.as_deref(), Some("StateError"));
+        proptest::prop_assert_eq!(failure.message, message);
+    }
+}
+
 #[test]
 fn failed_task_with_structured_content_carries_failure_kind() {
     let (mut client, _fake) = connect(vec![Scenario::failed("result_failed_structured")]);

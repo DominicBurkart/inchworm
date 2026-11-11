@@ -676,6 +676,17 @@ fn result_text(value: &Value) -> String {
         .to_string()
 }
 
+fn split_diagnostics(text: &str) -> (String, Option<Value>) {
+    let mut end = text.len();
+    while let Some(at) = text[..end].rfind("\n\n{") {
+        if let Ok(diagnostics) = serde_json::from_str::<Value>(&text[at + 2..]) {
+            return (text[..at].to_string(), Some(diagnostics));
+        }
+        end = at;
+    }
+    (text.to_string(), None)
+}
+
 fn parse_failure(value: &Value) -> NannaFailure {
     let text = result_text(value);
     let structured = value.get("structuredContent");
@@ -685,17 +696,12 @@ fn parse_failure(value: &Value) -> NannaFailure {
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    let (head, tail) = match text.split_once("\n\n") {
-        Some((head, tail)) => (head.to_string(), Some(tail)),
-        None => (text.clone(), None),
-    };
-    let diagnostics_type = tail
-        .and_then(|tail| serde_json::from_str::<Value>(tail).ok())
-        .and_then(|d| {
-            d.get("error_type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
+    let (head, diagnostics) = split_diagnostics(&text);
+    let diagnostics_type = diagnostics.and_then(|d| {
+        d.get("error_type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     NannaFailure {
         failure_kind: string_at("/failure_kind"),
         error_type: string_at("/error_type").or(diagnostics_type),
