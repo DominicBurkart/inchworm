@@ -7,6 +7,7 @@ use crate::model::FailureClass;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskDone, TaskOutcome};
 
 pub const PROTECTED_DIR: &str = ".inchworm";
+pub const PROTECTED_FILE: &str = "inchworm.toml";
 pub const MAX_FORWARDED_PATCH_BYTES: usize = 100_000;
 
 pub trait Dispatcher {
@@ -70,16 +71,63 @@ pub fn branch_name(issue: u64, attempt: u32) -> String {
 }
 
 /// ```
-/// use inchworm::flow::touches_protected;
+/// use inchworm::flow::decode_git_quotes;
 ///
-/// assert!(touches_protected(".inchworm/flows.toml"));
-/// assert!(touches_protected("./src/../.inchworm/rubric.md"));
-/// assert!(!touches_protected("src/inchworm.rs"));
+/// assert_eq!(decode_git_quotes(".\\151nchworm/x"), ".inchworm/x");
+/// assert_eq!(decode_git_quotes("caf\\303\\251"), "caf\u{e9}");
+/// assert_eq!(decode_git_quotes("a\\tb\\\\c"), "a\tb\\c");
+/// assert_eq!(decode_git_quotes("odd\\q\\"), "odd\\q\\");
 /// ```
-pub fn touches_protected(path: &str) -> bool {
-    let unquoted = path.trim().trim_matches('"').replace('\\', "/");
+pub fn decode_git_quotes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let next = bytes[i + 1];
+        let named = match next {
+            b'a' => Some(7),
+            b'b' => Some(8),
+            b't' => Some(9),
+            b'n' => Some(10),
+            b'v' => Some(11),
+            b'f' => Some(12),
+            b'r' => Some(13),
+            b'\\' | b'"' => Some(next),
+            _ => None,
+        };
+        if let Some(byte) = named {
+            out.push(byte);
+            i += 2;
+        } else if (b'0'..=b'7').contains(&next) {
+            let mut value: u32 = 0;
+            let mut used = 0;
+            while used < 3 && i + 1 + used < bytes.len() {
+                let digit = bytes[i + 1 + used];
+                if !(b'0'..=b'7').contains(&digit) {
+                    break;
+                }
+                value = value * 8 + u32::from(digit - b'0');
+                used += 1;
+            }
+            out.push((value & 0xff) as u8);
+            i += 1 + used;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn components_are_protected(text: &str) -> bool {
+    let normalised = text.replace('\\', "/");
     let mut stack: Vec<&str> = Vec::new();
-    for part in unquoted.split('/') {
+    for part in normalised.split('/') {
         match part {
             "" | "." => {}
             ".." => {
@@ -91,6 +139,23 @@ pub fn touches_protected(path: &str) -> bool {
     stack
         .iter()
         .any(|part| part.eq_ignore_ascii_case(PROTECTED_DIR))
+        || stack
+            .last()
+            .is_some_and(|part| part.eq_ignore_ascii_case(PROTECTED_FILE))
+}
+
+/// ```
+/// use inchworm::flow::touches_protected;
+///
+/// assert!(touches_protected(".inchworm/flows.toml"));
+/// assert!(touches_protected("./src/../.inchworm/rubric.md"));
+/// assert!(touches_protected("\".\\151nchworm/x\""));
+/// assert!(touches_protected("services/api/inchworm.toml"));
+/// assert!(!touches_protected("src/inchworm.rs"));
+/// ```
+pub fn touches_protected(path: &str) -> bool {
+    let unquoted = path.trim().trim_matches('"');
+    components_are_protected(unquoted) || components_are_protected(&decode_git_quotes(unquoted))
 }
 
 fn header_paths(patch: &str) -> impl Iterator<Item = &str> {
@@ -133,8 +198,11 @@ pub fn protected_paths_in(files: &[String], patches: &[Option<&str>]) -> Vec<Str
         .collect();
     for patch in patches.iter().flatten() {
         for path in header_paths(patch) {
-            if touches_protected(path) && !found.iter().any(|f| f == path) {
-                found.push(path.to_string());
+            if touches_protected(path) {
+                let shown = decode_git_quotes(path);
+                if !found.contains(&shown) {
+                    found.push(shown);
+                }
             }
         }
     }
@@ -303,7 +371,7 @@ pub fn run_flow(
                 &step.name,
                 FailureClass::ProtectedPathViolation,
                 format!(
-                    "step output touches protected {PROTECTED_DIR}/**: {}",
+                    "step output touches protected {PROTECTED_DIR}/** or {PROTECTED_FILE}: {}",
                     violations.join(", ")
                 ),
             );
@@ -703,6 +771,60 @@ mod tests {
     }
 
     #[test]
+    fn git_quoted_octal_paths_are_decoded_before_they_are_matched() {
+        let header = "diff --git \"a/.\\151nchworm/x\" \"b/.\\151nchworm/x\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(header)]), [".inchworm/x"]);
+        let rename = "rename from src/a.rs\nrename to \"\\056inchworm/y\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(rename)]), [".inchworm/y"]);
+        let plus = "+++ \"b/.\\151NCHWORM/z\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(plus)]), [".iNCHWORM/z"]);
+        assert!(touches_protected("\\056inchworm/flows.toml"));
+        assert!(touches_protected("\"\\056inchworm\\057x\""));
+        assert!(touches_protected("src/\\056\\056/\\056inchworm/x"));
+    }
+
+    #[test]
+    fn a_windows_separator_is_still_a_separator_even_when_it_spells_an_escape() {
+        for bad in [
+            ".inchworm\\temp\\x",
+            ".inchworm\\new",
+            ".inchworm\\0",
+            ".inchworm\\\\x",
+        ] {
+            assert!(touches_protected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_inchworm_toml_at_any_depth_is_protected_but_lookalikes_are_not() {
+        for bad in [
+            "inchworm.toml",
+            "./inchworm.toml",
+            "a/b/inchworm.toml",
+            "A/INCHWORM.TOML",
+            "\"sub/inchworm.toml\"",
+            "sub\\inchworm.toml",
+            "src/\\151nchworm.toml",
+        ] {
+            assert!(touches_protected(bad), "{bad}");
+        }
+        for good in [
+            "inchworm.toml.bak",
+            "inchworm.tomlx",
+            "myinchworm.toml",
+            "inchworm.toml/child.rs",
+            "a/inchworm.tom",
+        ] {
+            assert!(!touches_protected(good), "{good}");
+        }
+        let patch = "diff --git a/svc/inchworm.toml b/svc/inchworm.toml\n";
+        assert_eq!(
+            protected_paths_in(&[], &[Some(patch)]),
+            ["svc/inchworm.toml"]
+        );
+    }
+
+    #[test]
     fn patch_scanning_covers_headers_but_ignores_unrelated_lines() {
         let clean = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+let p = \".inchworm/x\";\n";
         assert!(protected_paths_in(&[], &[Some(clean)]).is_empty());
@@ -737,6 +859,29 @@ mod tests {
         fn paths_without_one_are_accepted(parts in proptest::collection::vec("[a-z][a-z.]{0,6}", 1..5)) {
             prop_assume!(parts.iter().all(|p| p != ".inchworm"));
             prop_assert!(!touches_protected(&parts.join("/")));
+        }
+
+        #[test]
+        fn decoding_never_panics_and_leaves_text_without_backslashes_alone(text in ".{0,40}") {
+            let decoded = decode_git_quotes(&text);
+            if !text.contains('\\') {
+                prop_assert_eq!(decoded, text);
+            }
+        }
+
+        #[test]
+        fn fully_octal_escaping_the_protected_component_never_hides_it(
+            before in proptest::collection::vec("[a-z]{1,6}", 0..3),
+            after in proptest::collection::vec("[a-z]{1,6}", 0..3),
+        ) {
+            let escaped: String = PROTECTED_DIR.bytes().map(|b| format!("\\{b:03o}")).collect();
+            let mut parts: Vec<String> = before;
+            parts.push(escaped);
+            parts.extend(after);
+            let quoted = format!("\"{}\"", parts.join("/"));
+            prop_assert!(touches_protected(&quoted), "{quoted}");
+            let header = format!("diff --git {quoted} {quoted}\n");
+            prop_assert!(!protected_paths_in(&[], &[Some(header.as_str())]).is_empty());
         }
 
         #[test]

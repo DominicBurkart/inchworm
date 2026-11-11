@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use crate::config::{Flow, Trigger};
 use crate::flow::{
-    Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, branch_name, protected_paths_in, run_flow,
+    Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, PROTECTED_FILE, branch_name,
+    protected_paths_in, run_flow,
 };
 use crate::github::{GitHub, GitHubError, PullRequest};
 use crate::model::{FailureClass, RunState};
@@ -87,9 +88,10 @@ fn protected_pr_files(
         Err((
             FailureClass::ProtectedPathViolation,
             format!(
-                "pull request #{} touches protected {}/**: {}",
+                "pull request #{} touches protected {}/** or {}: {}",
                 pr.number,
                 PROTECTED_DIR,
+                PROTECTED_FILE,
                 violations.join(", ")
             ),
         ))
