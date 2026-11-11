@@ -66,6 +66,8 @@ impl<R: Runner> IdentityCatalog for NannaCatalog<R> {
     }
 }
 
+pub const NIX_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub struct NixBuilder<R: Runner = SystemRunner> {
     runner: R,
     program: String,
@@ -102,7 +104,8 @@ impl<R: Runner> NixBuilder<R> {
 impl<R: Runner> ImageBuilder for NixBuilder<R> {
     fn build(&self, repo: &Path) -> Result<(), String> {
         let flake = format!("path:{}#devContainerImage", repo.display());
-        let spec = CmdSpec::new(&self.program, ["build", flake.as_str(), "--no-link"]);
+        let spec = CmdSpec::new(&self.program, ["build", flake.as_str(), "--no-link"])
+            .with_timeout(NIX_BUILD_TIMEOUT);
         let out = self.runner.run(&spec).map_err(|e| e.to_string())?;
         if out.success() {
             Ok(())
