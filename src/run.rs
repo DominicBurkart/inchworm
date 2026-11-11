@@ -181,6 +181,13 @@ pub fn run_issue(
         };
         let outcome = match run_flow(flow, &input, dispatcher) {
             FlowOutcome::Completed { .. } => match ctx.github.pr_for_branch(ctx.slug, &branch) {
+                Ok(Some(pr)) if !pr.is_draft => (
+                    FailureClass::AgentFailed,
+                    format!(
+                        "pull request #{} is not a draft; inchworm only accepts draft pull requests",
+                        pr.number
+                    ),
+                ),
                 Ok(Some(pr)) => match protected_pr_files(ctx, &pr) {
                     Err(failure) => failure,
                     Ok(()) => {
@@ -346,6 +353,30 @@ mode = "draft_pr"
         assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:running"]);
         assert!(github.comments()[0].2.contains("pull/77"));
         assert_eq!(fake.assigned().len(), 2);
+    }
+
+    #[test]
+    fn a_ready_for_review_pr_is_not_accepted_and_nothing_is_recorded_for_it() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let mut ready = pr("deadbeef");
+        ready.is_draft = false;
+        github.add_pr("o/r", "inchworm/5-a1", ready);
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::AgentFailed);
+        assert!(
+            raw.contains("pull request #77") && raw.contains("not a draft"),
+            "{raw}"
+        );
+        assert!(summary.pr.is_none());
+        let attempt = &store.attempts(summary.run_id).unwrap()[0];
+        assert_eq!(attempt.pr_number, None);
+        assert_eq!(attempt.head_sha, None);
+        assert_eq!(attempt.failure_class, Some(FailureClass::AgentFailed));
     }
 
     #[test]
