@@ -407,6 +407,21 @@ impl NannaClient {
         parse_result(state, &value)
     }
 
+    fn cancel_or_collect(&mut self, task_id: &str) -> Result<TaskOutcome, ClientError> {
+        match self.cancel(task_id) {
+            Ok(_) => Ok(TaskOutcome::TimedOut),
+            Err(rejected @ ClientError::Rpc { code: -32602, .. }) => {
+                let info = self.get(task_id)?;
+                if info.state.is_terminal() {
+                    self.result(task_id, info.state)
+                } else {
+                    Err(rejected)
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// ```
     /// use std::io::BufReader;
     /// use std::path::PathBuf;
@@ -442,8 +457,7 @@ impl NannaClient {
         while !current.state.is_terminal() {
             let now = Instant::now();
             if now >= deadline {
-                self.cancel(&current.task_id)?;
-                return Ok(TaskOutcome::TimedOut);
+                return self.cancel_or_collect(&current.task_id);
             }
             let pause = Duration::from_millis(current.poll_interval_ms).min(deadline - now);
             std::thread::sleep(pause);

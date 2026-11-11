@@ -23,6 +23,9 @@ pub enum Scenario {
     Cancelled { result: Value },
     Refused { error: Value },
     Hang,
+    FinishedBeforeCancel { result: Value },
+    ForgottenBeforeCancel,
+    RejectsCancelStillWorking,
 }
 
 impl Scenario {
@@ -50,6 +53,12 @@ impl Scenario {
         body["files_modified"] = json!([]);
         result["content"][0]["text"] = json!(body.to_string());
         Scenario::Success { result }
+    }
+
+    pub fn finished_before_cancel() -> Scenario {
+        Scenario::FinishedBeforeCancel {
+            result: fixture("result_success"),
+        }
     }
 
     pub fn failed(fixture_name: &str) -> Scenario {
@@ -119,6 +128,7 @@ struct Task {
     scenario: Scenario,
     gets: usize,
     cancelled: bool,
+    cancel_rejected: bool,
 }
 
 fn serve(
@@ -166,6 +176,7 @@ fn serve(
                             scenario,
                             gets: 0,
                             cancelled: false,
+                            cancel_rejected: false,
                         },
                     );
                     reply(&id, Ok(created));
@@ -176,10 +187,25 @@ fn serve(
                     &id,
                     Err(json!({"code": -32602, "message": "Task not found"})),
                 ),
+                Some(task)
+                    if task.cancel_rejected
+                        && matches!(task.scenario, Scenario::ForgottenBeforeCancel) =>
+                {
+                    reply(
+                        &id,
+                        Err(json!({"code": -32602, "message": "Task not found"})),
+                    )
+                }
                 Some(task) => {
                     task.gets += 1;
                     let name = if task.cancelled {
                         "task_cancelled"
+                    } else if matches!(task.scenario, Scenario::FinishedBeforeCancel { .. }) {
+                        if task.cancel_rejected {
+                            "task_completed"
+                        } else {
+                            "task_working"
+                        }
                     } else if task.gets < 2 {
                         "task_working"
                     } else {
@@ -200,6 +226,20 @@ fn serve(
                     &id,
                     Err(json!({"code": -32602, "message": "Task not found"})),
                 ),
+                Some(task)
+                    if matches!(
+                        task.scenario,
+                        Scenario::FinishedBeforeCancel { .. }
+                            | Scenario::ForgottenBeforeCancel
+                            | Scenario::RejectsCancelStillWorking
+                    ) =>
+                {
+                    task.cancel_rejected = true;
+                    reply(
+                        &id,
+                        Err(json!({"code": -32602, "message": "Task already in a terminal state"})),
+                    )
+                }
                 Some(task) => {
                     task.cancelled = true;
                     let mut wire = fixture("task_cancelled");
@@ -216,7 +256,8 @@ fn serve(
                 Some(task) => match &task.scenario {
                     Scenario::Success { result }
                     | Scenario::Failed { result }
-                    | Scenario::Cancelled { result } => reply(&id, Ok(result.clone())),
+                    | Scenario::Cancelled { result }
+                    | Scenario::FinishedBeforeCancel { result } => reply(&id, Ok(result.clone())),
                     _ => reply(&id, Ok(fixture("result_cancelled_legacy"))),
                 },
             },

@@ -158,6 +158,51 @@ fn a_hanging_task_is_cancelled_when_the_timeout_passes() {
 }
 
 #[test]
+fn a_task_that_finishes_as_the_timeout_fires_returns_its_result() {
+    let (mut client, mut fake) = connect(vec![Scenario::finished_before_cancel()]);
+    client.initialize().unwrap();
+    let outcome = client
+        .run_task(&request("x"), Duration::from_millis(30))
+        .unwrap();
+    assert!(
+        matches!(&outcome, TaskOutcome::Completed(done) if !done.result_summary.is_empty()),
+        "{outcome:?}"
+    );
+    drop(client);
+    fake.settle();
+    let methods = fake.methods();
+    let cancel = methods.iter().position(|m| m == "tasks/cancel").unwrap();
+    assert_eq!(methods[cancel + 1], "tasks/get");
+    assert_eq!(methods[cancel + 2], "tasks/result");
+}
+
+#[test]
+fn a_cancel_rejected_for_a_task_nanna_has_forgotten_surfaces_the_rpc_error() {
+    let (mut client, _fake) = connect(vec![Scenario::ForgottenBeforeCancel]);
+    client.initialize().unwrap();
+    let err = client
+        .run_task(&request("x"), Duration::from_millis(30))
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc { code: -32602, .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_rejected_cancel_for_a_task_still_working_surfaces_the_rpc_error() {
+    let (mut client, _fake) = connect(vec![Scenario::RejectsCancelStillWorking]);
+    client.initialize().unwrap();
+    let err = client
+        .run_task(&request("x"), Duration::from_millis(30))
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc { code: -32602, .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn rpc_errors_on_other_methods_surface_with_code_and_kind() {
     let (mut client, _fake) = connect(vec![]);
     client.initialize().unwrap();
