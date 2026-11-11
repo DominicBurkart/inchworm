@@ -15,11 +15,18 @@ pub const MAX_REASON_CHARS: usize = 500;
 pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Verdict {
     pub judge: String,
     pub passed: bool,
     pub score: Option<u8>,
     pub detail: String,
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub model_error: bool,
 }
 
 impl Verdict {
@@ -36,6 +43,9 @@ impl Verdict {
             passed: true,
             score: None,
             detail: detail.to_string(),
+            index: 0,
+            step: None,
+            model_error: false,
         }
     }
 
@@ -45,11 +55,29 @@ impl Verdict {
             passed: false,
             score: None,
             detail: detail.to_string(),
+            index: 0,
+            step: None,
+            model_error: false,
         }
     }
 
     pub fn with_score(mut self, score: u8) -> Verdict {
         self.score = Some(score);
+        self
+    }
+
+    pub fn with_index(mut self, index: usize) -> Verdict {
+        self.index = index;
+        self
+    }
+
+    pub fn with_step(mut self, step: &str) -> Verdict {
+        self.step = Some(step.to_string());
+        self
+    }
+
+    pub fn with_model_error(mut self) -> Verdict {
+        self.model_error = true;
         self
     }
 }
@@ -492,6 +520,29 @@ mod tests {
     }
 
     #[test]
+    fn verdict_builders_set_index_step_and_model_error() {
+        let verdict = Verdict::pass("llm", "ok");
+        assert_eq!(
+            (verdict.index, verdict.step.clone(), verdict.model_error),
+            (0, None, false)
+        );
+        let verdict = verdict.with_index(2).with_step("review").with_model_error();
+        assert_eq!(verdict.index, 2);
+        assert_eq!(verdict.step.as_deref(), Some("review"));
+        assert!(verdict.model_error);
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: Verdict = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, verdict);
+        let legacy: Verdict =
+            serde_json::from_str(r#"{"judge":"diff","passed":true,"score":null,"detail":"x"}"#)
+                .unwrap();
+        assert_eq!(
+            (legacy.index, legacy.step, legacy.model_error),
+            (0, None, false)
+        );
+    }
+
+    #[test]
     fn diff_passes_a_small_allowed_patch() {
         let verdict = diff_judge(&patch("src/a.rs", 1, 2), 3, &[]);
         assert!(verdict.passed, "{verdict:?}");
@@ -824,7 +875,7 @@ mod tests {
             assert!(llm.passed);
             let diff = diff_judge(&tainted, 400, &[".github/**".to_string()]);
             assert!(!diff.passed);
-            let verdicts = [diff, llm];
+            let verdicts = [diff.with_index(0), llm.with_index(1)];
             for mode in [OutcomeMode::DraftPr, OutcomeMode::MergeWhen] {
                 let decision = decide(&PolicyInput {
                     mode,
@@ -833,7 +884,7 @@ mod tests {
                     checks: &[],
                     judged_head_sha: &sha,
                     live_head_sha: &sha,
-                    expected_judges: 2,
+                    expected_judges: &["diff".to_string(), "llm".to_string()],
                     verdicts: &verdicts,
                     human_gate: HumanGate::NotConsulted,
                 });
