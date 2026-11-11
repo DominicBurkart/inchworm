@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use crate::config::{FlowFile, GlobalConfig, RepoEntry};
 use crate::github::GhCli;
 use crate::model::RunState;
-use crate::nanna_client::NannaClient;
+use crate::nanna_client::{NannaClient, SpawnOptions, state_dir_for};
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
 use crate::run::{RunContext, run_issue};
 use crate::store::Store;
@@ -129,7 +129,9 @@ fn run_command(
     }
     let store = Store::open(&config.state_db)?;
     let github = GhCli::with_program(tools.gh.as_str());
-    let mut client = NannaClient::spawn(&config.nanna_bin)
+    let spawn_options =
+        SpawnOptions::new(config.nanna_bin.clone(), state_dir_for(&config.state_db));
+    let mut client = NannaClient::spawn(&spawn_options)
         .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
     client.initialize()?;
 

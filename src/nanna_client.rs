@@ -1,8 +1,10 @@
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -193,6 +195,127 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub const MAX_NOISE_LINES_PER_EXCHANGE: u64 = 1000;
 
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+const CANCEL_ON_DROP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnOptions {
+    pub bin: PathBuf,
+    pub state_dir: PathBuf,
+    pub config_dir: Option<PathBuf>,
+}
+
+impl SpawnOptions {
+    pub fn new(bin: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> SpawnOptions {
+        SpawnOptions {
+            bin: bin.into(),
+            state_dir: state_dir.into(),
+            config_dir: None,
+        }
+    }
+}
+
+pub fn state_dir_for(state_db: &Path) -> PathBuf {
+    state_db
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join("nanna")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnEnv {
+    pub queue_file: PathBuf,
+    pub set: Vec<(&'static str, PathBuf)>,
+    pub remove: Vec<&'static str>,
+}
+
+fn non_empty(lookup: &dyn Fn(&str) -> Option<OsString>, key: &str) -> Option<OsString> {
+    lookup(key).filter(|value| !value.is_empty())
+}
+
+/// ```
+/// use std::ffi::OsString;
+/// use inchworm::nanna_client::{spawn_env, SpawnOptions};
+///
+/// let options = SpawnOptions::new("nanna", "/state/inchworm/nanna");
+/// let lookup = |key: &str| (key == "HOME").then(|| OsString::from("/home/me"));
+/// let env = spawn_env(&options, "1-2-3", &lookup).unwrap();
+/// assert_eq!(env.queue_file.to_str(), Some("/state/inchworm/nanna/queue-1-2-3.jsonl"));
+/// let get = |name: &str| env.set.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone());
+/// assert_eq!(get("NANNA_BUDGET_PATH").unwrap().to_str(), Some("/home/me/.local/state/nanna/budget.json"));
+/// assert!(env.remove.contains(&"RUST_LOG"));
+/// ```
+pub fn spawn_env(
+    options: &SpawnOptions,
+    unique: &str,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<SpawnEnv, ClientError> {
+    let queue_file = options.state_dir.join(format!("queue-{unique}.jsonl"));
+    let shared_dir = || -> Result<PathBuf, ClientError> {
+        non_empty(lookup, "NANNA_QUEUE_PATH")
+            .and_then(|queue| PathBuf::from(queue).parent().map(Path::to_path_buf))
+            .or_else(|| {
+                non_empty(lookup, "HOME").map(|home| PathBuf::from(home).join(".local/state/nanna"))
+            })
+            .ok_or_else(|| {
+                ClientError::Protocol(
+                    "cannot locate nanna's shared state: set HOME or NANNA_QUEUE_PATH".into(),
+                )
+            })
+    };
+    let mut set = vec![("NANNA_QUEUE_PATH", queue_file.clone())];
+    for (key, file) in [
+        ("NANNA_LEASE_PATH", "leases.jsonl"),
+        ("NANNA_ESCALATION_PATH", "escalations.jsonl"),
+        ("NANNA_BUDGET_PATH", "budget.json"),
+    ] {
+        let path = match non_empty(lookup, key) {
+            Some(explicit) => PathBuf::from(explicit),
+            None => shared_dir()?.join(file),
+        };
+        set.push((key, path));
+    }
+    if let Some(config_dir) = &options.config_dir {
+        set.push(("NANNA_CONFIG_DIR", config_dir.clone()));
+    }
+    Ok(SpawnEnv {
+        queue_file,
+        set,
+        remove: vec!["RUST_LOG"],
+    })
+}
+
+fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn build_command(options: &SpawnOptions, env: &SpawnEnv) -> Command {
+    let mut command = Command::new(&options.bin);
+    command
+        .arg("mcp-serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for key in &env.remove {
+        command.env_remove(key);
+    }
+    for (key, value) in &env.set {
+        command.env(key, value);
+    }
+    command
+}
+
 fn spawn_reader(mut reader: impl BufRead + Send + 'static) -> Receiver<io::Result<String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -215,6 +338,9 @@ pub struct NannaClient {
     read_timeout: Duration,
     dead: bool,
     noise_lines: u64,
+    queue_file: Option<PathBuf>,
+    active_task: Option<String>,
+    shutdown_grace: Duration,
 }
 
 impl NannaClient {
@@ -227,7 +353,14 @@ impl NannaClient {
             read_timeout: DEFAULT_READ_TIMEOUT,
             dead: false,
             noise_lines: 0,
+            queue_file: None,
+            active_task: None,
+            shutdown_grace: SHUTDOWN_GRACE,
         }
+    }
+
+    pub fn set_shutdown_grace(&mut self, grace: Duration) {
+        self.shutdown_grace = grace;
     }
 
     /// ```
@@ -261,13 +394,18 @@ impl NannaClient {
         self.read_timeout = timeout;
     }
 
-    pub fn spawn(nanna_bin: &Path) -> Result<NannaClient, ClientError> {
-        let mut child = Command::new(nanna_bin)
-            .arg("mcp-serve")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+    pub fn spawn(options: &SpawnOptions) -> Result<NannaClient, ClientError> {
+        NannaClient::spawn_with_lookup(options, &|key| std::env::var_os(key))
+    }
+
+    pub fn spawn_with_lookup(
+        options: &SpawnOptions,
+        lookup: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<NannaClient, ClientError> {
+        let env = spawn_env(options, &unique_suffix(), lookup)?;
+        std::fs::create_dir_all(&options.state_dir)?;
+        let _ = std::fs::remove_file(&env.queue_file);
+        let mut child = build_command(options, &env).spawn()?;
         let stdin = child
             .stdin
             .take()
@@ -278,6 +416,7 @@ impl NannaClient {
             .ok_or_else(|| ClientError::Protocol("child has no stdout".into()))?;
         let mut client = NannaClient::new(BufReader::new(stdout), stdin);
         client.child = Some(child);
+        client.queue_file = Some(env.queue_file);
         Ok(client)
     }
 
@@ -377,7 +516,11 @@ impl NannaClient {
                 let task = result
                     .get("task")
                     .ok_or_else(|| ClientError::Protocol("CreateTaskResult missing task".into()))?;
-                Ok(Submitted::Accepted(TaskInfo::from_wire(task)?))
+                let info = TaskInfo::from_wire(task)?;
+                if !info.state.is_terminal() {
+                    self.active_task = Some(info.task_id.clone());
+                }
+                Ok(Submitted::Accepted(info))
             }
             Err(ClientError::Rpc {
                 message,
@@ -392,18 +535,30 @@ impl NannaClient {
         }
     }
 
+    fn settle_if_terminal(&mut self, info: TaskInfo) -> TaskInfo {
+        if info.state.is_terminal() && self.active_task.as_deref() == Some(info.task_id.as_str()) {
+            self.active_task = None;
+        }
+        info
+    }
+
     pub fn get(&mut self, task_id: &str) -> Result<TaskInfo, ClientError> {
         let value = self.request("tasks/get", json!({"taskId": task_id}))?;
-        TaskInfo::from_wire(&value)
+        let info = TaskInfo::from_wire(&value)?;
+        Ok(self.settle_if_terminal(info))
     }
 
     pub fn cancel(&mut self, task_id: &str) -> Result<TaskInfo, ClientError> {
         let value = self.request("tasks/cancel", json!({"taskId": task_id}))?;
-        TaskInfo::from_wire(&value)
+        let info = TaskInfo::from_wire(&value)?;
+        Ok(self.settle_if_terminal(info))
     }
 
     pub fn result(&mut self, task_id: &str, state: TaskState) -> Result<TaskOutcome, ClientError> {
         let value = self.request("tasks/result", json!({"taskId": task_id}))?;
+        if self.active_task.as_deref() == Some(task_id) {
+            self.active_task = None;
+        }
         parse_result(state, &value)
     }
 
@@ -469,9 +624,31 @@ impl NannaClient {
 
 impl Drop for NannaClient {
     fn drop(&mut self) {
+        if let Some(task_id) = self.active_task.take()
+            && !self.dead
+        {
+            self.read_timeout = CANCEL_ON_DROP_READ_TIMEOUT;
+            let _ = self.request("tasks/cancel", json!({"taskId": task_id}));
+        }
+        self.writer = Box::new(io::sink());
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let deadline = Instant::now() + self.shutdown_grace;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(queue_file) = self.queue_file.take() {
+            let _ = std::fs::remove_file(queue_file);
         }
     }
 }

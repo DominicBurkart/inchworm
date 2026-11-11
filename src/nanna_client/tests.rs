@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -311,25 +312,38 @@ fn task_done_detects_changes_from_any_output() {
     assert_eq!(done(None, None, &[]).denial_count, 1);
 }
 
-#[test]
-fn spawn_runs_a_binary_with_mcp_serve_and_talks_to_it() {
+fn script_options(dir: &Path, body: &str) -> SpawnOptions {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("nanna");
+    let script = dir.join("nanna");
     std::fs::write(
         &script,
-        "#!/bin/sh\n[ \"$1\" = mcp-serve ] || exit 9\nread line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}'\nread line\nsleep 5\n",
+        format!("#!/bin/sh\n[ \"$1\" = mcp-serve ] || exit 9\n{body}"),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut client = loop {
-        match NannaClient::spawn(&script) {
+    SpawnOptions::new(script, dir.join("state"))
+}
+
+fn spawn_script(options: &SpawnOptions, home: &Path) -> NannaClient {
+    let home = home.as_os_str().to_os_string();
+    let lookup = move |key: &str| (key == "HOME").then(|| home.clone());
+    loop {
+        match NannaClient::spawn_with_lookup(options, &lookup) {
             Err(ClientError::Io(err)) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             other => break other.unwrap(),
         }
-    };
+    }
+}
+
+const HANDSHAKE: &str = "read line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}'\nread line\n";
+
+#[test]
+fn spawn_runs_a_binary_with_mcp_serve_and_talks_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = script_options(dir.path(), &format!("{HANDSHAKE}exec cat >/dev/null\n"));
+    let mut client = spawn_script(&options, dir.path());
     assert_eq!(
         client.initialize().unwrap()["protocolVersion"],
         PROTOCOL_VERSION
@@ -338,10 +352,320 @@ fn spawn_runs_a_binary_with_mcp_serve_and_talks_to_it() {
 
 #[test]
 fn spawn_of_a_missing_binary_is_an_io_error() {
-    let err = NannaClient::spawn(Path::new("/definitely/not/nanna"))
+    let dir = tempfile::tempdir().unwrap();
+    let options = SpawnOptions::new("/definitely/not/nanna", dir.path().join("state"));
+    let err = NannaClient::spawn_with_lookup(&options, &|_| Some("/h".into()))
         .err()
         .unwrap();
     assert!(matches!(err, ClientError::Io(_)));
+}
+
+fn lookup_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+    move |key| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(v))
+    }
+}
+
+fn setting(env: &SpawnEnv, key: &str) -> Option<String> {
+    env.set
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.to_str().unwrap().to_string())
+}
+
+#[test]
+fn the_queue_is_unique_and_private_while_shared_state_keeps_nannas_defaults() {
+    let options = SpawnOptions::new("nanna", "/state/inchworm/nanna");
+    let env = spawn_env(&options, "7-8-9", &lookup_from(&[("HOME", "/home/me")])).unwrap();
+    assert_eq!(
+        setting(&env, "NANNA_QUEUE_PATH").as_deref(),
+        Some("/state/inchworm/nanna/queue-7-8-9.jsonl")
+    );
+    assert_eq!(
+        env.queue_file,
+        PathBuf::from("/state/inchworm/nanna/queue-7-8-9.jsonl")
+    );
+    assert_eq!(
+        setting(&env, "NANNA_LEASE_PATH").as_deref(),
+        Some("/home/me/.local/state/nanna/leases.jsonl")
+    );
+    assert_eq!(
+        setting(&env, "NANNA_ESCALATION_PATH").as_deref(),
+        Some("/home/me/.local/state/nanna/escalations.jsonl")
+    );
+    assert_eq!(
+        setting(&env, "NANNA_BUDGET_PATH").as_deref(),
+        Some("/home/me/.local/state/nanna/budget.json")
+    );
+    assert_eq!(setting(&env, "NANNA_CONFIG_DIR"), None);
+    assert_eq!(env.remove, ["RUST_LOG"]);
+}
+
+#[test]
+fn an_inherited_queue_path_only_locates_the_shared_files_and_is_never_reused() {
+    let options = SpawnOptions::new("nanna", "/state/inchworm/nanna");
+    let inherited = [
+        ("NANNA_QUEUE_PATH", "/data/nanna/queue.jsonl"),
+        ("HOME", "/home/me"),
+    ];
+    let env = spawn_env(&options, "u", &lookup_from(&inherited)).unwrap();
+    assert_eq!(
+        setting(&env, "NANNA_QUEUE_PATH").as_deref(),
+        Some("/state/inchworm/nanna/queue-u.jsonl")
+    );
+    assert_eq!(
+        setting(&env, "NANNA_BUDGET_PATH").as_deref(),
+        Some("/data/nanna/budget.json")
+    );
+}
+
+#[test]
+fn explicit_shared_paths_are_kept_and_empty_values_count_as_unset() {
+    let options = SpawnOptions::new("nanna", "/s");
+    let inherited = [
+        ("NANNA_LEASE_PATH", "/x/leases"),
+        ("NANNA_ESCALATION_PATH", ""),
+        ("NANNA_BUDGET_PATH", "/x/budget"),
+        ("HOME", "/home/me"),
+    ];
+    let env = spawn_env(&options, "u", &lookup_from(&inherited)).unwrap();
+    assert_eq!(
+        setting(&env, "NANNA_LEASE_PATH").as_deref(),
+        Some("/x/leases")
+    );
+    assert_eq!(
+        setting(&env, "NANNA_ESCALATION_PATH").as_deref(),
+        Some("/home/me/.local/state/nanna/escalations.jsonl")
+    );
+    assert_eq!(
+        setting(&env, "NANNA_BUDGET_PATH").as_deref(),
+        Some("/x/budget")
+    );
+}
+
+#[test]
+fn with_every_shared_path_explicit_no_home_is_needed() {
+    let options = SpawnOptions::new("nanna", "/s");
+    let inherited = [
+        ("NANNA_LEASE_PATH", "/x/l"),
+        ("NANNA_ESCALATION_PATH", "/x/e"),
+        ("NANNA_BUDGET_PATH", "/x/b"),
+    ];
+    assert!(spawn_env(&options, "u", &lookup_from(&inherited)).is_ok());
+}
+
+#[test]
+fn without_home_or_a_queue_path_the_shared_state_cannot_be_located() {
+    let options = SpawnOptions::new("nanna", "/s");
+    let err = spawn_env(&options, "u", &lookup_from(&[("HOME", "")])).unwrap_err();
+    assert!(
+        matches!(err, ClientError::Protocol(ref m) if m.contains("HOME or NANNA_QUEUE_PATH")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_config_dir_is_passed_only_when_given() {
+    let mut options = SpawnOptions::new("nanna", "/s");
+    options.config_dir = Some(PathBuf::from("/cfg/nanna"));
+    let env = spawn_env(&options, "u", &lookup_from(&[("HOME", "/h")])).unwrap();
+    assert_eq!(
+        setting(&env, "NANNA_CONFIG_DIR").as_deref(),
+        Some("/cfg/nanna")
+    );
+}
+
+#[test]
+fn the_command_removes_rust_log_and_sets_the_isolated_environment() {
+    let options = SpawnOptions::new("nanna", "/s");
+    let env = spawn_env(&options, "u", &lookup_from(&[("HOME", "/h")])).unwrap();
+    let command = build_command(&options, &env);
+    let envs: Vec<_> = command
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_str().unwrap().to_string(),
+                v.map(|v| v.to_str().unwrap().to_string()),
+            )
+        })
+        .collect();
+    assert!(envs.contains(&("RUST_LOG".to_string(), None)), "{envs:?}");
+    assert!(envs.contains(&(
+        "NANNA_QUEUE_PATH".to_string(),
+        Some("/s/queue-u.jsonl".to_string())
+    )));
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["mcp-serve"]);
+}
+
+#[test]
+fn every_spawn_gets_its_own_queue_file_name() {
+    let names: std::collections::HashSet<_> = (0..50).map(|_| unique_suffix()).collect();
+    assert_eq!(names.len(), 50);
+}
+
+#[test]
+fn the_child_sees_the_isolated_environment_and_the_queue_file_is_removed_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report");
+    let body = format!(
+        "{{ echo \"queue=$NANNA_QUEUE_PATH\"; echo \"lease=$NANNA_LEASE_PATH\"; echo \"rust_log=${{RUST_LOG-unset}}\"; }} > {report}\ntouch \"$NANNA_QUEUE_PATH\"\n{HANDSHAKE}exec cat >/dev/null\n",
+        report = report.display()
+    );
+    let options = script_options(dir.path(), &body);
+    let mut client = spawn_script(&options, dir.path());
+    client.initialize().unwrap();
+    let text = std::fs::read_to_string(&report).unwrap();
+    let queue = text
+        .lines()
+        .find_map(|l| l.strip_prefix("queue="))
+        .unwrap()
+        .to_string();
+    assert!(
+        queue.starts_with(options.state_dir.to_str().unwrap()),
+        "{text}"
+    );
+    assert!(Path::new(&queue).exists());
+    assert!(
+        text.contains(&format!(
+            "lease={}/.local/state/nanna/leases.jsonl",
+            dir.path().display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("rust_log=unset"), "{text}");
+    drop(client);
+    assert!(!Path::new(&queue).exists());
+}
+
+#[test]
+fn a_stale_queue_file_with_the_same_name_is_removed_before_spawning() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let options = SpawnOptions::new("/definitely/not/nanna", &state);
+    let env = spawn_env(&options, "fixed", &lookup_from(&[("HOME", "/h")])).unwrap();
+    std::fs::write(&env.queue_file, "stale").unwrap();
+    assert!(NannaClient::spawn_with_lookup(&options, &|_| Some("/h".into())).is_err());
+    assert!(state.exists());
+}
+
+fn pid_alive(pid: &str) -> bool {
+    Path::new("/proc").join(pid).exists()
+}
+
+#[test]
+fn dropping_the_client_lets_a_well_behaved_nanna_exit_on_stdin_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let body = format!(
+        "echo $$ > {}\n{HANDSHAKE}exec cat >/dev/null\n",
+        pidfile.display()
+    );
+    let options = script_options(dir.path(), &body);
+    let mut client = spawn_script(&options, dir.path());
+    client.initialize().unwrap();
+    client.set_shutdown_grace(Duration::from_secs(30));
+    let pid = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .to_string();
+    let started = Instant::now();
+    drop(client);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!pid_alive(&pid));
+}
+
+#[test]
+fn dropping_the_client_kills_a_nanna_that_ignores_stdin_eof_after_the_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let body = format!(
+        "echo $$ > {}\n{HANDSHAKE}exec sleep 60\n",
+        pidfile.display()
+    );
+    let options = script_options(dir.path(), &body);
+    let mut client = spawn_script(&options, dir.path());
+    client.initialize().unwrap();
+    client.set_shutdown_grace(Duration::from_millis(150));
+    let pid = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .to_string();
+    let started = Instant::now();
+    drop(client);
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!pid_alive(&pid));
+}
+
+#[test]
+fn dropping_a_client_with_a_running_task_cancels_it_first() {
+    let (mut client, mut fake) = connect(vec![Scenario::Hang]);
+    client.initialize().unwrap();
+    assert!(matches!(
+        client.assign_task(&request("x")).unwrap(),
+        Submitted::Accepted(_)
+    ));
+    drop(client);
+    fake.settle();
+    assert_eq!(
+        fake.methods().last().map(String::as_str),
+        Some("tasks/cancel")
+    );
+}
+
+#[test]
+fn a_finished_task_is_not_cancelled_on_drop() {
+    let (mut client, mut fake) = connect(vec![Scenario::success()]);
+    client.initialize().unwrap();
+    let outcome = client.run_task(&request("x"), WAIT).unwrap();
+    assert!(matches!(outcome, TaskOutcome::Completed(_)));
+    drop(client);
+    fake.settle();
+    assert!(!fake.methods().contains(&"tasks/cancel".to_string()));
+}
+
+#[test]
+fn a_cancelled_task_is_not_cancelled_again_on_drop() {
+    let (mut client, mut fake) = connect(vec![Scenario::Hang]);
+    client.initialize().unwrap();
+    let Submitted::Accepted(info) = client.assign_task(&request("x")).unwrap() else {
+        panic!("expected acceptance");
+    };
+    client.cancel(&info.task_id).unwrap();
+    drop(client);
+    fake.settle();
+    let cancels = fake
+        .methods()
+        .iter()
+        .filter(|m| *m == "tasks/cancel")
+        .count();
+    assert_eq!(cancels, 1);
+}
+
+#[test]
+fn a_dead_connection_does_not_try_to_cancel_on_drop() {
+    let (mut client, mut fake) = connect(vec![Scenario::Hang]);
+    client.initialize().unwrap();
+    let Submitted::Accepted(_) = client.assign_task(&request("x")).unwrap() else {
+        panic!("expected acceptance");
+    };
+    client.set_read_timeout(Duration::from_millis(10));
+    client.dead = true;
+    drop(client);
+    fake.settle();
+    assert!(!fake.methods().contains(&"tasks/cancel".to_string()));
 }
 
 #[test]
@@ -351,7 +675,9 @@ fn real_binary_speaks_the_pinned_protocol() {
     let bin = std::env::var("INCHWORM_NANNA_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(&home).join(".local/bin/nanna"));
-    let mut client = NannaClient::spawn(&bin).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let options = SpawnOptions::new(bin, state.path().join("nanna"));
+    let mut client = NannaClient::spawn(&options).unwrap();
     let init = client.initialize().unwrap();
     assert_eq!(init["protocolVersion"], PROTOCOL_VERSION);
     assert!(init["capabilities"]["tasks"]["requests"]["tools"]["call"].is_object());
