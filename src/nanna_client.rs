@@ -191,6 +191,8 @@ pub enum Submitted {
 
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+pub const MAX_NOISE_LINES_PER_EXCHANGE: u64 = 1000;
+
 fn spawn_reader(mut reader: impl BufRead + Send + 'static) -> Receiver<io::Result<String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -212,6 +214,7 @@ pub struct NannaClient {
     next_id: i64,
     read_timeout: Duration,
     dead: bool,
+    noise_lines: u64,
 }
 
 impl NannaClient {
@@ -223,7 +226,24 @@ impl NannaClient {
             next_id: 0,
             read_timeout: DEFAULT_READ_TIMEOUT,
             dead: false,
+            noise_lines: 0,
         }
+    }
+
+    /// ```
+    /// use std::io::BufReader;
+    /// use inchworm::nanna_client::NannaClient;
+    ///
+    /// let replies = concat!(
+    ///     "2026-11-10T12:00:00Z ERROR something nanna logged to stdout\n",
+    ///     r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#, "\n",
+    /// );
+    /// let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), std::io::sink());
+    /// client.initialize().unwrap();
+    /// assert_eq!(client.noise_lines(), 1);
+    /// ```
+    pub fn noise_lines(&self) -> u64 {
+        self.noise_lines
     }
 
     /// ```
@@ -290,6 +310,7 @@ impl NannaClient {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
+        let mut noise_in_exchange = 0u64;
         loop {
             let line = self.lines.recv_timeout(self.read_timeout).map_err(|err| {
                 if err == RecvTimeoutError::Timeout {
@@ -305,7 +326,16 @@ impl NannaClient {
             if trimmed.is_empty() {
                 continue;
             }
-            let message: Value = serde_json::from_str(trimmed)?;
+            let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+                self.noise_lines += 1;
+                noise_in_exchange += 1;
+                if noise_in_exchange > MAX_NOISE_LINES_PER_EXCHANGE {
+                    return Err(ClientError::Protocol(format!(
+                        "nanna sent more than {MAX_NOISE_LINES_PER_EXCHANGE} non-JSON lines without answering"
+                    )));
+                }
+                continue;
+            };
             if message.get("id") != Some(&json!(id)) {
                 continue;
             }

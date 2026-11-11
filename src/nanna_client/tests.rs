@@ -177,13 +177,7 @@ fn eof_before_a_response_is_an_error() {
 }
 
 #[test]
-fn garbage_and_malformed_responses_are_errors() {
-    let mut client = NannaClient::new(BufReader::new(&b"not json\n"[..]), io::sink());
-    assert!(matches!(
-        client.initialize().unwrap_err(),
-        ClientError::Json(_)
-    ));
-
+fn malformed_responses_are_protocol_errors() {
     let neither = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n";
     let mut client = NannaClient::new(BufReader::new(&neither[..]), io::sink());
     assert!(matches!(
@@ -353,17 +347,51 @@ fn a_hung_server_fails_run_task_instead_of_blocking_forever() {
 }
 
 #[test]
-fn malformed_json_and_read_errors_are_fatal_to_the_connection() {
+fn non_json_lines_on_stdout_are_skipped_not_fatal() {
+    let replies = concat!(
+        "2026-11-10T12:00:00Z ERROR harness: disk is slow\n",
+        "\n",
+        "42\n",
+        "[1,2]\n",
+        "\"just a string\"\n",
+        r#"{"level":"error","msg":"json log line without an id"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":99,"result":{"somebody":"else"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#,
+        "\n",
+    );
+    let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), io::sink());
+    let init = client.initialize().unwrap();
+    assert_eq!(init["protocolVersion"], PROTOCOL_VERSION);
+    assert_eq!(client.noise_lines(), 1);
+}
+
+#[test]
+fn garbage_then_end_of_stream_is_a_closed_connection_not_a_json_error() {
     let mut client = NannaClient::new(BufReader::new(&b"not json\n"[..]), io::sink());
-    assert!(matches!(
-        client.initialize().unwrap_err(),
-        ClientError::Json(_)
-    ));
+    assert!(matches!(client.initialize().unwrap_err(), ClientError::Eof));
+    assert_eq!(client.noise_lines(), 1);
     assert!(matches!(
         client.initialize().unwrap_err(),
         ClientError::Dead
     ));
+}
 
+#[test]
+fn a_flood_of_noise_without_an_answer_is_a_protocol_error() {
+    let flood = "log line\n".repeat(MAX_NOISE_LINES_PER_EXCHANGE as usize + 5);
+    let mut client = NannaClient::new(BufReader::new(std::io::Cursor::new(flood)), io::sink());
+    let err = client.initialize().unwrap_err();
+    assert!(
+        matches!(err, ClientError::Protocol(ref m) if m.contains("non-JSON")),
+        "{err:?}"
+    );
+    assert_eq!(client.noise_lines(), MAX_NOISE_LINES_PER_EXCHANGE + 1);
+}
+
+#[test]
+fn read_errors_are_fatal_to_the_connection() {
     struct Broken;
     impl io::Read for Broken {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
