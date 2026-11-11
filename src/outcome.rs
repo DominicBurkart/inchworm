@@ -34,6 +34,7 @@ pub struct OutcomeEnv<'a> {
     pub scorer: &'a dyn DynScorer,
     pub model_permit: Arc<Semaphore>,
     pub ci: CiPolicy,
+    pub human_gate: HumanGate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +157,7 @@ pub async fn run_judges(
     inputs: &JudgeInputs<'_>,
 ) -> Vec<Verdict> {
     let mut verdicts = Vec::new();
-    for judge in &flow.judge {
+    for (index, judge) in flow.judge.iter().enumerate() {
         let verdict = match judge {
             Judge::Diff {
                 max_lines,
@@ -182,7 +183,7 @@ pub async fn run_judges(
                 Err(err) => Verdict::fail("llm", &format!("cannot read rubric: {err}")),
             },
         };
-        verdicts.push(verdict);
+        verdicts.push(verdict.with_index(index));
     }
     verdicts
 }
@@ -344,6 +345,11 @@ pub async fn conclude(
     ctx.store
         .record_verdicts(published.attempt_id, sha, &verdicts, ctx.clock.now())?;
 
+    let expected_judges: Vec<String> = flow
+        .judge
+        .iter()
+        .map(|judge| judge.kind_name().to_string())
+        .collect();
     let decision = decide(&PolicyInput {
         mode: flow.outcome.mode,
         merge_method: flow.outcome.merge_method,
@@ -351,9 +357,9 @@ pub async fn conclude(
         checks: &checks,
         judged_head_sha: sha,
         live_head_sha: &live.head_sha,
-        expected_judges: flow.judge.len(),
+        expected_judges: &expected_judges,
         verdicts: &verdicts,
-        human_gate: HumanGate::NotConsulted,
+        human_gate: env.human_gate,
     });
 
     match decision {
@@ -669,8 +675,7 @@ mod tests {
     async fn green_ci_and_passing_judges_record_verdicts_and_leave_a_draft() {
         let rig = rig();
         rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
-        rig.github
-            .set_pr_patch("o/r", 77, "diff --git a/f b/f\n+x\n");
+        rig.github.set_pr_patch("o/r", 77, &patch(1));
         rig.github.push_check_poll(
             "o/r",
             SHA,
@@ -842,7 +847,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(summary.failure.unwrap().0, FailureClass::JudgeRejected);
+        assert_eq!(summary.failure.unwrap().0, FailureClass::ModelError);
 
         let missing = [Judge::Llm {
             rubric: "nope.md".into(),
@@ -938,6 +943,29 @@ mod tests {
                 .2
                 .contains("--match-head-commit")
         );
+    }
+
+    #[tokio::test]
+    async fn merge_when_with_an_unconsulted_human_gate_stays_a_draft_and_never_touches_the_pr() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        rig.github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![check("build", SHA, CheckConclusion::Success)],
+        );
+        rig.github.set_pr_patch("o/r", 77, &patch(2));
+        let mut env = env(&rig.scorer);
+        env.human_gate = HumanGate::NotConsulted;
+        let (mut client, _fake) = connect(two_successes(1));
+        client.initialize().unwrap();
+        let summary = run_issue(&rig.ctx(), &env, &merge_flow(), 5, &mut client)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, RunState::PrOpen);
+        assert!(rig.github.ready_calls().is_empty());
+        assert!(rig.github.merge_calls().is_empty());
+        assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
     }
 
     #[tokio::test]

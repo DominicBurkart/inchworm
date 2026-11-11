@@ -14,6 +14,7 @@ use crate::model::RunState;
 use crate::nanna_client::NannaClient;
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
 use crate::outcome::{CiPolicy, OutcomeEnv};
+use crate::policy::HumanGate;
 use crate::run::{RunContext, run_issue};
 use crate::stats::{parse_class, render_failures, render_stats, render_status};
 use crate::store::Store;
@@ -141,7 +142,7 @@ fn daemon_command(
         github: Arc::new(GhCli::with_program(tools.gh.as_str())),
         clock: Arc::new(SystemClock),
         dispatchers: Arc::new(NannaFactory::new(config.nanna_bin.clone())),
-        scorer: Arc::new(OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)),
+        scorer: Arc::new(OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)?),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -218,11 +219,12 @@ fn run_command(
         repo_path: &repo.path,
         clock: &clock,
     };
-    let scorer = OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT);
+    let scorer = OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)?;
     let env = OutcomeEnv {
         scorer: &scorer,
         model_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         ci: CiPolicy::default(),
+        human_gate: HumanGate::NotConsulted,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

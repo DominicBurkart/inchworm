@@ -305,6 +305,7 @@ async fn settle_published(
 ///     scorer: &NoModel,
 ///     model_permit: Arc::new(tokio::sync::Semaphore::new(1)),
 ///     ci: CiPolicy::default(),
+///     human_gate: inchworm::policy::HumanGate::NotConsulted,
 /// };
 /// let summary = run_issue(&ctx, &env, &file.flow[0], 1, &mut Cancels).await.unwrap();
 /// assert_eq!(summary.state, inchworm::model::RunState::Failed);

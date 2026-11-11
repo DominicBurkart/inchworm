@@ -20,6 +20,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "
 toml = "1.2.1"
 
 [dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 proptest = "1.12.0"

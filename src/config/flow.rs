@@ -120,6 +120,16 @@ pub struct Outcome {
     pub merge_method: MergeMethod,
 }
 
+impl Judge {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Judge::Diff { .. } => "diff",
+            Judge::NannaClean {} => "nanna_clean",
+            Judge::Llm { .. } => "llm",
+        }
+    }
+}
+
 impl FlowFile {
     /// ```
     /// use inchworm::config::{FlowFile, OutcomeMode};

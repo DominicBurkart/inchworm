@@ -15,6 +15,7 @@ use crate::judges::DynScorer;
 use crate::model::RunState;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskOutcome};
 use crate::outcome::{CiPolicy, OutcomeEnv};
+use crate::policy::HumanGate;
 use crate::run::{RunContext, enqueue_issue, execute_run};
 use crate::scheduler::Scheduler;
 use crate::store::{RunId, Store, StoreError};
@@ -126,7 +127,7 @@ async fn process(
     deps: &DaemonDeps,
     scheduler: &Scheduler<Job>,
     ci: CiPolicy,
-    mut lease: crate::scheduler::Lease<Job>,
+    _lease: crate::scheduler::Lease<Job>,
 ) {
     let repo = &job.repo;
     let file = match load_flows(repo) {
@@ -150,13 +151,13 @@ async fn process(
         scorer: deps.scorer.as_ref(),
         model_permit: scheduler.model_permit(),
         ci,
+        human_gate: HumanGate::NotConsulted,
     };
     let mut dispatcher = deps
         .dispatchers
         .make()
         .unwrap_or_else(|err| Box::new(Unavailable(err)));
-    let permit = lease.take_permit();
-    match execute_run(&ctx, &env, flow, job.run_id, dispatcher.as_mut(), permit).await {
+    match execute_run(&ctx, &env, flow, job.run_id, dispatcher.as_mut(), None).await {
         Ok(summary) => log(&format!(
             "{}: run {} finished as {}",
             repo.slug, job.run_id, summary.state

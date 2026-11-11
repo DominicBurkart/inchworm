@@ -462,12 +462,12 @@ impl Store {
         )?;
         let rows = statement.query_map([attempt_id], |row| {
             let score: Option<i64> = row.get("score")?;
-            Ok(Verdict {
-                judge: row.get("judge")?,
-                passed: row.get("passed")?,
-                score: score.and_then(|s| u8::try_from(s).ok()),
-                detail: row.get("detail")?,
-            })
+            Ok(Verdict::from_parts(
+                row.get("judge")?,
+                row.get("passed")?,
+                score.and_then(|s| u8::try_from(s).ok()),
+                row.get("detail")?,
+            ))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1177,7 +1177,7 @@ mod tests {
         fn verdicts_round_trip(passed in any::<bool>(), score in prop::option::of(0u8..=10), detail in ".{0,40}") {
             let (store, run) = store_with_run();
             let attempt = store.start_attempt(run, 1).unwrap();
-            let verdict = Verdict { judge: "llm".into(), passed, score, detail };
+            let verdict = Verdict::from_parts("llm".into(), passed, score, detail);
             store.record_verdicts(attempt.id, "sha", std::slice::from_ref(&verdict), 2).unwrap();
             prop_assert_eq!(store.verdicts(attempt.id).unwrap(), vec![verdict]);
         }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 
 #[derive(Debug)]
 pub struct RepoQueues<T> {
@@ -42,26 +42,15 @@ impl<T> RepoQueues<T> {
     }
 
     pub fn claim(&mut self) -> Option<(String, T)> {
-        self.claim_seq().map(|(repo, _, item)| (repo, item))
-    }
-
-    fn claim_seq(&mut self) -> Option<(String, u64, T)> {
         let repo = self
             .queues
             .iter()
             .filter(|(repo, queue)| !self.active.contains(*repo) && !queue.is_empty())
             .min_by_key(|(_, queue)| queue.front().map(|(seq, _)| *seq))
             .map(|(repo, _)| repo.clone())?;
-        let (seq, item) = self.queues.get_mut(&repo)?.pop_front()?;
+        let (_, item) = self.queues.get_mut(&repo)?.pop_front()?;
         self.active.insert(repo.clone());
-        Some((repo, seq, item))
-    }
-
-    fn requeue_front(&mut self, repo: &str, seq: u64, item: T) {
-        self.queues
-            .entry(repo.to_string())
-            .or_default()
-            .push_front((seq, item));
+        Some((repo, item))
     }
 
     pub fn finish(&mut self, repo: &str) {
@@ -108,11 +97,8 @@ impl<T> Clone for Scheduler<T> {
 
 pub struct Lease<T> {
     repo: String,
-    item: Option<T>,
-    seq: u64,
+    item: T,
     shared: Arc<Shared<T>>,
-    permit: Option<OwnedSemaphorePermit>,
-    started: bool,
 }
 
 impl<T> Lease<T> {
@@ -121,44 +107,13 @@ impl<T> Lease<T> {
     }
 
     pub fn item(&self) -> &T {
-        self.item
-            .as_ref()
-            .expect("lease item is present until drop")
-    }
-
-    /// ```
-    /// # #[tokio::main(flavor = "current_thread")]
-    /// # async fn main() {
-    /// use inchworm::scheduler::Scheduler;
-    ///
-    /// let scheduler = Scheduler::new(1);
-    /// scheduler.enqueue("a/x", 7u32);
-    /// let mut lease = scheduler.next().await;
-    /// let permit = lease.take_permit().unwrap();
-    /// assert!(lease.take_permit().is_none());
-    /// drop(permit);
-    /// assert_eq!(scheduler.model_permit().available_permits(), 1);
-    /// assert!(scheduler.is_active("a/x"));
-    /// drop(lease);
-    /// assert_eq!(scheduler.queued_len("a/x"), 0);
-    /// # }
-    /// ```
-    pub fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
-        self.permit.take()
+        &self.item
     }
 }
 
 impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
-        let started = self.started;
-        self.permit.take();
-        {
-            let mut queues = self.shared.queues();
-            if !started && let Some(item) = self.item.take() {
-                queues.requeue_front(&self.repo, self.seq, item);
-            }
-            queues.finish(&self.repo);
-        }
+        self.shared.queues().finish(&self.repo);
         self.shared.wake.notify_waiters();
         self.shared.wake.notify_one();
     }
@@ -174,9 +129,10 @@ impl<T> Scheduler<T> {
     /// scheduler.enqueue("a/x", 7u32);
     /// let lease = scheduler.next().await;
     /// assert_eq!((lease.repo(), *lease.item()), ("a/x", 7));
-    /// assert_eq!(scheduler.model_permit().available_permits(), 0);
-    /// drop(lease);
     /// assert_eq!(scheduler.model_permit().available_permits(), 1);
+    /// assert!(scheduler.is_active("a/x"));
+    /// drop(lease);
+    /// assert!(!scheduler.is_active("a/x"));
     /// # }
     /// ```
     pub fn new(permits: usize) -> Scheduler<T> {
@@ -211,21 +167,13 @@ impl<T> Scheduler<T> {
             let notified = self.shared.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let claimed = self.shared.queues().claim_seq();
-            if let Some((repo, seq, item)) = claimed {
-                let mut lease = Lease {
+            let claimed = self.shared.queues().claim();
+            if let Some((repo, item)) = claimed {
+                return Lease {
                     repo,
-                    item: Some(item),
-                    seq,
+                    item,
                     shared: Arc::clone(&self.shared),
-                    permit: None,
-                    started: false,
                 };
-                if let Ok(permit) = Arc::clone(&self.shared.permit).acquire_owned().await {
-                    lease.permit = Some(permit);
-                    lease.started = true;
-                }
-                return lease;
             }
             notified.await;
         }
@@ -308,7 +256,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn next_waits_for_work() {
         let s: Scheduler<u8> = Scheduler::new(1);
         assert!(timeout(SHORT, s.next()).await.is_err());
@@ -317,17 +265,56 @@ mod tests {
             tokio::spawn(async move { *s.next().await.item() })
         };
         tokio::time::sleep(SHORT).await;
+        assert!(!waiter.is_finished());
         s.enqueue("r", 5);
-        assert_eq!(
-            timeout(Duration::from_secs(2), waiter)
-                .await
-                .unwrap()
-                .unwrap(),
-            5
-        );
+        assert_eq!(waiter.await.unwrap(), 5);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_woken_by_a_lease_drop_takes_the_next_item() {
+        let s = Scheduler::new(1);
+        s.enqueue("r", 1);
+        s.enqueue("r", 2);
+        let first = s.next().await;
+        let waiter = {
+            let s = s.clone();
+            tokio::spawn(async move { *s.next().await.item() })
+        };
+        tokio::time::sleep(SHORT).await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        assert_eq!(waiter.await.unwrap(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn several_waiters_are_all_woken_when_a_repo_frees_up() {
+        let s = Scheduler::new(1);
+        s.enqueue("r", 1);
+        let first = s.next().await;
+        s.enqueue("r", 2);
+        s.enqueue("q", 3);
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let s = s.clone();
+                tokio::spawn(async move { *s.next().await.item() })
+            })
+            .collect();
+        tokio::time::sleep(SHORT).await;
+        let mut done = 0;
+        for waiter in &waiters {
+            done += usize::from(waiter.is_finished());
+        }
+        assert_eq!(done, 1);
+        drop(first);
+        let mut got = Vec::new();
+        for waiter in waiters {
+            got.push(waiter.await.unwrap());
+        }
+        got.sort();
+        assert_eq!(got, [2, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn second_run_in_the_same_repo_waits_for_the_lease_to_drop() {
         let s = Scheduler::new(2);
         s.enqueue("r", 1);
@@ -337,83 +324,106 @@ mod tests {
         assert!(s.is_active("r"));
         assert!(timeout(SHORT, s.next()).await.is_err());
         drop(first);
-        let second = timeout(Duration::from_secs(2), s.next()).await.unwrap();
-        assert_eq!(*second.item(), 2);
+        assert_eq!(*timeout(SHORT, s.next()).await.unwrap().item(), 2);
     }
 
-    #[tokio::test]
-    async fn global_permit_serialises_different_repos() {
+    #[tokio::test(start_paused = true)]
+    async fn different_repos_are_leased_concurrently_and_the_lease_holds_no_model_permit() {
         let s = Scheduler::new(1);
         s.enqueue("a", 1);
         s.enqueue("b", 2);
         let first = s.next().await;
-        assert!(timeout(SHORT, s.next()).await.is_err());
-        drop(first);
-        let second = timeout(Duration::from_secs(2), s.next()).await.unwrap();
-        assert_eq!(second.repo(), "b");
+        let second = timeout(SHORT, s.next()).await.unwrap();
+        assert_eq!((first.repo(), second.repo()), ("a", "b"));
+        assert_eq!(s.model_permit().available_permits(), 1);
     }
 
-    #[tokio::test]
-    async fn permit_is_shared_with_other_holders_such_as_the_llm_judge() {
+    #[tokio::test(start_paused = true)]
+    async fn a_run_holding_a_lease_can_still_take_the_model_permit() {
         let s = Scheduler::new(1);
-        let judge_permit = s.model_permit().acquire_owned().await.unwrap();
         s.enqueue("a", 1);
-        assert!(timeout(SHORT, s.next()).await.is_err());
-        drop(judge_permit);
-        let lease = timeout(Duration::from_secs(2), s.next()).await.unwrap();
-        assert_eq!(s.model_permit().available_permits(), 0);
+        let lease = s.next().await;
+        let permit = timeout(SHORT, s.model_permit().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s.is_active(lease.repo()));
+        drop(permit);
+        assert_eq!(s.model_permit().available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n_leased_runs_can_all_use_n_permits_without_deadlock() {
+        let s = Scheduler::new(2);
+        for repo in ["a", "b", "c"] {
+            s.enqueue(repo, repo.to_string());
+        }
+        let leases = [s.next().await, s.next().await, s.next().await];
+        for lease in &leases {
+            let permit = timeout(SHORT, s.model_permit().acquire_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(permit);
+            assert!(s.is_active(lease.repo()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_lease_frees_the_repo_and_prunes_its_empty_queue() {
+        let s = Scheduler::new(1);
+        s.enqueue("a", 1);
+        let lease = s.next().await;
+        assert!(s.is_active("a"));
+        assert_eq!(s.queued_len("a"), 0);
         drop(lease);
+        assert!(!s.is_active("a"));
+        assert!(s.shared.queues().queues.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_next_leaves_queued_work_untouched() {
+        let s = Scheduler::new(1);
+        assert!(timeout(SHORT, s.next()).await.is_err());
+        s.enqueue("a", 1);
+        s.enqueue("a", 2);
+        drop(s.next().await);
+        assert_eq!(s.queued_len("a"), 1);
+        assert!(!s.is_active("a"));
+        assert_eq!(*s.next().await.item(), 2);
+    }
+
+    struct Fixed;
+
+    impl crate::judges::Scorer for Fixed {
+        async fn complete(
+            &self,
+            _model: &str,
+            _prompt: &str,
+        ) -> Result<String, crate::judges::LlmError> {
+            Ok(r#"{"score":9,"reason":"ok"}"#.to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_llm_judge_runs_under_a_lease_on_the_shared_permit() {
+        let s = Scheduler::new(1);
+        s.enqueue("a", 1);
+        let lease = s.next().await;
+        let verdict = timeout(
+            SHORT,
+            crate::judges::llm_judge(&Fixed, &s.model_permit(), "r", "m", 5, "+x"),
+        )
+        .await
+        .expect("the judge must not deadlock against its own lease");
+        assert!(verdict.passed);
+        assert!(s.is_active(lease.repo()));
         assert_eq!(s.model_permit().available_permits(), 1);
     }
 
     #[tokio::test]
-    async fn an_llm_judge_can_take_the_permit_once_the_lease_hands_it_over() {
-        let s = Scheduler::new(1);
-        s.enqueue("a", 1);
-        let mut lease = s.next().await;
-        assert!(
-            timeout(SHORT, s.model_permit().acquire_owned())
-                .await
-                .is_err()
-        );
-        drop(lease.take_permit());
-        let judge = timeout(SHORT, s.model_permit().acquire_owned())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(judge);
-        assert!(s.is_active("a"));
-    }
-
-    #[tokio::test]
-    async fn dropping_a_lease_after_handing_over_the_permit_does_not_requeue() {
-        let s = Scheduler::new(1);
-        s.enqueue("a", 1);
-        let mut lease = s.next().await;
-        drop(lease.take_permit());
-        drop(lease);
-        assert_eq!(s.queued_len("a"), 0);
-        assert!(!s.is_active("a"));
-        assert!(timeout(SHORT, s.next()).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn cancelled_next_does_not_leave_the_repo_stuck() {
-        let s = Scheduler::new(1);
-        let judge_permit = s.model_permit().acquire_owned().await.unwrap();
-        s.enqueue("a", 1);
-        s.enqueue("a", 2);
-        assert!(timeout(SHORT, s.next()).await.is_err());
-        assert!(!s.is_active("a"));
-        assert_eq!(s.queued_len("a"), 2);
-        drop(judge_permit);
-        assert_eq!(*s.next().await.item(), 1);
-    }
-
-    #[tokio::test]
     async fn zero_permits_is_treated_as_one() {
-        let s = Scheduler::new(0);
-        s.enqueue("a", 1);
-        assert_eq!(*timeout(SHORT, s.next()).await.unwrap().item(), 1);
+        let s: Scheduler<u8> = Scheduler::new(0);
+        assert_eq!(s.model_permit().available_permits(), 1);
     }
 }
