@@ -1251,6 +1251,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resuming_a_succeeded_attempt_closes_the_run_without_dispatching_again() {
+        for state in [RunState::AwaitingCi, RunState::Judging] {
+            let rig = rig();
+            rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+            let run = published_run(&rig, state);
+            let attempt = rig.store.attempts(run).unwrap()[0].id;
+            rig.store.finish_attempt_ok(attempt, 6).unwrap();
+            let summary = execute_run(
+                &rig.ctx(),
+                &env(&rig.scorer),
+                &flow_with(2, "", DRAFT_OUTCOME),
+                run,
+                &mut MustNotDispatch,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(summary.state, RunState::PrOpen, "{state}");
+            assert_eq!(summary.attempts, 1);
+            assert_eq!(rig.store.run(run).unwrap().state, RunState::PrOpen);
+            assert_eq!(rig.store.attempts(run).unwrap().len(), 1);
+            assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
+        }
+    }
+
+    #[tokio::test]
+    async fn resuming_a_published_attempt_whose_pr_already_merged_records_the_merge() {
+        let rig = rig();
+        let mut merged = pr_at(77, SHA);
+        merged.state = PrState::Merged;
+        merged.is_draft = false;
+        rig.github.add_pr("o/r", "inchworm/5-a1", merged);
+        let run = published_run(&rig, RunState::Judging);
+        let summary = execute_run(
+            &rig.ctx(),
+            &env(&rig.scorer),
+            &merge_flow(),
+            run,
+            &mut MustNotDispatch,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::Merged);
+        assert_eq!(rig.store.run(run).unwrap().state, RunState::Merged);
+        assert_eq!(
+            rig.store.attempts(run).unwrap()[0].state,
+            AttemptState::Succeeded
+        );
+        assert!(rig.github.merge_calls().is_empty());
+        assert!(rig.github.draft_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_resumed_judging_run_that_is_still_pending_times_out_instead_of_hanging() {
         let rig = rig();
         rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));

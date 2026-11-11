@@ -9,9 +9,10 @@ use crate::flow::{
     Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, branch_name, nanna_report,
     protected_paths_in, run_flow,
 };
+use crate::github::PrState;
 use crate::github::{GitHub, GitHubError, PullRequest};
 use crate::model::{FailureClass, RunState};
-use crate::outcome::{ConcludeContext, Concluded, OutcomeEnv, Published, conclude};
+use crate::outcome::{ConcludeContext, Concluded, DONE_LABEL, OutcomeEnv, Published, conclude};
 use crate::store::{AttemptState, RunId, Store, StoreError};
 
 pub const RUNNING_LABEL: &str = "inchworm:running";
@@ -168,6 +169,54 @@ fn published_pr(ctx: &RunContext<'_>, attempt_pr: Option<u64>) -> Result<PullReq
     Ok(ctx.github.pr(ctx.slug, number)?)
 }
 
+fn settle_resumed(
+    ctx: &RunContext<'_>,
+    flow: &Flow,
+    run_id: RunId,
+    issue: u64,
+    attempt: &crate::store::Attempt,
+    warnings: &mut Vec<String>,
+) -> Result<Option<(RunState, PullRequest)>, RunError> {
+    if !matches!(
+        attempt.state,
+        AttemptState::Succeeded | AttemptState::Published
+    ) {
+        return Ok(None);
+    }
+    let pr = published_pr(ctx, attempt.pr_number)?;
+    let target = match (attempt.state, pr.state) {
+        (_, PrState::Merged) => RunState::Merged,
+        (AttemptState::Succeeded, _) => RunState::PrOpen,
+        _ => return Ok(None),
+    };
+    for step in [RunState::AwaitingCi, RunState::Judging] {
+        if ctx.store.run(run_id)?.state.can_transition_to(step) {
+            ctx.store.set_run_state(run_id, step, ctx.clock.now())?;
+        }
+    }
+    if attempt.state == AttemptState::Published {
+        ctx.store.finish_attempt_ok(attempt.id, ctx.clock.now())?;
+    }
+    ctx.store.set_run_state(run_id, target, ctx.clock.now())?;
+    relabel(
+        ctx,
+        issue,
+        &[DONE_LABEL],
+        &[RUNNING_LABEL, trigger_label(flow)],
+        warnings,
+    );
+    note(
+        ctx,
+        issue,
+        &format!(
+            "inchworm resumed after a restart and found {} already settled as {target}.",
+            pr.url
+        ),
+        warnings,
+    );
+    Ok(Some((target, pr)))
+}
+
 async fn settle_published(
     ctx: &RunContext<'_>,
     env: &OutcomeEnv<'_>,
@@ -317,6 +366,20 @@ pub async fn execute_run(
             }
             AttemptState::Dispatched | AttemptState::Succeeded => {}
         }
+    }
+
+    if let Some(last) = existing.last()
+        && let Some((state, pr)) =
+            settle_resumed(ctx, flow, run_id, issue_number, last, &mut warnings)?
+    {
+        return Ok(RunSummary {
+            run_id,
+            attempts,
+            state,
+            pr: Some(pr),
+            failure: None,
+            warnings,
+        });
     }
 
     loop {
