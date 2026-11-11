@@ -3,12 +3,14 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use thiserror::Error;
 
+use crate::judges::Verdict;
 use crate::model::{FailureClass, InvalidTransition, RunState};
 
 pub type RunId = i64;
 pub type AttemptId = i64;
 
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
 CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
     repo TEXT NOT NULL,
@@ -35,7 +37,24 @@ CREATE TABLE attempts (
     ended_at INTEGER,
     UNIQUE (run_id, n)
 );
-"];
+",
+    "
+ALTER TABLE attempts ADD COLUMN nanna_denials INTEGER;
+ALTER TABLE attempts ADD COLUMN nanna_qa_ok INTEGER;
+CREATE TABLE verdicts (
+    id INTEGER PRIMARY KEY,
+    attempt_id INTEGER NOT NULL REFERENCES attempts(id),
+    head_sha TEXT NOT NULL,
+    judge TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    score INTEGER,
+    detail TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX verdicts_by_attempt ON verdicts (attempt_id);
+CREATE INDEX attempts_by_failure ON attempts (failure_class);
+",
+];
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -56,6 +75,7 @@ pub enum StoreError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptState {
     Dispatched,
+    Published,
     Succeeded,
     Failed,
 }
@@ -64,6 +84,7 @@ impl AttemptState {
     const fn as_str(self) -> &'static str {
         match self {
             AttemptState::Dispatched => "dispatched",
+            AttemptState::Published => "published",
             AttemptState::Succeeded => "succeeded",
             AttemptState::Failed => "failed",
         }
@@ -72,6 +93,7 @@ impl AttemptState {
     fn parse(text: &str) -> Result<AttemptState, StoreError> {
         match text {
             "dispatched" => Ok(AttemptState::Dispatched),
+            "published" => Ok(AttemptState::Published),
             "succeeded" => Ok(AttemptState::Succeeded),
             "failed" => Ok(AttemptState::Failed),
             other => Err(StoreError::Corrupt(format!("attempt state `{other}`"))),
@@ -101,12 +123,49 @@ pub struct Attempt {
     pub pr_number: Option<u64>,
     pub failure_class: Option<FailureClass>,
     pub raw_error: Option<String>,
+    pub nanna_denials: Option<u64>,
+    pub nanna_qa_ok: Option<bool>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
 }
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateRow {
+    pub repo: String,
+    pub flow: String,
+    pub total: u64,
+    pub succeeded: u64,
+}
+
+impl RateRow {
+    pub fn rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.succeeded as f64 / self.total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureCount {
+    pub class: FailureClass,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureRow {
+    pub run_id: RunId,
+    pub repo: String,
+    pub issue: u64,
+    pub attempt: u32,
+    pub class: FailureClass,
+    pub raw_error: String,
+    pub ended_at: i64,
 }
 
 fn corrupt<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> StoreError + '_ {
@@ -132,6 +191,8 @@ fn attempt_from_row(row: &Row<'_>) -> Result<Attempt, StoreError> {
     let n: i64 = row.get("n")?;
     let pr: Option<i64> = row.get("pr_number")?;
     let class: Option<String> = row.get("failure_class")?;
+    let denials: Option<i64> = row.get("nanna_denials")?;
+    let qa_ok: Option<i64> = row.get("nanna_qa_ok")?;
     Ok(Attempt {
         id: row.get("id")?,
         run_id: row.get("run_id")?,
@@ -148,6 +209,11 @@ fn attempt_from_row(row: &Row<'_>) -> Result<Attempt, StoreError> {
             .transpose()
             .map_err(corrupt("failure class"))?,
         raw_error: row.get("raw_error")?,
+        nanna_denials: denials
+            .map(u64::try_from)
+            .transpose()
+            .map_err(corrupt("nanna denials"))?,
+        nanna_qa_ok: qa_ok.map(|v| v != 0),
         started_at: row.get("started_at")?,
         ended_at: row.get("ended_at")?,
     })
@@ -174,6 +240,7 @@ impl Store {
 
     fn from_connection(conn: Connection) -> Result<Store, StoreError> {
         conn.pragma_update(None, "foreign_keys", true)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Store { conn };
         store.migrate()?;
         Ok(store)
@@ -187,9 +254,18 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
-        let current = self.schema_version()?;
-        for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-            let tx = self.conn.unchecked_transaction()?;
+        for (index, sql) in MIGRATIONS.iter().enumerate() {
+            if self.schema_version()? > index {
+                continue;
+            }
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if usize::try_from(current).unwrap_or(0) > index {
+                continue;
+            }
             tx.execute_batch(sql)?;
             tx.pragma_update(
                 None,
@@ -334,6 +410,188 @@ impl Store {
         Ok(())
     }
 
+    pub fn mark_published(
+        &self,
+        id: AttemptId,
+        denials: u64,
+        qa_ok: Option<bool>,
+    ) -> Result<(), StoreError> {
+        let denials = i64::try_from(denials).map_err(corrupt("nanna denials"))?;
+        let changed = self.conn.execute(
+            "UPDATE attempts SET state = ?1, nanna_denials = ?2, nanna_qa_ok = ?3
+             WHERE id = ?4 AND state = 'dispatched'",
+            params![AttemptState::Published.as_str(), denials, qa_ok, id],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        self.attempt(id)?;
+        Err(StoreError::AttemptNotDispatched(id))
+    }
+
+    pub fn record_verdicts(
+        &self,
+        attempt_id: AttemptId,
+        head_sha: &str,
+        verdicts: &[Verdict],
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for verdict in verdicts {
+            tx.execute(
+                "INSERT INTO verdicts (attempt_id, head_sha, judge, passed, score, detail, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    attempt_id,
+                    head_sha,
+                    verdict.judge,
+                    verdict.passed,
+                    verdict.score,
+                    verdict.detail,
+                    now
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn verdicts(&self, attempt_id: AttemptId) -> Result<Vec<Verdict>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT judge, passed, score, detail FROM verdicts WHERE attempt_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([attempt_id], |row| {
+            let score: Option<i64> = row.get("score")?;
+            Ok(Verdict {
+                judge: row.get("judge")?,
+                passed: row.get("passed")?,
+                score: score.and_then(|s| u8::try_from(s).ok()),
+                detail: row.get("detail")?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn runs_in_states(&self, states: &[RunState]) -> Result<Vec<Run>, StoreError> {
+        let wanted: Vec<String> = states.iter().map(|s| format!("'{}'", s.as_str())).collect();
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT * FROM runs WHERE state IN ({}) ORDER BY id",
+            wanted.join(",")
+        ))?;
+        let rows = statement.query_map([], |row| Ok(run_from_row(row)))?;
+        rows.map(|row| row?).collect()
+    }
+
+    pub fn recent_runs(&self, limit: usize) -> Result<Vec<Run>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .conn
+            .prepare("SELECT * FROM runs ORDER BY updated_at DESC, id DESC LIMIT ?1")?;
+        let rows = statement.query_map([limit], |row| Ok(run_from_row(row)))?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// ```
+    /// use inchworm::model::RunState;
+    /// use inchworm::store::Store;
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let run = store.enqueue_run("o/r", 1, "issue", 0).unwrap().unwrap();
+    /// store.set_run_state(run, RunState::Failed, 5).unwrap();
+    /// let rows = store.success_rates(10, None).unwrap();
+    /// assert_eq!((rows[0].total, rows[0].succeeded), (1, 0));
+    /// assert_eq!(rows[0].rate(), 0.0);
+    /// assert!(store.success_rates(1000, Some(10)).unwrap().is_empty());
+    /// ```
+    pub fn success_rates(
+        &self,
+        now: i64,
+        window_secs: Option<i64>,
+    ) -> Result<Vec<RateRow>, StoreError> {
+        let since = window_secs.map(|w| now.saturating_sub(w));
+        let mut statement = self.conn.prepare(
+            "SELECT repo, flow, COUNT(*), COALESCE(SUM(state IN ('merged', 'pr_open')), 0)
+             FROM runs
+             WHERE state IN ('merged', 'pr_open', 'failed', 'escalated')
+               AND (?1 IS NULL OR updated_at >= ?1)
+             GROUP BY repo, flow ORDER BY repo, flow",
+        )?;
+        let rows = statement.query_map([since], |row| {
+            let total: i64 = row.get(2)?;
+            let succeeded: i64 = row.get(3)?;
+            Ok(RateRow {
+                repo: row.get(0)?,
+                flow: row.get(1)?,
+                total: u64::try_from(total).unwrap_or(0),
+                succeeded: u64::try_from(succeeded).unwrap_or(0),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn failure_histogram(
+        &self,
+        class: Option<FailureClass>,
+    ) -> Result<Vec<FailureCount>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT failure_class, COUNT(*) FROM attempts
+             WHERE failure_class IS NOT NULL AND (?1 IS NULL OR failure_class = ?1)
+             GROUP BY failure_class ORDER BY COUNT(*) DESC, failure_class",
+        )?;
+        let rows = statement.query_map([class.map(FailureClass::as_str)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = Vec::new();
+        for row in rows {
+            let (name, count) = row?;
+            counts.push(FailureCount {
+                class: name.parse().map_err(corrupt("failure class"))?,
+                count: u64::try_from(count).map_err(corrupt("count"))?,
+            });
+        }
+        Ok(counts)
+    }
+
+    pub fn recent_failures(
+        &self,
+        class: Option<FailureClass>,
+        limit: usize,
+    ) -> Result<Vec<FailureRow>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.conn.prepare(
+            "SELECT r.id, r.repo, r.issue, a.n, a.failure_class, COALESCE(a.raw_error, ''),
+                    COALESCE(a.ended_at, a.started_at)
+             FROM attempts a JOIN runs r ON r.id = a.run_id
+             WHERE a.failure_class IS NOT NULL AND (?1 IS NULL OR a.failure_class = ?1)
+             ORDER BY a.ended_at DESC, a.id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![class.map(FailureClass::as_str), limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut failures = Vec::new();
+        for row in rows {
+            let (run_id, repo, issue, attempt, class, raw_error, ended_at) = row?;
+            failures.push(FailureRow {
+                run_id,
+                repo,
+                issue: u64::try_from(issue).map_err(corrupt("issue"))?,
+                attempt: u32::try_from(attempt).map_err(corrupt("attempt"))?,
+                class: class.parse().map_err(corrupt("failure class"))?,
+                raw_error,
+                ended_at,
+            });
+        }
+        Ok(failures)
+    }
+
     pub fn finish_attempt_ok(&self, id: AttemptId, now: i64) -> Result<(), StoreError> {
         self.finish(id, AttemptState::Succeeded, None, None, now)
     }
@@ -358,7 +616,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             "UPDATE attempts SET state = ?1, failure_class = ?2, raw_error = ?3, ended_at = ?4
-             WHERE id = ?5 AND state = 'dispatched'",
+             WHERE id = ?5 AND state IN ('dispatched', 'published')",
             params![
                 state.as_str(),
                 class.map(FailureClass::as_str),
@@ -668,7 +926,262 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_opens_of_a_fresh_database_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).map(|s| s.schema_version().unwrap()))
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), MIGRATIONS.len());
+        }
+    }
+
+    #[test]
+    fn publishing_keeps_the_attempt_out_of_crash_recovery_and_records_the_nanna_report() {
+        let (store, run) = store_with_run();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        store.record_pr(attempt.id, "b", "sha", 3).unwrap();
+        store.mark_published(attempt.id, 2, Some(false)).unwrap();
+        assert_eq!(store.recover_after_crash(20).unwrap(), 0);
+        let published = store.attempt(attempt.id).unwrap();
+        assert_eq!(published.state, AttemptState::Published);
+        assert_eq!(published.nanna_denials, Some(2));
+        assert_eq!(published.nanna_qa_ok, Some(false));
+        assert!(matches!(
+            store.mark_published(attempt.id, 0, None),
+            Err(StoreError::AttemptNotDispatched(_))
+        ));
+        assert!(matches!(
+            store.mark_published(999, 0, None),
+            Err(StoreError::AttemptNotFound(999))
+        ));
+        store
+            .finish_attempt_failed(attempt.id, FailureClass::CiRed, "check x failed", 21)
+            .unwrap();
+        let failed = store.attempt(attempt.id).unwrap();
+        assert_eq!(failed.state, AttemptState::Failed);
+        assert_eq!(failed.failure_class, Some(FailureClass::CiRed));
+    }
+
+    #[test]
+    fn corrupt_rows_are_reported_not_trusted() {
+        let (store, run) = store_with_run();
+        let attempt = store.start_attempt(run, 1).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET state = 'bogus' WHERE id = ?1",
+                [attempt.id],
+            )
+            .unwrap();
+        let err = store.attempt(attempt.id).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(m) if m.contains("bogus")));
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET state = 'dispatched', pr_number = -4 WHERE id = ?1",
+                [attempt.id],
+            )
+            .unwrap();
+        let err = store.attempt(attempt.id).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(m) if m.contains("pr number")));
+    }
+
+    #[test]
+    fn unknown_report_values_stay_none() {
+        let (store, run) = store_with_run();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        store.mark_published(attempt.id, 0, None).unwrap();
+        let published = store.attempt(attempt.id).unwrap();
+        assert_eq!(
+            (published.nanna_denials, published.nanna_qa_ok),
+            (Some(0), None)
+        );
+        assert_eq!(
+            store
+                .attempt(store.start_attempt(run, 12).unwrap().id)
+                .unwrap()
+                .nanna_denials,
+            None
+        );
+    }
+
+    #[test]
+    fn verdicts_round_trip_in_order_per_attempt() {
+        let (store, run) = store_with_run();
+        let first = store.start_attempt(run, 11).unwrap();
+        let second = store.start_attempt(run, 12).unwrap();
+        let verdicts = [
+            Verdict::pass("diff", "3 lines"),
+            Verdict::fail("llm", "too vague").with_score(4),
+        ];
+        store
+            .record_verdicts(first.id, "sha1", &verdicts, 13)
+            .unwrap();
+        store
+            .record_verdicts(second.id, "sha2", &verdicts[..1], 14)
+            .unwrap();
+        assert_eq!(store.verdicts(first.id).unwrap(), verdicts);
+        assert_eq!(store.verdicts(second.id).unwrap(), &verdicts[..1]);
+        assert!(store.verdicts(999).unwrap().is_empty());
+        assert!(store.record_verdicts(999, "s", &verdicts, 1).is_err());
+    }
+
+    #[test]
+    fn runs_in_states_and_recent_runs() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.enqueue_run("o/r", 1, "issue", 1).unwrap().unwrap();
+        let b = store.enqueue_run("o/r", 2, "issue", 2).unwrap().unwrap();
+        store.set_run_state(b, RunState::Running, 5).unwrap();
+        let queued = store.runs_in_states(&[RunState::Queued]).unwrap();
+        assert_eq!(queued.iter().map(|r| r.id).collect::<Vec<_>>(), [a]);
+        let open = store
+            .runs_in_states(&[RunState::Queued, RunState::Running])
+            .unwrap();
+        assert_eq!(open.len(), 2);
+        assert!(store.runs_in_states(&[]).unwrap().is_empty());
+        let recent = store.recent_runs(1).unwrap();
+        assert_eq!(recent[0].id, b);
+    }
+
+    fn finish_run(store: &Store, repo: &str, issue: u64, flow: &str, end: RunState, at: i64) {
+        let id = store.enqueue_run(repo, issue, flow, at).unwrap().unwrap();
+        store.set_run_state(id, RunState::Running, at).unwrap();
+        match end {
+            RunState::Failed | RunState::Escalated => store.set_run_state(id, end, at).unwrap(),
+            _ => {
+                store.set_run_state(id, RunState::AwaitingCi, at).unwrap();
+                store.set_run_state(id, RunState::Judging, at).unwrap();
+                store.set_run_state(id, end, at).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn success_rates_aggregate_per_repo_flow_and_window() {
+        let store = Store::open_in_memory().unwrap();
+        finish_run(&store, "o/a", 1, "issue", RunState::PrOpen, 100);
+        finish_run(&store, "o/a", 2, "issue", RunState::Merged, 200);
+        finish_run(&store, "o/a", 3, "issue", RunState::Failed, 300);
+        finish_run(&store, "o/a", 4, "other", RunState::Escalated, 300);
+        finish_run(&store, "o/b", 1, "issue", RunState::Failed, 50);
+        store.enqueue_run("o/b", 9, "issue", 400).unwrap();
+
+        let all = store.success_rates(1000, None).unwrap();
+        let summary: Vec<_> = all
+            .iter()
+            .map(|r| (r.repo.as_str(), r.flow.as_str(), r.total, r.succeeded))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("o/a", "issue", 3, 2),
+                ("o/a", "other", 1, 0),
+                ("o/b", "issue", 1, 0)
+            ]
+        );
+        assert!((all[0].rate() - 2.0 / 3.0).abs() < 1e-9);
+
+        let recent = store.success_rates(1000, Some(750)).unwrap();
+        let summary: Vec<_> = recent.iter().map(|r| (r.repo.as_str(), r.total)).collect();
+        assert_eq!(summary, [("o/a", 1), ("o/a", 1)]);
+        assert_eq!(
+            RateRow {
+                repo: String::new(),
+                flow: String::new(),
+                total: 0,
+                succeeded: 0
+            }
+            .rate(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn failure_histogram_and_recent_failures_filter_by_class() {
+        let (store, run) = store_with_run();
+        for (class, raw, at) in [
+            (FailureClass::CiRed, "check a red", 20),
+            (FailureClass::ModelError, "oom", 21),
+            (FailureClass::CiRed, "check b red", 22),
+        ] {
+            let attempt = store.start_attempt(run, at).unwrap();
+            store
+                .finish_attempt_failed(attempt.id, class, raw, at)
+                .unwrap();
+        }
+        let ok = store.start_attempt(run, 30).unwrap();
+        store.finish_attempt_ok(ok.id, 31).unwrap();
+
+        let histogram = store.failure_histogram(None).unwrap();
+        assert_eq!(
+            histogram,
+            [
+                FailureCount {
+                    class: FailureClass::CiRed,
+                    count: 2
+                },
+                FailureCount {
+                    class: FailureClass::ModelError,
+                    count: 1
+                }
+            ]
+        );
+        let only = store
+            .failure_histogram(Some(FailureClass::ModelError))
+            .unwrap();
+        assert_eq!(only.len(), 1);
+
+        let recent = store.recent_failures(None, 2).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|f| f.raw_error.as_str())
+                .collect::<Vec<_>>(),
+            ["check b red", "oom"]
+        );
+        assert_eq!(
+            (recent[0].repo.as_str(), recent[0].issue, recent[0].attempt),
+            ("o/r", 1, 3)
+        );
+        let red = store
+            .recent_failures(Some(FailureClass::CiRed), 10)
+            .unwrap();
+        assert_eq!(red.len(), 2);
+        assert!(
+            store
+                .recent_failures(Some(FailureClass::Timeout), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     proptest! {
+        #[test]
+        fn histogram_counts_match_the_attempts_recorded(classes in prop::collection::vec(0..FailureClass::ALL.len(), 0..20)) {
+            let (store, run) = store_with_run();
+            for index in &classes {
+                let attempt = store.start_attempt(run, 1).unwrap();
+                store.finish_attempt_failed(attempt.id, FailureClass::ALL[*index], "x", 2).unwrap();
+            }
+            let total: u64 = store.failure_histogram(None).unwrap().iter().map(|c| c.count).sum();
+            prop_assert_eq!(total, classes.len() as u64);
+        }
+
+        #[test]
+        fn verdicts_round_trip(passed in any::<bool>(), score in prop::option::of(0u8..=10), detail in ".{0,40}") {
+            let (store, run) = store_with_run();
+            let attempt = store.start_attempt(run, 1).unwrap();
+            let verdict = Verdict { judge: "llm".into(), passed, score, detail };
+            store.record_verdicts(attempt.id, "sha", std::slice::from_ref(&verdict), 2).unwrap();
+            prop_assert_eq!(store.verdicts(attempt.id).unwrap(), vec![verdict]);
+        }
+
         #[test]
         fn attempt_numbers_are_sequential(count in 1usize..12) {
             let (store, run) = store_with_run();

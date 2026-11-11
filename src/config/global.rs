@@ -170,6 +170,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[test]
+    fn a_repo_with_an_empty_path_is_rejected() {
+        let text = "nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"\"\n";
+        assert!(
+            GlobalConfig::parse(text)
+                .unwrap_err()
+                .to_string()
+                .contains("empty path")
+        );
+    }
+
     const FULL: &str = r#"
 nanna_bin = "~/.nix-profile/bin/nanna"
 ollama_url = "http://localhost:11434"

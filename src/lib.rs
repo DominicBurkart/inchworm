@@ -1,12 +1,21 @@
 pub mod classify;
 pub mod cli;
+pub mod clock;
 pub mod config;
+pub mod daemon;
 pub mod exec;
 pub mod flow;
 pub mod github;
+pub mod judges;
 pub mod model;
 pub mod nanna_client;
 pub mod online;
+pub mod outcome;
+pub mod policy;
 pub mod run;
+pub mod scheduler;
+pub mod stats;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod validate;

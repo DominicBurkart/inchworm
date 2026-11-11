@@ -1,15 +1,21 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
+use crate::clock::{Clock, SystemClock};
 use crate::config::{FlowFile, GlobalConfig, RepoEntry};
+use crate::daemon::{DaemonDeps, DaemonSettings, NannaFactory, run_daemon};
 use crate::github::GhCli;
+use crate::judges::OllamaClient;
 use crate::model::RunState;
 use crate::nanna_client::NannaClient;
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
+use crate::outcome::{CiPolicy, OutcomeEnv};
 use crate::run::{RunContext, run_issue};
+use crate::stats::{parse_class, render_failures, render_stats, render_status};
 use crate::store::Store;
 use crate::validate::validate;
 
@@ -29,6 +35,28 @@ pub enum Command {
         online: bool,
         #[arg(long)]
         build_images: bool,
+        #[arg(long)]
+        skip_branch_protection: bool,
+    },
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Stats {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        window: Option<String>,
+    },
+    Failures {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        class: Option<String>,
+    },
+    Daemon {
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Run {
         repo: String,
@@ -74,14 +102,66 @@ fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEnt
         .ok_or_else(|| anyhow!("repo `{selector}` is not in the config"))
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn open_store(config: &GlobalConfig) -> Result<Store> {
+    if let Some(parent) = config.state_db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    Ok(Store::open(&config.state_db)?)
 }
 
-fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_images: bool) -> bool {
+fn report_command(
+    config: &GlobalConfig,
+    report: impl FnOnce(&Store) -> Result<String>,
+) -> Result<bool> {
+    let store = open_store(config)?;
+    print!("{}", report(&store)?);
+    Ok(true)
+}
+
+async fn termination_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("a SIGTERM handler can be installed");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+fn daemon_command(
+    config: GlobalConfig,
+    tools: &Tools,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<bool> {
+    drop(open_store(&config)?);
+    let settings = DaemonSettings::from_config(&config);
+    let deps = DaemonDeps {
+        github: Arc::new(GhCli::with_program(tools.gh.as_str())),
+        clock: Arc::new(SystemClock),
+        dispatchers: Arc::new(NannaFactory::new(config.nanna_bin.clone())),
+        scorer: Arc::new(OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_daemon(settings, deps, shutdown))?;
+    Ok(true)
+}
+
+struct ValidateMode {
+    online: bool,
+    build_images: bool,
+    branch_protection: bool,
+}
+
+fn validate_command(config: GlobalConfig, tools: &Tools, mode: ValidateMode) -> bool {
+    let ValidateMode {
+        online,
+        build_images,
+        branch_protection,
+    } = mode;
     let report = if online || build_images {
         let catalog = NannaCatalog::new(&config.nanna_bin);
         let github = GhCli::with_program(tools.gh.as_str());
@@ -89,6 +169,7 @@ fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_ima
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection,
             builder: build_images.then_some(&builder as &dyn ImageBuilder),
         };
         validate_online(&config, &online)
@@ -123,25 +204,30 @@ fn run_command(
         )
     })?;
 
-    if let Some(parent) = config.state_db.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-    let store = Store::open(&config.state_db)?;
+    let store = open_store(&config)?;
     let github = GhCli::with_program(tools.gh.as_str());
     let mut client = NannaClient::spawn(&config.nanna_bin)
         .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
     client.initialize()?;
 
-    let clock = now;
+    let clock = SystemClock;
     let ctx = RunContext {
         store: &store,
         github: &github,
         slug: &repo.slug,
         repo_path: &repo.path,
-        now: &clock,
+        clock: &clock,
     };
-    let summary = run_issue(&ctx, selected, issue, &mut client)?;
+    let scorer = OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT);
+    let env = OutcomeEnv {
+        scorer: &scorer,
+        model_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        ci: CiPolicy::default(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let summary = runtime.block_on(run_issue(&ctx, &env, selected, issue, &mut client))?;
     println!(
         "run {} for {}#{issue}: {} after {} attempt(s)",
         summary.run_id, repo.slug, summary.state, summary.attempts
@@ -154,9 +240,6 @@ fn run_command(
     }
     for warning in &summary.warnings {
         eprintln!("warning: {warning}");
-    }
-    if summary.state == RunState::AwaitingCi {
-        println!("CI, judges and the outcome policy are not run by this command yet");
     }
     Ok(summary.state != RunState::Failed)
 }
@@ -180,12 +263,33 @@ pub fn execute(cli: Cli, tools: &Tools) -> Result<bool> {
             config,
             online,
             build_images,
+            skip_branch_protection,
         } => Ok(validate_command(
             load_config(config, tools)?,
             tools,
-            online,
-            build_images,
+            ValidateMode {
+                online,
+                build_images,
+                branch_protection: !skip_branch_protection,
+            },
         )),
+        Command::Status { config } => report_command(&load_config(config, tools)?, |store| {
+            Ok(render_status(store)?)
+        }),
+        Command::Stats { config, window } => {
+            report_command(&load_config(config, tools)?, |store| {
+                Ok(render_stats(store, SystemClock.now(), window.as_deref())?)
+            })
+        }
+        Command::Failures { config, class } => {
+            let class = class.as_deref().map(parse_class).transpose()?;
+            report_command(&load_config(config, tools)?, |store| {
+                Ok(render_failures(store, class)?)
+            })
+        }
+        Command::Daemon { config } => {
+            daemon_command(load_config(config, tools)?, tools, termination_signal())
+        }
         Command::Run {
             repo,
             issue,
@@ -311,6 +415,28 @@ mod tests {
     }
 
     #[test]
+    fn online_validate_compares_required_checks_with_branch_protection() {
+        let env = env();
+        write(
+            &env.repo,
+            ".inchworm/flows.toml",
+            &FLOWS.replace(
+                "mode = \"draft_pr\"",
+                "mode = \"draft_pr\"\nrequired_checks = [\"build\"]",
+            ),
+        );
+        assert!(env.exec(&["validate", "--online"]).unwrap());
+        env.set("protection", "test\n");
+        assert!(!env.exec(&["validate", "--online"]).unwrap());
+        assert!(
+            env.exec(&["validate", "--online", "--skip-branch-protection"])
+                .unwrap()
+        );
+        env.set("protection", "build\n");
+        assert!(env.exec(&["validate", "--online"]).unwrap());
+    }
+
+    #[test]
     fn build_images_builds_and_reports_failures() {
         let env = env();
         let record = env.dir.path().join("nix-args");
@@ -332,9 +458,56 @@ mod tests {
         let env = env();
         assert!(env.exec(&["run", "o/r", "5"]).unwrap());
         let store = Store::open(&env.dir.path().join("state/state.db")).unwrap();
-        let run = store.active_run("o/r").unwrap().unwrap();
-        assert_eq!(run.state, RunState::AwaitingCi);
+        let run = store.recent_runs(1).unwrap().remove(0);
+        assert_eq!(run.state, RunState::PrOpen);
         assert_eq!(store.attempts(run.id).unwrap()[0].pr_number, Some(9));
+    }
+
+    #[test]
+    fn status_stats_and_failures_read_the_store_after_a_run() {
+        let env = env();
+        assert!(env.exec(&["status"]).unwrap());
+        assert!(env.exec(&["stats"]).unwrap());
+        assert!(env.exec(&["failures"]).unwrap());
+        assert!(env.exec(&["run", "o/r", "5"]).unwrap());
+        env.set("state", "task_failed");
+        env.set("result", "result_failed_structured");
+        assert!(!env.exec(&["run", "o/r", "5"]).unwrap());
+        assert!(env.exec(&["status"]).unwrap());
+        assert!(env.exec(&["stats", "--window", "24h"]).unwrap());
+        assert!(
+            env.exec(&["failures", "--class", "max_iterations"])
+                .unwrap()
+        );
+        let store = Store::open(&env.dir.path().join("state/state.db")).unwrap();
+        assert_eq!(
+            store.success_rates(SystemClock.now(), None).unwrap()[0].total,
+            2
+        );
+    }
+
+    #[test]
+    fn the_daemon_starts_polls_and_stops_on_shutdown() {
+        let env = env();
+        let config = GlobalConfig::load(&env.config, &env.tools.home).unwrap();
+        assert!(daemon_command(config, &env.tools, std::future::ready(())).unwrap());
+        assert!(env.dir.path().join("state/state.db").exists());
+    }
+
+    #[test]
+    fn stats_and_failures_reject_unknown_arguments() {
+        let env = env();
+        let err = env.exec(&["stats", "--window", "1y"]).unwrap_err();
+        assert!(err.to_string().contains("unknown window"));
+        let err = env.exec(&["failures", "--class", "nope"]).unwrap_err();
+        assert!(err.to_string().contains("unknown failure class"));
+    }
+
+    #[test]
+    fn run_prints_label_failures_as_warnings_and_still_succeeds() {
+        let env = env();
+        env.set("fail_edit", "1");
+        assert!(env.exec(&["run", "o/r", "5"]).unwrap());
     }
 
     #[test]
@@ -369,6 +542,9 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("flow nope not found"));
         assert!(env.exec(&["run", "o/r", "5"]).unwrap());
+        let store = Store::open(&env.dir.path().join("state/state.db")).unwrap();
+        store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        drop(store);
         let err = env.exec(&["run", "o/r", "5"]).unwrap_err();
         assert!(err.to_string().contains("already has a run"));
     }

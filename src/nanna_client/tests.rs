@@ -283,7 +283,14 @@ fn spawn_runs_a_binary_with_mcp_serve_and_talks_to_it() {
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut client = NannaClient::spawn(&script).unwrap();
+    let mut client = loop {
+        match NannaClient::spawn(&script) {
+            Err(ClientError::Io(err)) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => break other.unwrap(),
+        }
+    };
     assert_eq!(
         client.initialize().unwrap()["protocolVersion"],
         PROTOCOL_VERSION
@@ -322,5 +329,50 @@ fn real_binary_speaks_the_pinned_protocol() {
     assert!(matches!(
         client.get("nope").unwrap_err(),
         ClientError::Rpc { .. }
+    ));
+}
+
+#[test]
+fn a_silent_server_times_out_each_read_and_marks_the_client_dead() {
+    let (silent, _keep_open) = std::io::pipe().unwrap();
+    let mut client = NannaClient::new(BufReader::new(silent), io::sink());
+    client.set_read_timeout(Duration::from_millis(30));
+    let err = client.initialize().unwrap_err();
+    assert!(matches!(err, ClientError::ReadTimeout(_)), "{err:?}");
+    assert!(err.to_string().contains("nothing for"));
+    assert!(matches!(client.get("t").unwrap_err(), ClientError::Dead));
+}
+
+#[test]
+fn a_hung_server_fails_run_task_instead_of_blocking_forever() {
+    let (silent, _keep_open) = std::io::pipe().unwrap();
+    let mut client = NannaClient::new(BufReader::new(silent), io::sink());
+    client.set_read_timeout(Duration::from_millis(30));
+    let err = client.run_task(&request("x"), WAIT).unwrap_err();
+    assert!(matches!(err, ClientError::ReadTimeout(_)), "{err:?}");
+}
+
+#[test]
+fn malformed_json_and_read_errors_are_fatal_to_the_connection() {
+    let mut client = NannaClient::new(BufReader::new(&b"not json\n"[..]), io::sink());
+    assert!(matches!(
+        client.initialize().unwrap_err(),
+        ClientError::Json(_)
+    ));
+    assert!(matches!(
+        client.initialize().unwrap_err(),
+        ClientError::Dead
+    ));
+
+    struct Broken;
+    impl io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("boom"))
+        }
+    }
+    let mut client = NannaClient::new(BufReader::new(Broken), io::sink());
+    assert!(matches!(
+        client.initialize().unwrap_err(),
+        ClientError::Io(_)
     ));
 }

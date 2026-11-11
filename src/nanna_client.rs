@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -16,6 +17,10 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
     #[error("nanna closed the connection before answering")]
     Eof,
+    #[error("nanna sent nothing for {0:?}")]
+    ReadTimeout(Duration),
+    #[error("nanna connection is unusable after an earlier failure")]
+    Dead,
     #[error("nanna protocol violation: {0}")]
     Protocol(String),
     #[error("nanna rpc error {code}: {message}")]
@@ -127,6 +132,29 @@ pub struct TaskDone {
 }
 
 impl TaskDone {
+    /// ```
+    /// use inchworm::nanna_client::parse_result;
+    /// use inchworm::nanna_client::TaskState;
+    /// use serde_json::json;
+    ///
+    /// let body = json!({"qa_summary": {"endpoint_checks_failed": 0, "console_errors": 2}}).to_string();
+    /// let value = json!({"isError": false, "content": [{"type": "text", "text": body}]});
+    /// let outcome = parse_result(TaskState::Completed, &value).unwrap();
+    /// let inchworm::nanna_client::TaskOutcome::Completed(done) = outcome else { panic!() };
+    /// assert_eq!(done.qa_ok(), Some(false));
+    /// ```
+    pub fn qa_ok(&self) -> Option<bool> {
+        let qa = self.raw.get("qa_summary")?.as_object()?;
+        let failed = [
+            "endpoint_checks_failed",
+            "browser_steps_failed",
+            "console_errors",
+        ]
+        .iter()
+        .any(|key| qa.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
+        Some(!failed)
+    }
+
     pub fn has_changes(&self) -> bool {
         let non_empty = |p: &Option<String>| p.as_deref().is_some_and(|s| !s.trim().is_empty());
         non_empty(&self.changes_patch)
@@ -184,21 +212,56 @@ pub enum Submitted {
     Refused(NannaFailure),
 }
 
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn spawn_reader(mut reader: impl BufRead + Send + 'static) -> Receiver<io::Result<String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut open = true;
+        while open {
+            let mut line = String::new();
+            let message = reader.read_line(&mut line).map(|_| line);
+            open = matches!(&message, Ok(line) if !line.is_empty());
+            open &= tx.send(message).is_ok();
+        }
+    });
+    rx
+}
+
 pub struct NannaClient {
-    reader: Box<dyn BufRead + Send>,
+    lines: Receiver<io::Result<String>>,
     writer: Box<dyn Write + Send>,
     child: Option<Child>,
     next_id: i64,
+    read_timeout: Duration,
+    dead: bool,
 }
 
 impl NannaClient {
     pub fn new(reader: impl BufRead + Send + 'static, writer: impl Write + Send + 'static) -> Self {
         NannaClient {
-            reader: Box::new(reader),
+            lines: spawn_reader(reader),
             writer: Box::new(writer),
             child: None,
             next_id: 0,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            dead: false,
         }
+    }
+
+    /// ```
+    /// use std::io::BufReader;
+    /// use std::time::Duration;
+    /// use inchworm::nanna_client::{ClientError, NannaClient};
+    ///
+    /// let (silent, _keep_open) = std::io::pipe().unwrap();
+    /// let mut client = NannaClient::new(BufReader::new(silent), std::io::sink());
+    /// client.set_read_timeout(Duration::from_millis(20));
+    /// assert!(matches!(client.initialize(), Err(ClientError::ReadTimeout(_))));
+    /// assert!(matches!(client.initialize(), Err(ClientError::Dead)));
+    /// ```
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = timeout;
     }
 
     pub fn spawn(nanna_bin: &Path) -> Result<NannaClient, ClientError> {
@@ -230,13 +293,35 @@ impl NannaClient {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
+        if self.dead {
+            return Err(ClientError::Dead);
+        }
+        let result = self.exchange(method, params);
+        if matches!(
+            result,
+            Err(ClientError::ReadTimeout(_)
+                | ClientError::Eof
+                | ClientError::Io(_)
+                | ClientError::Json(_))
+        ) {
+            self.dead = true;
+        }
+        result
+    }
+
+    fn exchange(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        let mut line = String::new();
         loop {
-            line.clear();
-            if self.reader.read_line(&mut line)? == 0 {
+            let line = self.lines.recv_timeout(self.read_timeout).map_err(|err| {
+                if err == RecvTimeoutError::Timeout {
+                    ClientError::ReadTimeout(self.read_timeout)
+                } else {
+                    ClientError::Eof
+                }
+            })??;
+            if line.is_empty() {
                 return Err(ClientError::Eof);
             }
             let trimmed = line.trim();

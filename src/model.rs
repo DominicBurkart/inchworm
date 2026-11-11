@@ -141,7 +141,7 @@ impl RunState {
             (Queued, Running | Failed)
                 | (Running, AwaitingCi | Failed | Escalated)
                 | (AwaitingCi, Judging | Failed)
-                | (Judging, Merged | PrOpen | Failed)
+                | (Judging, Merged | PrOpen | Failed | Running)
         )
     }
 
@@ -248,6 +248,13 @@ mod tests {
         }
         assert!(RunState::Judging.can_transition_to(RunState::PrOpen));
         assert!(RunState::Running.can_transition_to(RunState::Escalated));
+    }
+
+    #[test]
+    fn a_rejected_judging_can_return_to_running_for_a_retry() {
+        assert!(RunState::Judging.can_transition_to(RunState::Running));
+        assert!(!RunState::AwaitingCi.can_transition_to(RunState::Running));
+        assert!(!RunState::Judging.can_transition_to(RunState::AwaitingCi));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+[Unit]
+Description=inchworm local coding agent orchestrator
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/nix/store/pvkgzz2yi76bdj23rvf0sd1g2h7ampax-skopeo-1.21.0/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NANNA_CONFIG_DIR=%h/.config/nanna
+ExecStart=%h/.cargo/bin/inchworm daemon
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
