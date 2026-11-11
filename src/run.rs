@@ -593,6 +593,9 @@ mod tests {
         fn comment(&self, r: &str, n: u64, b: &str) -> Result<(), GitHubError> {
             self.0.comment(r, n, b)
         }
+        fn mark_draft(&self, r: &str, n: u64) -> Result<(), GitHubError> {
+            self.0.mark_draft(r, n)
+        }
         fn pr_for_branch(&self, _: &str, _: &str) -> Result<Option<PullRequest>, GitHubError> {
             Err(GitHubError::NotFound("pr lookup".into()))
         }

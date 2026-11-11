@@ -408,12 +408,16 @@ pub async fn conclude(
                         state: RunState::Merged,
                     })
                 }
-                Err(err) => reject(
-                    ctx,
-                    published,
-                    FailureClass::MergeBlocked,
-                    format!("merge was refused: {err}"),
-                ),
+                Err(err) => {
+                    let restored = ctx.github.mark_draft(ctx.slug, published.pr.number);
+                    let raw = match restored {
+                        Ok(()) => format!("merge was refused: {err}"),
+                        Err(undo) => format!(
+                            "merge was refused: {err}; restoring draft status also failed: {undo}"
+                        ),
+                    };
+                    reject(ctx, published, FailureClass::MergeBlocked, raw)
+                }
             }
         }
         other => {
@@ -972,6 +976,48 @@ mod tests {
             rig.store.run(summary.run_id).unwrap().state,
             RunState::Failed
         );
+        assert_eq!(rig.github.ready_calls(), [("o/r".to_string(), 77)]);
+        assert_eq!(rig.github.draft_calls(), [("o/r".to_string(), 77)]);
+        assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
+    }
+
+    #[tokio::test]
+    async fn a_refused_merge_reports_when_restoring_draft_also_fails() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        rig.github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![check("build", SHA, CheckConclusion::Success)],
+        );
+        rig.github.set_pr_patch("o/r", 77, &patch(2));
+        rig.github.fail_merges_with("not mergeable");
+        rig.github.fail_drafts_with("undo denied");
+        let summary = rig.run(&merge_flow(), two_successes(1)).await;
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::MergeBlocked);
+        assert!(raw.contains("not mergeable"), "{raw}");
+        assert!(raw.contains("undo denied"), "{raw}");
+        assert!(!rig.github.pr("o/r", 77).unwrap().is_draft);
+    }
+
+    #[tokio::test]
+    async fn a_failed_ready_call_also_leaves_the_pr_draft_and_never_merges() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        rig.github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![check("build", SHA, CheckConclusion::Success)],
+        );
+        rig.github.set_pr_patch("o/r", 77, &patch(2));
+        rig.github.fail_ready_with("no permission");
+        let summary = rig.run(&merge_flow(), two_successes(1)).await;
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::MergeBlocked);
+        assert!(raw.contains("no permission"), "{raw}");
+        assert!(rig.github.merge_calls().is_empty());
+        assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
     }
 
     async fn conclude_with(rig: &Rig, flow: &Flow, pr: &PullRequest, judged: &str) -> Concluded {

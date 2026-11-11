@@ -71,6 +71,7 @@ pub trait GitHub {
     fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError>;
     fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError>;
     fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError>;
+    fn mark_draft(&self, repo: &str, number: u64) -> Result<(), GitHubError>;
     fn merge_pr(
         &self,
         repo: &str,
@@ -334,6 +335,12 @@ impl<R: Runner> GitHub for GhCli<R> {
         self.run(&["pr", "ready", &number, "-R", repo]).map(|_| ())
     }
 
+    fn mark_draft(&self, repo: &str, number: u64) -> Result<(), GitHubError> {
+        let number = number.to_string();
+        self.run(&["pr", "ready", &number, "--undo", "-R", repo])
+            .map(|_| ())
+    }
+
     fn merge_pr(
         &self,
         repo: &str,
@@ -383,6 +390,9 @@ struct FakeState {
     patches: BTreeMap<(String, u64), String>,
     check_polls: BTreeMap<(String, String), Vec<Vec<CheckRun>>>,
     ready: Vec<(String, u64)>,
+    drafted: Vec<(String, u64)>,
+    ready_error: Option<String>,
+    draft_error: Option<String>,
     merges: Vec<(String, u64, String, MergeMethod)>,
     protection: BTreeMap<(String, String), Vec<String>>,
     merge_error: Option<String>,
@@ -475,6 +485,18 @@ impl FakeGitHub {
 
     pub fn fail_merges_with(&self, message: &str) {
         self.state.lock().unwrap().merge_error = Some(message.to_string());
+    }
+
+    pub fn fail_ready_with(&self, message: &str) {
+        self.state.lock().unwrap().ready_error = Some(message.to_string());
+    }
+
+    pub fn fail_drafts_with(&self, message: &str) {
+        self.state.lock().unwrap().draft_error = Some(message.to_string());
+    }
+
+    pub fn draft_calls(&self) -> Vec<(String, u64)> {
+        self.state.lock().unwrap().drafted.clone()
     }
 
     pub fn fail_patches_with(&self, message: &str) {
@@ -649,6 +671,12 @@ impl GitHub for FakeGitHub {
 
     fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError> {
         let mut state = self.state.lock().unwrap();
+        if let Some(message) = state.ready_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh pr ready {number}"),
+                detail: message,
+            });
+        }
         let pr = state
             .prs
             .iter_mut()
@@ -657,6 +685,25 @@ impl GitHub for FakeGitHub {
             .ok_or_else(|| GitHubError::NotFound(format!("{repo}!{number}")))?;
         pr.is_draft = false;
         state.ready.push((repo.to_string(), number));
+        Ok(())
+    }
+
+    fn mark_draft(&self, repo: &str, number: u64) -> Result<(), GitHubError> {
+        let mut state = self.state.lock().unwrap();
+        state.drafted.push((repo.to_string(), number));
+        if let Some(message) = state.draft_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh pr ready {number} --undo"),
+                detail: message,
+            });
+        }
+        let pr = state
+            .prs
+            .iter_mut()
+            .find(|((r, _), pr)| r == repo && pr.number == number)
+            .map(|(_, pr)| pr)
+            .ok_or_else(|| GitHubError::NotFound(format!("{repo}!{number}")))?;
+        pr.is_draft = true;
         Ok(())
     }
 
@@ -917,6 +964,18 @@ mod tests {
             "gh pr merge 9 --match-head-commit abc123 --squash -R o/r"
         );
         assert!(!calls[1].contains("--admin"));
+    }
+
+    #[test]
+    fn gh_restores_draft_with_ready_undo() {
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(""),
+            ScriptedRunner::fail("boom"),
+        ]));
+        gh.mark_draft("o/r", 9).unwrap();
+        assert!(gh.mark_draft("o/r", 9).is_err());
+        let calls = gh.runner.calls();
+        assert_eq!(calls[0], "gh pr ready 9 --undo -R o/r");
     }
 
     #[test]

@@ -364,6 +364,9 @@ mode = "draft_pr"
         fn mark_ready(&self, _: &str, _: u64) -> Result<(), GitHubError> {
             unreachable!()
         }
+        fn mark_draft(&self, _: &str, _: u64) -> Result<(), GitHubError> {
+            unreachable!()
+        }
         fn merge_pr(&self, _: &str, _: u64, _: &str, _: MergeMethod) -> Result<(), GitHubError> {
             unreachable!()
         }
