@@ -236,29 +236,76 @@ fn a_task_that_finishes_as_the_timeout_fires_returns_its_result() {
 }
 
 #[test]
-fn a_cancel_rejected_for_a_task_nanna_has_forgotten_surfaces_the_rpc_error() {
-    let (mut client, _fake) = connect(vec![Scenario::ForgottenBeforeCancel]);
+fn a_cancel_rejected_for_a_task_nanna_has_forgotten_is_still_a_timeout() {
+    let (mut client, mut fake) = connect(vec![Scenario::ForgottenBeforeCancel]);
     client.initialize().unwrap();
-    let err = client
+    let outcome = client
         .run_task(&request("x"), Duration::from_millis(30))
-        .unwrap_err();
-    assert!(
-        matches!(err, ClientError::Rpc { code: -32602, .. }),
-        "{err:?}"
-    );
+        .unwrap();
+    assert_eq!(outcome, TaskOutcome::TimedOut);
+    assert!(!client.is_dead());
+    drop(client);
+    fake.settle();
+    let methods = fake.methods();
+    let cancel = methods.iter().position(|m| m == "tasks/cancel").unwrap();
+    assert_eq!(methods[cancel + 1], "tasks/get");
+    assert!(!methods.contains(&"tasks/result".to_string()));
 }
 
 #[test]
-fn a_rejected_cancel_for_a_task_still_working_surfaces_the_rpc_error() {
+fn a_rejected_cancel_for_a_task_still_working_is_still_a_timeout() {
     let (mut client, _fake) = connect(vec![Scenario::RejectsCancelStillWorking]);
     client.initialize().unwrap();
-    let err = client
+    let outcome = client
         .run_task(&request("x"), Duration::from_millis(30))
-        .unwrap_err();
-    assert!(
-        matches!(err, ClientError::Rpc { code: -32602, .. }),
-        "{err:?}"
+        .unwrap();
+    assert_eq!(outcome, TaskOutcome::TimedOut);
+}
+
+#[test]
+fn a_connection_that_dies_during_the_cancel_is_a_timeout_and_the_client_reports_dead() {
+    let reply = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working","pollInterval":60000}}}"#,
+        "\n"
     );
+    let mut client = NannaClient::new(BufReader::new(reply.as_bytes()), io::sink());
+    client.set_read_timeout(Duration::from_millis(50));
+    let outcome = client.run_task(&request("x"), Duration::ZERO).unwrap();
+    assert_eq!(outcome, TaskOutcome::TimedOut);
+    assert!(client.is_dead());
+}
+
+#[test]
+fn a_connection_that_dies_while_polling_is_still_an_error_for_the_caller() {
+    let reply = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working","pollInterval":1}}}"#,
+        "\n"
+    );
+    let mut client = NannaClient::new(BufReader::new(reply.as_bytes()), io::sink());
+    let err = client.run_task(&request("x"), WAIT).unwrap_err();
+    assert!(matches!(err, ClientError::Eof), "{err:?}");
+    assert!(client.is_dead());
+}
+
+#[test]
+fn a_server_initiated_message_that_reuses_our_id_is_not_taken_as_the_response() {
+    let replies = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sampling/createMessage","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"notifications/message","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#,
+        "\n",
+    );
+    let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), io::sink());
+    let init = client.initialize().unwrap();
+    assert_eq!(init["protocolVersion"], PROTOCOL_VERSION);
+}
+
+#[test]
+fn a_fresh_client_is_not_dead() {
+    let (client, _fake) = connect(vec![]);
+    assert!(!client.is_dead());
 }
 
 #[test]

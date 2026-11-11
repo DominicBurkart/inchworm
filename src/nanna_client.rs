@@ -475,7 +475,7 @@ impl NannaClient {
                 }
                 continue;
             };
-            if message.get("id") != Some(&json!(id)) {
+            if message.get("method").is_some() || message.get("id") != Some(&json!(id)) {
                 continue;
             }
             if let Some(error) = message.get("error") {
@@ -563,18 +563,28 @@ impl NannaClient {
     }
 
     fn cancel_or_collect(&mut self, task_id: &str) -> Result<TaskOutcome, ClientError> {
-        match self.cancel(task_id) {
-            Ok(_) => Ok(TaskOutcome::TimedOut),
-            Err(rejected @ ClientError::Rpc { code: -32602, .. }) => {
-                let info = self.get(task_id)?;
-                if info.state.is_terminal() {
-                    self.result(task_id, info.state)
-                } else {
-                    Err(rejected)
-                }
-            }
-            Err(other) => Err(other),
+        if self.cancel(task_id).is_ok() {
+            return Ok(TaskOutcome::TimedOut);
         }
+        Ok(match self.get(task_id) {
+            Ok(info) if info.state.is_terminal() => self
+                .result(task_id, info.state)
+                .unwrap_or(TaskOutcome::TimedOut),
+            _ => TaskOutcome::TimedOut,
+        })
+    }
+
+    /// ```
+    /// use std::io::BufReader;
+    /// use inchworm::nanna_client::NannaClient;
+    ///
+    /// let mut client = NannaClient::new(BufReader::new(&b""[..]), std::io::sink());
+    /// assert!(!client.is_dead());
+    /// assert!(client.initialize().is_err());
+    /// assert!(client.is_dead());
+    /// ```
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     /// ```
