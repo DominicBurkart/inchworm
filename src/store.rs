@@ -23,22 +23,23 @@ fn states_sql(states: &[RunState]) -> String {
         .join(", ")
 }
 
-fn migrations() -> Vec<String> {
-    vec![format!(
-        "
+/// Migration 1 is frozen: it must never be edited once a database may have
+/// been created from it. A change to the schema or to the run states needs a
+/// new entry in this list that alters or rebuilds the tables.
+const MIGRATIONS: &[&str] = &["
 CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
     repo TEXT NOT NULL,
     subject_kind TEXT NOT NULL CHECK (subject_kind IN ('issue', 'pr', 'commit')),
     subject_ref TEXT NOT NULL CHECK (length(subject_ref) > 0),
     flow TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ({all})),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'awaiting_ci', 'judging', 'merged', 'pr_open', 'failed', 'escalated')),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX runs_one_open_per_subject
     ON runs (repo, subject_kind, subject_ref, flow)
-    WHERE state IN ({open});
+    WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging');
 CREATE TABLE attempts (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -53,11 +54,34 @@ CREATE TABLE attempts (
     ended_at INTEGER,
     UNIQUE (run_id, n)
 );
-",
-        all = states_sql(RunState::ALL),
-        open = states_sql(RunState::OPEN),
-    )]
-}
+"];
+
+const EXPECTED_RUN_COLUMNS: &[&str] = &[
+    "id",
+    "repo",
+    "subject_kind",
+    "subject_ref",
+    "flow",
+    "state",
+    "created_at",
+    "updated_at",
+];
+
+const EXPECTED_ATTEMPT_COLUMNS: &[&str] = &[
+    "id",
+    "run_id",
+    "n",
+    "state",
+    "branch",
+    "head_sha",
+    "pr_number",
+    "failure_class",
+    "raw_error",
+    "started_at",
+    "ended_at",
+];
+
+const EXPECTED_INDEX_COLUMNS: &[&str] = &["repo", "subject_kind", "subject_ref", "flow"];
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -77,6 +101,10 @@ pub enum StoreError {
     Corrupt(String),
     #[error("database schema version {found} is newer than this build supports ({supported})")]
     SchemaTooNew { found: usize, supported: usize },
+    #[error(
+        "the database schema does not match this build ({0}); it was probably created by an unreleased development build: delete the file and start again"
+    )]
+    SchemaMismatch(String),
     #[error("invalid subject: {0}")]
     InvalidSubject(String),
     #[error("another inchworm daemon holds {0}")]
@@ -482,18 +510,17 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
-        let steps = migrations();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = Store::version_in(&tx)?;
-        if current > steps.len() {
+        if current > MIGRATIONS.len() {
             return Err(StoreError::SchemaTooNew {
                 found: current,
-                supported: steps.len(),
+                supported: MIGRATIONS.len(),
             });
         }
-        for (index, sql) in steps.iter().enumerate().skip(current) {
+        for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
             tx.execute_batch(sql)?;
             tx.pragma_update(
                 None,
@@ -502,6 +529,56 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        self.verify_schema()
+    }
+
+    fn verify_schema(&self) -> Result<(), StoreError> {
+        let columns = |table: &str| -> Result<Vec<String>, StoreError> {
+            let mut statement = self
+                .conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+            let names = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(names)
+        };
+        let mismatch = |detail: String| Err(StoreError::SchemaMismatch(detail));
+        for (table, expected) in [
+            ("runs", EXPECTED_RUN_COLUMNS),
+            ("attempts", EXPECTED_ATTEMPT_COLUMNS),
+        ] {
+            let found = columns(table)?;
+            if found != expected {
+                return mismatch(format!(
+                    "table `{table}` has columns {found:?}, expected {expected:?}"
+                ));
+            }
+        }
+        let index: Option<(bool, bool)> = self
+            .conn
+            .query_row(
+                "SELECT \"unique\", partial FROM pragma_index_list('runs') WHERE name = 'runs_one_open_per_subject'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if index != Some((true, true)) {
+            return mismatch(
+                "the partial unique index `runs_one_open_per_subject` is missing or different"
+                    .into(),
+            );
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT name FROM pragma_index_info('runs_one_open_per_subject') ORDER BY seqno",
+        )?;
+        let indexed: Vec<String> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if indexed != EXPECTED_INDEX_COLUMNS {
+            return mismatch(format!(
+                "the index `runs_one_open_per_subject` covers {indexed:?}, expected {EXPECTED_INDEX_COLUMNS:?}"
+            ));
+        }
         Ok(())
     }
 
@@ -866,15 +943,142 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let first = Store::open(&path).unwrap();
-        assert_eq!(first.schema_version().unwrap(), migrations().len());
+        assert_eq!(first.schema_version().unwrap(), MIGRATIONS.len());
         let id = first
             .enqueue_run("o/r", &issue(1), "issue", 1)
             .unwrap()
             .unwrap();
         drop(first);
         let second = Store::open(&path).unwrap();
-        assert_eq!(second.schema_version().unwrap(), migrations().len());
+        assert_eq!(second.schema_version().unwrap(), MIGRATIONS.len());
         assert_eq!(second.run(id).unwrap().repo, "o/r");
+    }
+
+    const UNRELEASED_130EFD6A_SCHEMA: &str = "
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
+    flow TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX runs_one_open_per_issue
+    ON runs (repo, issue, flow)
+    WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging');
+CREATE TABLE attempts (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    branch TEXT,
+    head_sha TEXT,
+    pr_number INTEGER,
+    failure_class TEXT,
+    raw_error TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    UNIQUE (run_id, n)
+);
+";
+
+    fn mismatch(result: Result<Store, StoreError>) -> String {
+        match result {
+            Err(error @ StoreError::SchemaMismatch(_)) => error.to_string(),
+            Err(other) => panic!("expected SchemaMismatch, got {other}"),
+            Ok(_) => panic!("a database with the wrong schema must not open"),
+        }
+    }
+
+    #[test]
+    fn a_database_made_by_the_unreleased_130efd6a_build_is_refused_with_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(UNRELEASED_130EFD6A_SCHEMA).unwrap();
+        old.pragma_update(None, "user_version", 1).unwrap();
+        drop(old);
+
+        let message = mismatch(Store::open(&path));
+        assert!(message.contains("unreleased"), "{message}");
+        assert!(message.contains("delete"), "{message}");
+        assert!(message.contains("subject_kind"), "{message}");
+    }
+
+    #[test]
+    fn a_damaged_current_schema_is_refused_whichever_part_is_wrong() {
+        let damage = [
+            ("missing table", "DROP TABLE attempts"),
+            ("missing index", "DROP INDEX runs_one_open_per_subject"),
+            (
+                "index that is not partial",
+                "DROP INDEX runs_one_open_per_subject;
+                 CREATE UNIQUE INDEX runs_one_open_per_subject ON runs (repo, subject_kind, subject_ref, flow)",
+            ),
+            (
+                "index that is not unique",
+                "DROP INDEX runs_one_open_per_subject;
+                 CREATE INDEX runs_one_open_per_subject ON runs (repo, subject_kind, subject_ref, flow)
+                 WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+            ),
+            (
+                "index on other columns",
+                "DROP INDEX runs_one_open_per_subject;
+                 CREATE UNIQUE INDEX runs_one_open_per_subject ON runs (repo, flow)
+                 WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+            ),
+            ("missing column", "ALTER TABLE attempts DROP COLUMN raw_error"),
+            ("extra column", "ALTER TABLE runs ADD COLUMN extra TEXT"),
+        ];
+        for (name, sql) in damage {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("damaged.db");
+            let store = Store::open(&path).unwrap();
+            store.raw().execute_batch(sql).unwrap();
+            drop(store);
+            let message = mismatch(Store::open(&path));
+            assert!(message.contains("delete"), "{name}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_healthy_database_reopens_after_the_schema_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fine.db");
+        drop(Store::open(&path).unwrap());
+        assert!(Store::open(&path).is_ok());
+    }
+
+    fn state_names_after(sql: &str, marker: &str) -> std::collections::BTreeSet<String> {
+        let start = sql.find(marker).expect("marker present") + marker.len();
+        let list = &sql[start..sql[start..].find(')').unwrap() + start];
+        list.split(',')
+            .map(|name| name.trim().trim_matches('\'').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn migration_1_is_frozen_and_must_agree_with_the_current_run_states() {
+        let sql = MIGRATIONS[0];
+        let all: std::collections::BTreeSet<String> = RunState::ALL
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let open: std::collections::BTreeSet<String> = RunState::OPEN
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        assert_eq!(
+            state_names_after(sql, "CHECK (state IN ("),
+            all,
+            "RunState changed: add a NEW migration that rebuilds the table, do not edit migration 1"
+        );
+        assert_eq!(
+            state_names_after(sql, "WHERE state IN ("),
+            open,
+            "RunState::OPEN changed: add a NEW migration that rebuilds the index, do not edit migration 1"
+        );
     }
 
     #[test]
@@ -888,7 +1092,7 @@ mod tests {
         match Store::open(&path) {
             Err(StoreError::SchemaTooNew { found, supported }) => {
                 assert_eq!(found, 99);
-                assert_eq!(supported, migrations().len());
+                assert_eq!(supported, MIGRATIONS.len());
             }
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("a newer schema must not open"),
@@ -912,7 +1116,7 @@ mod tests {
             .collect();
         for handle in handles {
             let version = handle.join().unwrap().expect("open must not fail");
-            assert_eq!(version, migrations().len());
+            assert_eq!(version, MIGRATIONS.len());
         }
     }
 
