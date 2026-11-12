@@ -1669,6 +1669,20 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn rubric_paths_are_capped_at_200_characters_not_bytes() {
+        for filler in ["r", "\u{e9}"] {
+            let at_cap = format!(".inchworm/{}", filler.repeat(190));
+            let over = format!(".inchworm/{}", filler.repeat(191));
+            assert_eq!(rubric_path_problem(Path::new(&at_cap)), None);
+            assert_eq!(
+                rubric_path_problem(Path::new(&over)),
+                Some("rubric must be at most 200 characters")
+            );
+        }
+        assert_eq!(MAX_RUBRIC_LEN, 200);
+    }
+
+    #[test]
     fn flow_names_must_be_present_and_unique_ignoring_case() {
         let mut file = FlowFile::parse(FULL).unwrap();
         file.flow[0].name = "  ".into();
