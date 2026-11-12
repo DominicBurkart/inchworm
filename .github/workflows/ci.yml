@@ -34,4 +34,6 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: ./scripts/coverage-no-regression.sh origin/main
+      - run: ./scripts/coverage-no-regression.sh "$BASE"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

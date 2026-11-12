@@ -12,9 +12,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 review="$(mktemp)"
 trap 'rm -f "$review"' EXIT
 git diff --cached | claude "You are a security engineer. Review the code being committed to determine if it can be committed/pushed. Does this commit leak any secrets, tokens, sensitive internals, or PII? Your response MUST start with exactly 'VERDICT: SAFE' or 'VERDICT: UNSAFE'. If UNSAFE, follow with a list of problems to fix before the commit can be completed." | tee "$review"
-if grep -qi "^VERDICT: UNSAFE" "$review"; then
-    echo "Security issues found above. Please fix before committing."
+if ! grep -q '^VERDICT: SAFE$' "$review" || grep -q '^VERDICT: UNSAFE' "$review"; then
+    echo "The security review did not return a clean 'VERDICT: SAFE' line. Fix the problems above or re-run."
     exit 1
 fi
 
-"$(git rev-parse --show-toplevel)/scripts/coverage-no-regression.sh" main
+root="$(git rev-parse --show-toplevel)"
+git fetch -q origin main 2>/dev/null || true
+base="${INCHWORM_COVERAGE_BASE:-$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse main)}"
+"$root/scripts/coverage-no-regression.sh" "$base"

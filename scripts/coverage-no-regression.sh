@@ -3,8 +3,21 @@ set -euo pipefail
 
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX
 
-base="${1:-main}"
+if [ "$#" -ne 1 ]; then
+    echo "usage: $0 <base-ref-or-sha>" >&2
+    exit 2
+fi
+base="$1"
 root="$(git rev-parse --show-toplevel)"
+
+if [[ "$base" =~ ^0+$ ]]; then
+    echo "No baseline commit (all-zero sha); skipping the coverage comparison."
+    exit 0
+fi
+if ! git -C "$root" rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+    echo "Cannot resolve the coverage baseline '$base'." >&2
+    exit 2
+fi
 
 coverage() {
     local output
@@ -22,8 +35,8 @@ git -C "$root" worktree add --detach -q "$tmp/base" "$base"
 old="$(coverage "$tmp/base")"
 
 if awk -v n="$new" -v o="$old" 'BEGIN { exit !(n >= o) }'; then
-    echo "Coverage: ${new}% >= ${old}%"
+    echo "Coverage: ${new}% >= ${old}% (baseline $base)"
 else
-    echo "Coverage dropped: ${new}% < ${old}%"
+    echo "Coverage dropped: ${new}% < ${old}% (baseline $base)"
     exit 1
 fi
