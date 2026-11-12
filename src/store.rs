@@ -14,6 +14,8 @@ pub type RunId = i64;
 pub type AttemptId = i64;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_BRANCH_BYTES: usize = 255;
+const MAX_HEAD_SHA_BYTES: usize = 64;
 
 fn states_sql(states: &[RunState]) -> String {
     states
@@ -153,6 +155,8 @@ pub enum StoreError {
     SchemaMismatch(String),
     #[error("invalid subject: {0}")]
     InvalidSubject(String),
+    #[error("invalid pull request record: {0}")]
+    InvalidPullRequest(String),
     #[error("another inchworm daemon holds {0}")]
     AlreadyRunning(PathBuf),
     #[error("the daemon lock is for {lock}, not for the database {store}")]
@@ -484,6 +488,22 @@ pub struct Store {
 
 fn corrupt<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> StoreError + '_ {
     move |err| StoreError::Corrupt(format!("{what}: {err}"))
+}
+
+fn check_text(field: &str, value: &str, max_bytes: usize) -> Result<(), StoreError> {
+    let problem = if value.trim().is_empty() {
+        Some("must not be blank".to_string())
+    } else if value.len() > max_bytes {
+        Some(format!("must be at most {max_bytes} bytes"))
+    } else if value.chars().any(char::is_control) {
+        Some("must not contain control characters".to_string())
+    } else {
+        None
+    };
+    match problem {
+        Some(problem) => Err(StoreError::InvalidPullRequest(format!("{field} {problem}"))),
+        None => Ok(()),
+    }
 }
 
 fn run_from_row(row: &Row<'_>) -> Result<Run, StoreError> {
@@ -845,6 +865,31 @@ impl Store {
         rows.map(|row| row?).collect()
     }
 
+    /// Records the branch, head commit and pull request an attempt produced.
+    ///
+    /// The recorded pull request number is what sends a `running` run to
+    /// `awaiting_ci` during recovery, so it is validated: `pr_number` must be
+    /// positive, `branch` must not be blank and at most 255 bytes, `head_sha`
+    /// must not be blank and at most 64 bytes, and neither text may contain a
+    /// control character. Anything else is [`StoreError::InvalidPullRequest`]
+    /// and nothing is written.
+    ///
+    /// ```
+    /// use inchworm::model::RunState;
+    /// use inchworm::store::{Store, StoreError, Subject};
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let subject = Subject::issue(1).unwrap();
+    /// let run = store.enqueue_run("o/r", &subject, "issue", 0).unwrap().unwrap();
+    /// store.set_run_state(run, RunState::Running, 1).unwrap();
+    /// let attempt = store.start_attempt(run, 2).unwrap();
+    /// assert!(matches!(
+    ///     store.record_pr(attempt.id, "feature", "abc123", 0),
+    ///     Err(StoreError::InvalidPullRequest(_))
+    /// ));
+    /// store.record_pr(attempt.id, "feature", "abc123", 7).unwrap();
+    /// assert_eq!(store.attempt(attempt.id).unwrap().pr_number, Some(7));
+    /// ```
     pub fn record_pr(
         &self,
         id: AttemptId,
@@ -852,6 +897,13 @@ impl Store {
         head_sha: &str,
         pr_number: u64,
     ) -> Result<(), StoreError> {
+        if pr_number == 0 {
+            return Err(StoreError::InvalidPullRequest(
+                "the pull request number must be positive".into(),
+            ));
+        }
+        check_text("branch", branch, MAX_BRANCH_BYTES)?;
+        check_text("head sha", head_sha, MAX_HEAD_SHA_BYTES)?;
         let pr = i64::try_from(pr_number).map_err(corrupt("pr number"))?;
         let changed = self.conn.execute(
             "UPDATE attempts SET branch = ?1, head_sha = ?2, pr_number = ?3
@@ -2000,6 +2052,72 @@ CREATE TABLE attempts (
         assert_eq!(done.pr_number, Some(42));
         assert_eq!(done.failure_class, None);
         assert_eq!(done.raw_error, None);
+    }
+
+    fn invalid_pr(result: Result<(), StoreError>) -> String {
+        match result {
+            Err(StoreError::InvalidPullRequest(detail)) => detail,
+            other => panic!("expected InvalidPullRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_pr_rejects_pr_zero_blank_fields_control_characters_and_absurd_lengths() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let long_branch = "b".repeat(256);
+        let long_sha = "a".repeat(65);
+        let cases: Vec<(&str, &str, &str, u64, &str)> = vec![
+            ("pr 0", "feature", "abc123", 0, "pull request number"),
+            ("empty branch", "", "abc123", 1, "branch"),
+            ("blank branch", "   ", "abc123", 1, "branch"),
+            ("tab-only branch", "\t", "abc123", 1, "branch"),
+            ("newline in branch", "a\nb", "abc123", 1, "branch"),
+            ("nul in branch", "a\0b", "abc123", 1, "branch"),
+            ("delete in branch", "a\x7fb", "abc123", 1, "branch"),
+            ("long branch", &long_branch, "abc123", 1, "branch"),
+            ("empty sha", "feature", "", 1, "head sha"),
+            ("blank sha", "feature", "   ", 1, "head sha"),
+            ("newline in sha", "feature", "ab\nc", 1, "head sha"),
+            ("long sha", "feature", &long_sha, 1, "head sha"),
+        ];
+        for (name, branch, sha, pr, field) in cases {
+            let detail = invalid_pr(store.record_pr(attempt.id, branch, sha, pr));
+            assert!(detail.contains(field), "{name}: {detail}");
+            let unchanged = store.attempt(attempt.id).unwrap();
+            assert_eq!(
+                (unchanged.branch, unchanged.head_sha, unchanged.pr_number),
+                (None, None, None),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_pr_accepts_values_at_the_bounds() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let branch = "b".repeat(255);
+        let sha = "a".repeat(64);
+        store.record_pr(attempt.id, &branch, &sha, 1).unwrap();
+        let stored = store.attempt(attempt.id).unwrap();
+        assert_eq!(stored.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(stored.head_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(stored.pr_number, Some(1));
+        store
+            .record_pr(attempt.id, "feat/x y", "abc", u64::MAX >> 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_recorded_pr_number_is_never_zero_so_recovery_cannot_be_diverted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
+        let attempt = store.start_attempt(run, 12).unwrap();
+        invalid_pr(store.record_pr(attempt.id, "feature", "abc123", 0));
+        store.recover_after_crash(&lock, 20).unwrap();
+        assert_eq!(store.run(run).unwrap().state, RunState::Queued);
     }
 
     #[test]
