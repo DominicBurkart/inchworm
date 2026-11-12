@@ -188,7 +188,7 @@ impl Subject {
     pub fn from_parts(kind: SubjectKind, reference: &str) -> Result<Subject, StoreError> {
         let valid = match kind {
             SubjectKind::Issue | SubjectKind::Pr => {
-                reference.parse::<u64>().is_ok_and(|n| n >= 1)
+                reference.parse::<u64>().is_ok()
                     && reference.bytes().all(|b| b.is_ascii_digit())
                     && !reference.starts_with('0')
             }
@@ -473,19 +473,30 @@ impl Store {
     /// assert_eq!(store.run(id).unwrap().state, RunState::Running);
     /// ```
     pub fn open_in_memory() -> Result<Store, StoreError> {
-        Store::from_connection(Connection::open_in_memory()?, None)
+        Store::from_connection(Connection::open_in_memory()?, None, BUSY_TIMEOUT)
     }
 
     pub fn open(path: &Path) -> Result<Store, StoreError> {
-        let conn = Connection::open(path)?;
-        let canonical = canonical_db_path(path).unwrap_or_else(|_| path.to_path_buf());
-        Store::from_connection(conn, Some(canonical))
+        Store::open_with_busy_timeout(path, BUSY_TIMEOUT)
     }
 
-    fn from_connection(conn: Connection, path: Option<PathBuf>) -> Result<Store, StoreError> {
-        conn.busy_timeout(BUSY_TIMEOUT)?;
+    pub(crate) fn open_with_busy_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Store, StoreError> {
+        let conn = Connection::open(path)?;
+        let canonical = canonical_db_path(path).unwrap_or_else(|_| path.to_path_buf());
+        Store::from_connection(conn, Some(canonical), timeout)
+    }
+
+    fn from_connection(
+        conn: Connection,
+        path: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Store, StoreError> {
+        conn.busy_timeout(timeout)?;
         if path.is_some() {
-            enable_wal(&conn, BUSY_TIMEOUT)?;
+            enable_wal(&conn, timeout)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store { conn, path };
@@ -1279,6 +1290,89 @@ CREATE TABLE attempts (
         assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
     }
 
+    fn within_ten_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the call hung")
+    }
+
+    #[test]
+    fn a_database_one_version_beyond_the_supported_one_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("next.db");
+        drop(Store::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        drop(conn);
+        match Store::open(&path) {
+            Err(StoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!((found, supported), (MIGRATIONS.len() + 1, MIGRATIONS.len()));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a newer schema must not open"),
+        }
+    }
+
+    #[test]
+    fn opening_a_locked_database_with_a_short_timeout_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let holder = hold_exclusive_lock(&path);
+        let started = Instant::now();
+        let result = within_ten_seconds(move || {
+            Store::open_with_busy_timeout(&path, Duration::from_millis(100)).map(|_| ())
+        });
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} instead of about 100 ms",
+            started.elapsed()
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn opening_retries_the_wal_switch_while_a_reader_holds_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader.db");
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1); BEGIN; SELECT * FROM t;")
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            reader.execute_batch("COMMIT").unwrap();
+        });
+        let store = within_ten_seconds(move || {
+            Store::open_with_busy_timeout(&path, Duration::from_secs(5))
+        })
+        .expect("open must keep retrying the WAL switch until the reader is gone");
+        releaser.join().unwrap();
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn opening_waits_for_a_lock_that_is_released_within_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released-open.db");
+        let holder = hold_exclusive_lock(&path);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let store = within_ten_seconds(move || {
+            Store::open_with_busy_timeout(&path, Duration::from_secs(5))
+        })
+        .expect("open must wait for the lock instead of giving up");
+        releaser.join().unwrap();
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    }
+
     #[test]
     fn foreign_keys_are_enforced() {
         let (store, _) = store_with_run();
@@ -2051,6 +2145,36 @@ CREATE TABLE attempts (
 
     #[cfg(unix)]
     #[test]
+    fn a_new_database_behind_a_symlinked_directory_shares_the_real_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let via_link = DaemonLock::acquire(&link_dir.join("new.db")).unwrap();
+        assert_eq!(
+            via_link.database(),
+            real_dir.canonicalize().unwrap().join("new.db")
+        );
+        assert!(matches!(
+            DaemonLock::acquire(&real_dir.join("new.db")),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(via_link);
+
+        let lock = DaemonLock::acquire(&link_dir.join("new.db")).unwrap();
+        let store = Store::open(&real_dir.join("new.db")).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store.recover_after_crash(&lock, 3).unwrap().attempts_failed,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_symlinked_database_path_shares_one_lock_with_the_real_path() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.db");
@@ -2081,6 +2205,19 @@ CREATE TABLE attempts (
                 .attempts_failed,
             1
         );
+
+        let opened_through_the_link = Store::open(&link).unwrap();
+        let other = opened_through_the_link
+            .enqueue_run("o/r", &issue(2), "issue", 4)
+            .unwrap()
+            .unwrap();
+        opened_through_the_link
+            .set_run_state(other, RunState::Running, 5)
+            .unwrap();
+        let report = opened_through_the_link
+            .recover_after_crash(&via_link, 6)
+            .expect("a store opened through a symlink is the same database as the lock");
+        assert_eq!(report.runs_requeued, 1);
     }
 
     #[test]
