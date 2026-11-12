@@ -71,6 +71,15 @@ const ERROR_TYPE_TABLE: &[(&str, FailureClass)] = &[
 ];
 
 const TEXT_TABLE: &[(&[&str], FailureClass)] = &[
+    (
+        &[
+            "tests failed",
+            "test failed",
+            "verification failed",
+            "check failed",
+        ],
+        FailureClass::TestsFailed,
+    ),
     (&["spawn refused"], FailureClass::SpawnRefused),
     (
         &["protected path", "protected-path"],
@@ -84,9 +93,13 @@ const TEXT_TABLE: &[(&[&str], FailureClass)] = &[
     (&["cancelled", "canceled"], FailureClass::Cancelled),
     (
         &[
-            "container",
-            "image",
-            "vendor",
+            "container image",
+            "container build",
+            "container setup",
+            "container runtime",
+            "image build",
+            "image pull",
+            "cargo vendor",
             "offline dependenc",
             "nix build",
         ],
@@ -105,15 +118,6 @@ const TEXT_TABLE: &[(&[&str], FailureClass)] = &[
     (
         &["patch does not apply", "patch failed", "apply patch"],
         FailureClass::PatchApplyFailed,
-    ),
-    (
-        &[
-            "tests failed",
-            "test failed",
-            "verification failed",
-            "check failed",
-        ],
-        FailureClass::TestsFailed,
     ),
 ];
 
@@ -302,6 +306,54 @@ mod tests {
         assert_eq!(classify(&f), FailureClass::ContainerBuildFailed);
         let f = failure(Some("unclassified"), Some("SomethingNew"), "Ollama said no");
         assert_eq!(classify(&f), FailureClass::ModelError);
+    }
+
+    #[test]
+    fn a_failing_test_whose_name_contains_another_keyword_is_still_a_test_failure() {
+        for text in [
+            "tests failed: test_connection_timeout panicked",
+            "2 tests failed: protected_path_rules, max_iterations_cap",
+            "verification failed: check lint timed out",
+            "check failed: cancelled_tasks_are_reported",
+            "tests failed: the container image builder",
+        ] {
+            assert_eq!(
+                classify(&failure(None, None, text)),
+                FailureClass::TestsFailed,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_text_with_a_bare_container_image_or_vendor_word_is_not_a_build_failure() {
+        for text in [
+            "failed to decode image attachment",
+            "container_id missing from the log line",
+            "the vendored crate foo panicked",
+            "wrote a vendor-neutral summary",
+        ] {
+            assert_eq!(
+                classify(&failure(None, None, text)),
+                FailureClass::AgentFailed,
+                "{text}"
+            );
+        }
+        for text in [
+            "could not build the container image",
+            "cannot start container runtime",
+            "podman: container setup failed",
+            "image pull failed: no route",
+            "cargo vendor failed: no Cargo.lock",
+            "offline dependencies could not be prepared",
+            "nix build exited 1",
+        ] {
+            assert_eq!(
+                classify(&failure(None, None, text)),
+                FailureClass::ContainerBuildFailed,
+                "{text}"
+            );
+        }
     }
 
     #[test]
