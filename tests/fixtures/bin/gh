@@ -2,7 +2,7 @@
 D=$(dirname "$0")
 cfg() { if [ -f "$D/$1" ]; then cat "$D/$1"; else printf '%s' "$2"; fi; }
 case "$1 $2" in
-  "issue view") echo '{"number":5,"title":"Do it","body":"please","labels":[{"name":"inchworm"}],"url":"https://github.com/o/r/issues/5"}' ;;
+  "issue view") cfg issue '{"number":5,"title":"Do it","body":"please","labels":[{"name":"inchworm"}],"url":"https://github.com/o/r/issues/5","state":"OPEN","authorAssociation":"OWNER"}'; echo ;;
   "issue edit"|"issue comment") ;;
   "label list") cfg labels '[{"name":"inchworm"},{"name":"inchworm:running"},{"name":"inchworm:failed"},{"name":"inchworm:done"}]'; echo ;;
   "pr list") cfg prs '[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]'; echo ;;

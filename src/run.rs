@@ -7,7 +7,7 @@ use crate::flow::{
     Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, PROTECTED_FILE, branch_name,
     protected_paths_in, run_flow,
 };
-use crate::github::{GitHub, GitHubError, PullRequest};
+use crate::github::{GitHub, GitHubError, Issue, PullRequest, issue_branch_attempt};
 use crate::model::{FailureClass, RunState};
 use crate::store::{AttemptId, RunId, Store, StoreError};
 
@@ -21,6 +21,12 @@ pub enum RunError {
         repo: String,
         issue: u64,
         flow: String,
+    },
+    #[error("{repo}#{issue} cannot be run: {reason}")]
+    NotRunnable {
+        repo: String,
+        issue: u64,
+        reason: String,
     },
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -100,6 +106,53 @@ impl Drop for RunGuard<'_, '_> {
             "inchworm stopped before this run finished; the run is marked failed and can be started again.",
         );
     }
+}
+
+pub const TRUSTED_AUTHOR_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+fn check_runnable(
+    ctx: &RunContext<'_>,
+    flow: &Flow,
+    issue: &Issue,
+    number: u64,
+) -> Result<(), RunError> {
+    let refuse = |reason: String| RunError::NotRunnable {
+        repo: ctx.slug.to_string(),
+        issue: number,
+        reason,
+    };
+    if !issue.open {
+        return Err(refuse("the issue is not open".to_string()));
+    }
+    let label = trigger_label(flow);
+    if !issue.labels.iter().any(|l| l == label) {
+        return Err(refuse(format!(
+            "the issue does not carry the `{label}` label"
+        )));
+    }
+    if !TRUSTED_AUTHOR_ASSOCIATIONS.contains(&issue.author_association.as_str()) {
+        let shown = if issue.author_association.is_empty() {
+            "unknown"
+        } else {
+            issue.author_association.as_str()
+        };
+        return Err(refuse(format!(
+            "the issue was written by a `{shown}` user and its text would be given to an agent; inchworm only runs issues written by the repository's owner, members or collaborators ({})",
+            TRUSTED_AUTHOR_ASSOCIATIONS.join(", ")
+        )));
+    }
+    let upcoming = ctx.store.issue_attempt_count(ctx.slug, number)? + 1;
+    let open = ctx.github.open_prs_for_issue(ctx.slug, number)?;
+    if let Some((branch, pr)) = open
+        .iter()
+        .find(|(branch, _)| issue_branch_attempt(branch, number).is_some_and(|n| n < upcoming))
+    {
+        return Err(refuse(format!(
+            "a pull request from an earlier attempt is still open on `{branch}`: {}",
+            pr.url
+        )));
+    }
+    Ok(())
 }
 
 fn trigger_label(flow: &Flow) -> &str {
@@ -184,6 +237,7 @@ fn protected_pr_files(
 /// let github = FakeGitHub::new();
 /// github.add_issue("o/r", Issue {
 ///     number: 1, title: "t".into(), body: "b".into(), labels: vec!["inchworm".into()], url: "u".into(),
+///     open: true, author_association: "OWNER".into(),
 /// });
 /// let store = Store::open_in_memory().unwrap();
 /// let ctx = RunContext {
@@ -200,6 +254,18 @@ pub fn run_issue(
     dispatcher: &mut dyn Dispatcher,
 ) -> Result<RunSummary, RunError> {
     let issue = ctx.github.issue(ctx.slug, issue_number)?;
+    if ctx
+        .store
+        .open_run(ctx.slug, issue_number, &flow.name)?
+        .is_some()
+    {
+        return Err(RunError::AlreadyRun {
+            repo: ctx.slug.to_string(),
+            issue: issue_number,
+            flow: flow.name.clone(),
+        });
+    }
+    check_runnable(ctx, flow, &issue, issue_number)?;
     let run_id = ctx
         .store
         .enqueue_run(ctx.slug, issue_number, &flow.name, (ctx.now)())?
@@ -371,6 +437,8 @@ mode = "draft_pr"
                 body: "please".into(),
                 labels: vec!["inchworm".into()],
                 url: "https://github.com/o/r/issues/5".into(),
+                open: true,
+                author_association: "OWNER".into(),
             },
         );
         github
@@ -421,6 +489,131 @@ mode = "draft_pr"
         assert_eq!(fake.assigned().len(), 2);
     }
 
+    fn refused(github: &FakeGitHub, store: &Store) -> String {
+        let err = run_issue(&ctx(store, github), &flow(1, ""), 5, &mut Panics).unwrap_err();
+        assert!(
+            matches!(err, RunError::NotRunnable { issue: 5, .. }),
+            "{err:?}"
+        );
+        assert!(
+            store.run(1).is_err(),
+            "a refused issue must not create a run"
+        );
+        assert!(github.comments().is_empty());
+        err.to_string()
+    }
+
+    fn change_issue(github: &FakeGitHub, edit: impl FnOnce(&mut Issue)) {
+        let mut issue = github.issue("o/r", 5).unwrap();
+        edit(&mut issue);
+        github.add_issue("o/r", issue);
+    }
+
+    #[test]
+    fn a_closed_issue_is_refused_before_anything_is_created() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        change_issue(&github, |i| i.open = false);
+        assert!(refused(&github, &store).contains("not open"));
+        assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm"]);
+    }
+
+    #[test]
+    fn an_issue_without_the_trigger_label_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        change_issue(&github, |i| i.labels = vec!["bug".into()]);
+        let reason = refused(&github, &store);
+        assert!(
+            reason.contains("does not carry the `inchworm` label"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn only_issues_written_by_owners_members_and_collaborators_are_run() {
+        for untrusted in [
+            "NONE",
+            "CONTRIBUTOR",
+            "FIRST_TIME_CONTRIBUTOR",
+            "FIRST_TIMER",
+            "MANNEQUIN",
+            "owner",
+            "",
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let github = github();
+            change_issue(&github, |i| i.author_association = untrusted.into());
+            let reason = refused(&github, &store);
+            let shown = if untrusted.is_empty() {
+                "unknown"
+            } else {
+                untrusted
+            };
+            assert!(reason.contains(&format!("`{shown}` user")), "{reason}");
+        }
+        for trusted in ["OWNER", "MEMBER", "COLLABORATOR"] {
+            let store = Store::open_in_memory().unwrap();
+            let github = github();
+            change_issue(&github, |i| i.author_association = trusted.into());
+            github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+            let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+            client.initialize().unwrap();
+            let summary = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+            assert_eq!(summary.state, RunState::AwaitingCi, "{trusted}");
+        }
+    }
+
+    #[test]
+    fn an_issue_whose_earlier_attempt_left_a_pull_request_open_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let first = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(first.state, RunState::AwaitingCi);
+        store
+            .set_run_state(first.run_id, RunState::Failed, 99)
+            .unwrap();
+        change_issue(&github, |i| i.labels.push("inchworm".into()));
+
+        let err = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut Panics).unwrap_err();
+        let reason = err.to_string();
+        assert!(
+            matches!(err, RunError::NotRunnable { issue: 5, .. }),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("earlier attempt")
+                && reason.contains("inchworm/5-a1")
+                && reason.contains("pull/77"),
+            "{reason}"
+        );
+        assert!(
+            store.run(2).is_err(),
+            "a refused rerun must not create a run"
+        );
+    }
+
+    #[test]
+    fn pull_requests_for_other_issues_do_not_block_a_run() {
+        let github = github();
+        github.add_pr("o/r", "inchworm/50-a1", pr("aaaa"));
+        github.add_pr("o/r", "inchworm/6-a1", pr("bbbb"));
+        github.add_pr("o/r", "feature/5-a1", pr("cccc"));
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let mut closed = pr("dddd");
+        closed.state = crate::github::PrState::Closed;
+        github.add_pr("o/r2", "inchworm/5-a1", closed);
+        let open = github.open_prs_for_issue("o/r", 5).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].0, "inchworm/5-a1");
+        assert_eq!(open[0].1.head_sha, "deadbeef");
+        assert!(github.open_prs_for_issue("o/r2", 5).unwrap().is_empty());
+        assert!(github.open_prs_for_issue("o/none", 5).unwrap().is_empty());
+    }
+
     struct Panics;
     impl Dispatcher for Panics {
         fn dispatch(
@@ -458,6 +651,7 @@ mode = "draft_pr"
             github.comments()
         );
 
+        change_issue(&github, |i| i.labels.push("inchworm".into()));
         let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
         client.initialize().unwrap();
         github.add_pr("o/r", "inchworm/5-a2", pr("deadbeef"));
@@ -591,6 +785,13 @@ mode = "draft_pr"
         fn pr_files(&self, r: &str, n: u64) -> Result<Vec<String>, GitHubError> {
             self.0.pr_files(r, n)
         }
+        fn open_prs_for_issue(
+            &self,
+            r: &str,
+            n: u64,
+        ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+            self.0.open_prs_for_issue(r, n)
+        }
     }
 
     #[test]
@@ -625,6 +826,10 @@ mode = "draft_pr"
         client.initialize().unwrap();
         let first = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
         assert_eq!(first.state, RunState::Failed);
+        let mut closed = pr("old");
+        closed.state = crate::github::PrState::Closed;
+        github.add_pr("o/r", "inchworm/5-a1", closed);
+        change_issue(&github, |i| i.labels.push("inchworm".into()));
         github.add_pr(
             "o/r",
             "inchworm/5-a2",

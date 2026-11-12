@@ -413,3 +413,40 @@ fn validate_help_warns_that_build_images_evaluates_repository_nix() {
         ))
         .stdout(predicates_contains("only on repositories you trust"));
 }
+
+#[test]
+fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
+    let fakes = fakes();
+    fakes.set(
+        "issue",
+        r#"{"number":5,"title":"t","body":"b","labels":[{"name":"inchworm"}],"url":"u","state":"CLOSED","authorAssociation":"OWNER"}"#,
+    );
+    inchworm(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(2)
+        .stderr(predicates_contains("the issue is not open"));
+
+    fakes.set(
+        "issue",
+        r#"{"number":5,"title":"t","body":"b","labels":[{"name":"inchworm"}],"url":"u","state":"OPEN","authorAssociation":"NONE"}"#,
+    );
+    inchworm(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(2)
+        .stderr(predicates_contains("`NONE` user"));
+
+    fakes.set(
+        "issue",
+        r#"{"number":5,"title":"t","body":"b","labels":[{"name":"bug"}],"url":"u","state":"OPEN","authorAssociation":"OWNER"}"#,
+    );
+    inchworm(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(2)
+        .stderr(predicates_contains("does not carry the `inchworm` label"));
+}

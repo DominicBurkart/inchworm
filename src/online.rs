@@ -313,6 +313,13 @@ mode = "draft_pr"
         fn pr_files(&self, _: &str, _: u64) -> Result<Vec<String>, GitHubError> {
             unreachable!()
         }
+        fn open_prs_for_issue(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+            unreachable!()
+        }
     }
 
     fn repo(dir: &Path) -> GlobalConfig {

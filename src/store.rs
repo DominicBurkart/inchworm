@@ -297,6 +297,24 @@ impl Store {
     /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 1);
     /// assert_eq!(store.issue_attempt_count("o/r", 2).unwrap(), 0);
     /// ```
+    pub fn open_run(
+        &self,
+        repo: &str,
+        issue: u64,
+        flow: &str,
+    ) -> Result<Option<RunId>, StoreError> {
+        let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM runs WHERE repo = ?1 AND issue = ?2 AND flow = ?3
+                 AND state IN ('queued', 'running', 'awaiting_ci', 'judging') LIMIT 1",
+                params![repo, issue, flow],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn issue_attempt_count(&self, repo: &str, issue: u64) -> Result<u32, StoreError> {
         let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
         let count: i64 = self.conn.query_row(
@@ -475,6 +493,19 @@ mod tests {
                 "{terminal}"
             );
         }
+    }
+
+    #[test]
+    fn open_run_finds_a_live_run_for_the_exact_issue_and_flow_only() {
+        let (store, id) = store_with_run();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));
+        assert_eq!(store.open_run("o/r", 2, "issue").unwrap(), None);
+        assert_eq!(store.open_run("o/r", 1, "other").unwrap(), None);
+        assert_eq!(store.open_run("o/x", 1, "issue").unwrap(), None);
+        store.set_run_state(id, RunState::Running, 11).unwrap();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));
+        store.set_run_state(id, RunState::Failed, 12).unwrap();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), None);
     }
 
     #[test]
