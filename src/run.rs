@@ -17,6 +17,7 @@ use crate::store::{AttemptState, RunId, Store, StoreError};
 
 pub const RUNNING_LABEL: &str = "inchworm:running";
 pub const FAILED_LABEL: &str = "inchworm:failed";
+const COMMENT_FAILURE_CHARS: usize = 1000;
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -148,7 +149,10 @@ fn give_up(
         issue,
         &format!(
             "inchworm gave up after {attempts} attempt(s): {}",
-            describe_failure(class, &raw, attempt_n)
+            crate::model::sanitize_text(
+                &describe_failure(class, &raw, attempt_n),
+                COMMENT_FAILURE_CHARS
+            )
         ),
         &mut warnings,
     );
@@ -583,6 +587,42 @@ mod tests {
             clock,
         };
         run_issue(&context, &env(&scorer), flow, 5, client).await
+    }
+
+    #[tokio::test]
+    async fn the_give_up_comment_is_sanitised_and_capped() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        let nasty = format!("\u{1b}[31mred{}", "y".repeat(5000));
+        store
+            .finish_attempt_failed(attempt.id, FailureClass::AgentFailed, &nasty, 4)
+            .unwrap();
+        let scorer = FakeScorer::new();
+        let (mut client, _fake) = connect(vec![]);
+        client.initialize().unwrap();
+        let summary = execute_run(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &flow(1, ""),
+            run,
+            &mut client,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        let comments = github.comments();
+        let gave_up = comments
+            .iter()
+            .find(|c| c.2.contains("gave up"))
+            .expect("a give-up comment");
+        assert!(!gave_up.2.contains('\u{1b}'));
+        assert!(gave_up.2.contains("...(truncated)"));
+        assert!(gave_up.2.len() < 1400);
     }
 
     #[tokio::test]

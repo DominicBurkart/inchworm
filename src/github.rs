@@ -375,9 +375,7 @@ impl<R: Runner> GitHub for GhCli<R> {
                     .map(str::to_string)
                     .collect(),
             )),
-            Err(GitHubError::Command { detail, .. })
-                if detail.contains("404") || detail.contains("not protected") =>
-            {
+            Err(GitHubError::Command { detail, .. }) if detail.contains("Branch not protected") => {
                 Ok(None)
             }
             Err(other) => Err(other),
@@ -1080,6 +1078,16 @@ mod tests {
         assert_eq!(parse_pr_state("MERGED"), PrState::Merged);
         assert_eq!(parse_pr_state("CLOSED"), PrState::Closed);
         assert_eq!(parse_pr_state("OPEN"), PrState::Open);
+    }
+
+    #[test]
+    fn only_the_branch_not_protected_message_means_unprotected() {
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::fail("gh: Not Found (HTTP 404)"),
+            ScriptedRunner::fail("HTTP 403: Resource not accessible, not protected by token"),
+        ]));
+        assert!(gh.required_checks("o/r", "main").is_err());
+        assert!(gh.required_checks("o/r", "main").is_err());
     }
 
     #[test]

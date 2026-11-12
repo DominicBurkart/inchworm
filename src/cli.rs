@@ -106,11 +106,42 @@ fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEnt
 const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn open_store(config: &GlobalConfig) -> Result<Store> {
+    use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = config.state_db.parent() {
+        let existed = parent.exists();
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
+        if !existed {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("cannot restrict {}", parent.display()))?;
+        }
     }
-    Ok(Store::open(&config.state_db)?)
+    let store = Store::open(&config.state_db)?;
+    std::fs::set_permissions(&config.state_db, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict {}", config.state_db.display()))?;
+    Ok(store)
+}
+
+fn check_nanna_bin(bin: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    let found = if bin.components().count() > 1 {
+        executable(bin)
+    } else {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| executable(&dir.join(bin))))
+            .unwrap_or(false)
+    };
+    anyhow::ensure!(
+        found,
+        "nanna_bin `{}` is not an executable file; fix nanna_bin in the config",
+        bin.display()
+    );
+    Ok(())
 }
 
 fn report_command(
@@ -139,6 +170,7 @@ fn daemon_command<S: std::future::Future<Output = ()>>(
     tools: &Tools,
     shutdown: impl FnOnce() -> std::io::Result<S>,
 ) -> Result<bool> {
+    check_nanna_bin(&config.nanna_bin)?;
     drop(open_store(&config)?);
     let settings = DaemonSettings::from_config(&config);
     let deps = DaemonDeps {
@@ -512,6 +544,48 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), shutdown)
             .await
             .expect("the SIGTERM was handled");
+    }
+
+    #[test]
+    fn the_daemon_refuses_to_start_with_a_missing_nanna_binary() {
+        let env = env();
+        let mut config = GlobalConfig::load(&env.config, &env.tools.home).unwrap();
+        config.nanna_bin = PathBuf::from("/no/such/nanna");
+        let err = daemon_command(config, &env.tools, || Ok(std::future::ready(()))).unwrap_err();
+        assert!(err.to_string().contains("nanna_bin"), "{err}");
+        assert!(!env.dir.path().join("state/state.db").exists());
+    }
+
+    #[test]
+    fn check_nanna_bin_accepts_executables_by_path_or_on_the_path_and_rejects_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nanna");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        assert!(check_nanna_bin(&bin).is_err());
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_nanna_bin(&bin).is_ok());
+        assert!(check_nanna_bin(dir.path()).is_err());
+        assert!(check_nanna_bin(Path::new("sh")).is_ok());
+        assert!(check_nanna_bin(Path::new("definitely-not-a-binary-xyz")).is_err());
+    }
+
+    #[test]
+    fn the_state_directory_and_database_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = env();
+        let config = GlobalConfig::load(&env.config, &env.tools.home).unwrap();
+        drop(open_store(&config).unwrap());
+        let db_mode = std::fs::metadata(&config.state_db)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(db_mode & 0o777, 0o600);
+        let parent = config.state_db.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

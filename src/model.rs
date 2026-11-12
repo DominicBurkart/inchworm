@@ -56,6 +56,28 @@ failure_classes! {
     MergeBlocked => "merge_blocked",
 }
 
+/// ```
+/// use inchworm::model::sanitize_text;
+///
+/// assert_eq!(sanitize_text("ok\u{1b}[31mred", 100), "ok?[31mred");
+/// assert_eq!(sanitize_text("abcdef", 3), "abc...(truncated)");
+/// ```
+pub fn sanitize_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count == max_chars {
+            out.push_str("...(truncated)");
+            break;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("unknown failure class `{0}`")]
 pub struct UnknownFailureClass(pub String);
@@ -185,6 +207,19 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn sanitize_text_strips_control_characters_and_caps_length() {
+        assert_eq!(sanitize_text("a\u{1b}[2Jb\u{7}c\rd", 100), "a?[2Jb?c?d");
+        assert_eq!(
+            sanitize_text("keep\nnewlines\tand tabs", 100),
+            "keep\nnewlines\tand tabs"
+        );
+        assert_eq!(sanitize_text("abc", 3), "abc");
+        assert_eq!(sanitize_text("abcd", 3), "abc...(truncated)");
+        assert_eq!(sanitize_text("\u{9b}x", 10), "?x");
+        assert_eq!(sanitize_text("", 0), "");
+    }
 
     #[test]
     fn names_are_unique_and_snake_case() {

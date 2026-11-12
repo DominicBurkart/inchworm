@@ -34,11 +34,11 @@ slug = "DominicBurkart/marigold"
 path = "~/code/marigold"
 ```
 
-inchworm only needs the `nanna` executable and `gh` (logged in with access to the repos) on the machine. nanna reads its identities from `NANNA_CONFIG_DIR` (for example `~/.config/nanna`, holding the global `agents/` catalog) and builds its container images through `skopeo`. The host skopeo lacks the nix transport, so the skopeo from the Nix store must come first in `PATH`:
+inchworm only needs the `nanna` executable and `gh` (logged in with access to the repos) on the machine. nanna reads its identities from `NANNA_CONFIG_DIR` (for example `~/.config/nanna`, holding the global `agents/` catalog) and builds its container images through `skopeo`. The host skopeo lacks the nix transport, so a skopeo built with the nix transport must come first in `PATH` (for example the one from your Nix profile):
 
 ```
 export NANNA_CONFIG_DIR=~/.config/nanna
-export PATH=/nix/store/pvkgzz2yi76bdj23rvf0sd1g2h7ampax-skopeo-1.21.0/bin:$PATH
+export PATH="$(dirname "$(readlink -f ~/.nix-profile/bin/skopeo)"):$PATH"
 ```
 
 Create the labels in every configured repo (the trigger label plus the three status labels):
@@ -68,7 +68,19 @@ systemctl --user enable --now inchworm
 journalctl --user -u inchworm -f
 ```
 
-The unit sets `PATH` (skopeo first) and `NANNA_CONFIG_DIR`; edit both for your machine. To keep it running while logged out: `loginctl enable-linger $USER`.
+The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH_TOKEN` (if you do not rely on `gh auth login`) in `~/.config/inchworm/env`, mode 600, which the unit loads with `EnvironmentFile`; never put it in `Environment=`. The unit does not restart on exit status 2 (a config error). The state directory is created mode 700 and the database mode 600, and a lock file next to the database (`state.db.lock`) makes a second daemon on the same database refuse to start. To keep it running while logged out: `loginctl enable-linger $USER`.
+
+## Operational notes
+
+- `inchworm daemon` refuses to start when `nanna_bin` is not an executable.
+- Stopping the daemon waits up to 20 seconds for the in-flight run; a run still in flight is marked `orchestrator_lost` on the next start and counts as one attempt. This is a known limitation: there is no cooperative cancel of a dispatched nanna task on shutdown.
+- Every `gh` call is bounded by 60 seconds and the poll cycle runs on its own thread, so SIGTERM stops the daemon even while `gh` hangs. The SIGTERM and SIGINT handlers are installed before the daemon starts.
+- A failed dispatch drops the nanna client and the next attempt starts a fresh `nanna mcp-serve`.
+- Re-adding the trigger label to an issue whose run finished (`pr_open`, `merged` or `failed`) starts a new run on purpose; remove the label when the work is done.
+- If the initial label swap on an issue fails, the daemon remembers that only in memory; after a restart a stale trigger label next to a finished run can start another run until the label is removed by hand. Known limitation.
+- Text from nanna, `gh` and judges is stripped of control characters and capped before it is printed by `failures` or posted to an issue.
+- Branch protection is compared by required check name only. A passing `validate --online` does not check `enforce_admins`, required reviews or app ids, so it says little about merge safety on its own.
+- Skipped, neutral, cancelled and unknown check conclusions are treated as red.
 
 ## Commands
 

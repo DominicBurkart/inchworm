@@ -115,7 +115,7 @@ pub fn render_failures(store: &Store, class: Option<FailureClass>) -> Result<Str
     }
     out.push_str("recent failures\n");
     for failure in store.recent_failures(class, RECENT_FAILURES)? {
-        let raw = failure.raw_error.replace('\n', " ");
+        let raw = crate::model::sanitize_text(&failure.raw_error.replace('\n', " "), 500);
         writeln!(
             out,
             "  run {} {}#{} attempt {} {} {}",
@@ -212,6 +212,22 @@ mod tests {
         assert!(!only.contains("ci_red"));
         let none = render_failures(&store, Some(FailureClass::Cancelled)).unwrap();
         assert!(none.contains("no failures"));
+    }
+
+    #[test]
+    fn failures_never_print_escape_sequences_and_cap_long_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.enqueue_run("o/r", 3, "issue", 0).unwrap().unwrap();
+        let attempt = store.start_attempt(run, 1).unwrap();
+        let raw = format!("\u{1b}[2Jevil\u{7}{}", "x".repeat(2000));
+        store
+            .finish_attempt_failed(attempt.id, FailureClass::CiRed, &raw, 2)
+            .unwrap();
+        let text = render_failures(&store, None).unwrap();
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'));
+        assert!(text.contains("?[2Jevil?"));
+        assert!(text.contains("...(truncated)"));
+        assert!(text.len() < 1500);
     }
 
     #[test]
