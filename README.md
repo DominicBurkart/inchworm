@@ -30,7 +30,7 @@ inchworm validate [--config PATH]
 Exit codes:
 
 - `0`: everything validated
-- `1`: at least one repository has errors (listed on stdout)
+- `1`: at least one error was found, either in a repository or in the global config (for example a missing or non-executable `nanna_bin`, reported with scope `[config]`); all errors are listed on stdout
 - `2`: the command could not run: bad usage, no config could be found, or the config could not be read or parsed (the reason is on stderr)
 
 `validate` is offline. It does not talk to GitHub, nanna or a model. It needs `HOME` only when the config uses `~`, and the default config location needs `XDG_CONFIG_HOME` or `HOME`.
@@ -40,10 +40,10 @@ For the global config it checks that `nanna_bin` is an executable file or, for a
 - the path is a git repository (a `.git` file or symlink must lead to a gitdir that exists)
 - `.inchworm/flows.toml` passes the flow rules below
 - every `llm` judge rubric exists and is a regular file inside `.inchworm/`
-- `.nanna/protected.toml` follows nanna's entry rules and lists `.inchworm/**`
+- `.nanna/protected.toml` follows nanna's entry rules and lists `.inchworm/**`. Its only key is `extra`, for example `extra = [".inchworm/**", "scripts/deploy.sh"]`; any other key (such as `entries`) is rejected as an unknown key
 - `.nanna/prompt.md` exists (a warning only)
 
-The repo-controlled files above (`.inchworm`, `.nanna` and everything read from them) are read only if no component of the path under the repository root is a symlink, each is a regular file, and each is read with a size cap: 256 KiB for `flows.toml`, 64 KiB for `protected.toml`, 4 KiB for a `.git` file. The global config may itself be a symlink (for example from home-manager), but must resolve to a regular file of at most 256 KiB.
+The repo-controlled files above (`.inchworm`, `.nanna` and everything read from them) are read only if no component of the path under the repository root is a symlink at the time of the check, each is a regular file, and each is read with a size cap: 256 KiB for `flows.toml`, 64 KiB for `protected.toml`, 4 KiB for a `.git` file. The symlink check is a walk of the path before the read, and only the final component is opened without following symlinks, so a directory swapped for a symlink between the walk and the read is not prevented. The global config may itself be a symlink (for example from home-manager), but must resolve to a regular file of at most 256 KiB.
 
 What a passing `validate` proves: the files inchworm reads are well formed, `.inchworm/**` is declared protected, and nothing it reads escapes the repository through a symlink. The `protected.toml` check mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` as of nanna-coder commit `239a1c94`; it does not run nanna's code, so a later change there is not tracked. It does not prove that identities named in flows exist, that labels exist, or that branch protection matches `required_checks`; those online checks are not built yet.
 
@@ -63,7 +63,7 @@ path = "~/code/marigold"
 ```
 
 - `nanna_bin` and each repo `path` may start with `~`, which needs `HOME` set to an absolute path. After expansion every repo path must be absolute. A path to a binary must exist: the example above resolves `nanna` on `PATH` and fails `validate` if it is not there.
-- Defaults: `ollama_url = "http://localhost:11434"`, `concurrency = 1` (1 to 64), `poll_secs = 120` (1 to 86400). `state_db` is optional and, when unset, defaults to `~/.local/state/inchworm/state.db`; `validate` never reads it.
+- Defaults: `ollama_url = "http://localhost:11434"`, `concurrency = 1` (1 to 64), `poll_secs = 120` (1 to 86400). `state_db` is optional and, when unset, defaults to `~/.local/state/inchworm/state.db`; `validate` never opens or reads that file, but it does reject a `state_db` that is empty, contains a NUL byte, or is neither absolute nor starting with `~/` (exit 2, with the reason on stderr).
 - Repo slugs are `owner/name` (case-insensitively unique), and no two repos may share a path.
 - Unknown keys are rejected everywhere.
 
@@ -122,6 +122,8 @@ required_checks = ["Tests"]
 ## Development
 
 The pre-commit hook runs fmt, clippy, tests, doctests, audit, deny, docs, a security review of the staged diff and a coverage no-regression check against the merge base with `origin/main` (or `INCHWORM_COVERAGE_BASE`). The review must start with exactly `VERDICT: SAFE` on its first line and contain no `VERDICT: UNSAFE` line (`scripts/review-verdict.sh`). `cargo-husky` installs the hook on `cargo test`; in a git worktree it cannot, so copy `.cargo-husky/hooks/pre-commit` into the repository's hooks directory by hand.
+
+The coverage gate compares line coverage with the merge base with `origin/main` (or `INCHWORM_COVERAGE_BASE`, or the pull request's base commit in CI) and fails if it dropped. While `main` is a stub (about 50% coverage) it is trivially satisfied. It is a regression check, not a quality bar.
 
 The toolchain is the `stable` channel with rustfmt and clippy. It is not pinned to a version, so it moves with each stable release. CI runs fmt, clippy, tests, doctests, audit, deny, the docs build and the coverage comparison with the pull request's base commit; it does not run the security review, which is local only.
 
