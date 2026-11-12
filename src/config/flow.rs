@@ -1931,14 +1931,11 @@ mode = "draft_pr"
         #[test]
         fn any_single_known_violation_makes_a_generated_flow_invalid(index in 0usize..1000) {
             let table = violations();
-            let (name, mutate, _) = table[index % table.len()];
+            let (name, mutate, expected) = table[index % table.len()];
             let mut flow = base_flow();
             mutate(&mut flow);
-            prop_assert!(
-                matches!(flow.validate(), Err(ConfigError::Invalid { .. })),
-                "{}",
-                name
-            );
+            let got = reason(&flow);
+            prop_assert!(got.contains(expected), "{}: {}", name, got);
         }
 
         #[test]

@@ -154,9 +154,11 @@ mod tests {
     #[test]
     fn the_bound_is_inclusive_for_any_reader() {
         assert_eq!(read_bounded(&b"12345"[..], 5).unwrap(), "12345");
-        assert!(read_bounded(&b"123456"[..], 5).is_err());
+        let over = read_bounded(&b"123456"[..], 5).unwrap_err();
+        assert!(over.to_string().contains("larger than 5 bytes"), "{over}");
         assert_eq!(read_bounded(&b""[..], 0).unwrap(), "");
-        assert!(read_bounded(&b"x"[..], 0).is_err());
+        let over = read_bounded(&b"x"[..], 0).unwrap_err();
+        assert!(over.to_string().contains("larger than 0 bytes"), "{over}");
         assert!(read_bounded(&b"ok"[..], u64::MAX).is_ok());
     }
 
@@ -204,7 +206,8 @@ mod tests {
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         let bad = dir.path().join("bad");
         std::fs::write(&bad, [0xff, 0xfe]).unwrap();
-        assert!(read_regular_text(&bad, 16).is_err());
+        let err = read_regular_text(&bad, 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -215,7 +218,8 @@ mod tests {
         let link = dir.path().join("link.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(read_text_following_symlinks(&link, 16).unwrap(), "hi");
-        assert!(read_text_following_symlinks(&link, 1).is_err());
+        let err = read_text_following_symlinks(&link, 1).unwrap_err();
+        assert!(err.to_string().contains("larger than 1 bytes"), "{err}");
 
         let to_dir = dir.path().join("to-dir");
         std::os::unix::fs::symlink(dir.path(), &to_dir).unwrap();

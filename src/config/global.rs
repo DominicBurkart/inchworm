@@ -744,19 +744,37 @@ path = "~/code/nanna-coder"
 
     #[test]
     fn unknown_keys_are_rejected() {
-        assert!(GlobalConfig::parse(&format!("surprise = 1\n{FULL}")).is_err());
+        let top = GlobalConfig::parse(&format!("surprise = 1\n{FULL}")).unwrap_err();
+        assert!(
+            matches!(top, GlobalConfigError::Parse(_))
+                && top.to_string().contains("unknown field `surprise`"),
+            "{top}"
+        );
         let in_repo = FULL.replacen(
             "path = \"/home/dominic/code/marigold\"",
             "path = \"/x\"\nsurprise = 1",
             1,
         );
-        assert!(GlobalConfig::parse(&in_repo).is_err());
+        let nested = GlobalConfig::parse(&in_repo).unwrap_err();
+        assert!(
+            matches!(nested, GlobalConfigError::Parse(_))
+                && nested.to_string().contains("unknown field `surprise`"),
+            "{nested}"
+        );
     }
 
     #[test]
     fn missing_required_fields_are_rejected() {
-        assert!(GlobalConfig::parse("").is_err());
-        assert!(GlobalConfig::parse("[[repo]]\nslug = \"a/b\"\npath = \"/x\"\n").is_err());
+        let empty = GlobalConfig::parse("").unwrap_err().to_string();
+        assert!(empty.contains("missing field `nanna_bin`"), "{empty}");
+        let no_bin = GlobalConfig::parse("[[repo]]\nslug = \"a/b\"\npath = \"/x\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(no_bin.contains("missing field `nanna_bin`"), "{no_bin}");
+        let no_repo = GlobalConfig::parse("nanna_bin = \"/x\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(no_repo.contains("missing field `repo`"), "{no_repo}");
     }
 
     #[test]
@@ -840,7 +858,8 @@ path = "~/code/nanna-coder"
         std::fs::write(&path, text).unwrap();
         let config = GlobalConfig::load(&path, None).unwrap();
         assert_eq!(config.state_db, Some(PathBuf::from("~/s.db")));
-        assert!(config.state_db_path(None).is_err());
+        let err = config.state_db_path(None).unwrap_err().to_string();
+        assert!(err.contains("HOME"), "{err}");
         assert_eq!(
             config.state_db_path(Some(Path::new("/home/me"))).unwrap(),
             PathBuf::from("/home/me/s.db")
@@ -880,7 +899,8 @@ path = "~/code/nanna-coder"
             ..base()
         };
         for home in [Some(Path::new("relative")), None] {
-            assert!(explicit.state_db_path(home).is_err());
+            let err = explicit.state_db_path(home).unwrap_err().to_string();
+            assert!(err.contains("HOME"), "{home:?}: {err}");
         }
     }
 
@@ -963,10 +983,11 @@ path = "~/code/nanna-coder"
         #[test]
         fn any_single_known_violation_makes_the_config_invalid(index in 0usize..1000) {
             let table = violations();
-            let (name, mutate, _) = table[index % table.len()];
+            let (name, mutate, expected) = table[index % table.len()];
             let mut config = base();
             mutate(&mut config);
-            prop_assert!(config.validate().is_err(), "{}", name);
+            let err = config.validate().err().map(|e| e.to_string()).unwrap_or_default();
+            prop_assert!(err.contains(expected), "{}: {}", name, err);
         }
 
         #[test]
