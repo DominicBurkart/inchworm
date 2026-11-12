@@ -28,6 +28,56 @@ pub enum DaemonError {
     Worker(String),
     #[error("the worker thread stopped unexpectedly")]
     WorkerDied,
+    #[error("another inchworm daemon holds {0}; refusing to start a second instance")]
+    AlreadyRunning(PathBuf),
+    #[error("cannot create the instance lock {path}: {detail}")]
+    Lock { path: PathBuf, detail: String },
+}
+
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl InstanceLock {
+    /// ```
+    /// use inchworm::daemon::InstanceLock;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = dir.path().join("state.db");
+    /// let first = InstanceLock::acquire(&db).unwrap();
+    /// assert!(InstanceLock::acquire(&db).is_err());
+    /// drop(first);
+    /// assert!(InstanceLock::acquire(&db).is_ok());
+    /// ```
+    pub fn acquire(state_db: &std::path::Path) -> Result<InstanceLock, DaemonError> {
+        let mut name = state_db.as_os_str().to_owned();
+        name.push(".lock");
+        let path = PathBuf::from(name);
+        let lock_error = |err: std::io::Error| DaemonError::Lock {
+            path: path.clone(),
+            detail: err.to_string(),
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(lock_error)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(lock_error)?;
+        match file.try_lock() {
+            Ok(()) => Ok(InstanceLock { _file: file, path }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(DaemonError::AlreadyRunning(path)),
+            Err(std::fs::TryLockError::Error(err)) => Err(lock_error(err)),
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +335,7 @@ pub async fn run_daemon(
     deps: DaemonDeps,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), DaemonError> {
+    let _instance = InstanceLock::acquire(&settings.state_db)?;
     let store = Store::open(&settings.state_db)?;
     let scheduler: Scheduler<Job> = Scheduler::new(settings.concurrency);
     resume(&settings, &store, &deps, &scheduler)?;
@@ -743,6 +794,51 @@ required_checks = ["build"]
         running.stop().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(rig.store().recover_after_crash(9).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_instance_lock_lives_next_to_the_state_db_and_is_exclusive() {
+        let rig = Rig::new(FLOWS);
+        let first = InstanceLock::acquire(&rig.db()).unwrap();
+        assert!(first.path().ends_with("state.db.lock"));
+        let second = InstanceLock::acquire(&rig.db()).unwrap_err();
+        assert!(
+            matches!(second, DaemonError::AlreadyRunning(_)),
+            "{second:?}"
+        );
+        assert!(second.to_string().contains("state.db.lock"));
+        drop(first);
+        assert!(InstanceLock::acquire(&rig.db()).is_ok());
+    }
+
+    #[test]
+    fn an_unwritable_lock_location_is_a_lock_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let err = InstanceLock::acquire(&blocker.join("state.db")).unwrap_err();
+        assert!(matches!(err, DaemonError::Lock { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_second_daemon_refuses_to_start_and_leaves_the_first_ones_attempt_alone() {
+        let rig = Rig::new(FLOWS);
+        let store = rig.store();
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        let _first = InstanceLock::acquire(&rig.db()).unwrap();
+        let second = rig.start(rig.settings(), ScriptedFactory::default());
+        let result = second.handle.join().unwrap();
+        assert!(
+            matches!(result, Err(DaemonError::AlreadyRunning(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            store.attempt(attempt.id).unwrap().state,
+            AttemptState::Dispatched
+        );
+        assert_eq!(store.run(run).unwrap().state, RunState::Running);
     }
 
     #[test]
