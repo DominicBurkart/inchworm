@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -266,10 +267,11 @@ impl DaemonLock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Recovery {
     pub attempts_failed: usize,
     pub runs_requeued: usize,
+    pub resumable: Vec<RunId>,
 }
 
 pub struct Store {
@@ -609,8 +611,22 @@ impl Store {
         Err(StoreError::AttemptNotDispatched(id))
     }
 
-    /// Fails every attempt left dispatched by a dead daemon and puts its run
-    /// back in the queue, so the issue is not wedged behind an open run.
+    /// Recovers the runs a dead daemon left in flight. Every run in `running`,
+    /// `awaiting_ci` or `judging` belonged to it, so recovery decides by run
+    /// state, never by whether the run still owns a dispatched attempt:
+    ///
+    /// - every dispatched attempt is failed as `orchestrator_lost`;
+    /// - a `running` run whose latest attempt already recorded a pull request
+    ///   (finished, or lost after `record_pr`) moves to `awaiting_ci`, because
+    ///   the work exists and must not be redone;
+    /// - any other `running` run goes back to `queued`, so its subject is not
+    ///   wedged behind an open run;
+    /// - `awaiting_ci` and `judging` runs keep their state and are listed in
+    ///   [`Recovery::resumable`] with the `awaiting_ci` ones recovered above,
+    ///   for the daemon to continue from the stored pull request and head SHA;
+    /// - `queued` and terminal runs are not touched.
+    ///
+    /// Calling it again changes nothing and reports the same resumable runs.
     ///
     /// ```
     /// use inchworm::model::{FailureClass, RunState};
@@ -626,6 +642,7 @@ impl Store {
     /// let lock = DaemonLock::acquire(&db).unwrap();
     /// let report = store.recover_after_crash(&lock, 3).unwrap();
     /// assert_eq!((report.attempts_failed, report.runs_requeued), (1, 1));
+    /// assert!(report.resumable.is_empty());
     /// assert_eq!(store.run(run).unwrap().state, RunState::Queued);
     /// let lost = store.attempt(attempt.id).unwrap();
     /// assert_eq!(lost.failure_class, Some(FailureClass::OrchestratorLost));
@@ -636,10 +653,8 @@ impl Store {
         now: i64,
     ) -> Result<Recovery, StoreError> {
         let tx = self.immediate()?;
-        let mut statement = tx.prepare(
-            "SELECT DISTINCT run_id FROM attempts WHERE state = 'dispatched' ORDER BY run_id",
-        )?;
-        let run_ids: Vec<RunId> = statement
+        let mut statement = tx.prepare("SELECT id FROM attempts WHERE state = 'dispatched'")?;
+        let lost: HashSet<AttemptId> = statement
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         drop(statement);
@@ -653,22 +668,53 @@ impl Store {
                 now
             ],
         )?;
-        let mut runs_requeued = 0;
-        for run_id in run_ids {
-            let run = run_in(&tx, run_id)?;
-            if run.state.can_transition_to(RunState::Queued) {
-                tx.execute(
-                    "UPDATE runs SET state = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![RunState::Queued.as_str(), now, run_id],
-                )?;
-                runs_requeued += 1;
+
+        let sql = format!(
+            "SELECT * FROM runs WHERE state IN ({}) ORDER BY id",
+            states_sql(RunState::ACTIVE)
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let runs: Vec<Run> = statement
+            .query_map([], |row| Ok(run_from_row(row)))?
+            .map(|row| row?)
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+
+        let mut recovery = Recovery {
+            attempts_failed,
+            ..Recovery::default()
+        };
+        for run in runs {
+            if run.state != RunState::Running {
+                recovery.resumable.push(run.id);
+                continue;
             }
+            let latest = tx
+                .query_row(
+                    "SELECT * FROM attempts WHERE run_id = ?1 ORDER BY n DESC LIMIT 1",
+                    [run.id],
+                    |row| Ok(attempt_from_row(row)),
+                )
+                .optional()?
+                .transpose()?;
+            let published = latest.is_some_and(|attempt| {
+                attempt.pr_number.is_some()
+                    && (attempt.state == AttemptState::Succeeded || lost.contains(&attempt.id))
+            });
+            let to = if published {
+                recovery.resumable.push(run.id);
+                RunState::AwaitingCi
+            } else {
+                recovery.runs_requeued += 1;
+                RunState::Queued
+            };
+            tx.execute(
+                "UPDATE runs SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                params![to.as_str(), now, run.id],
+            )?;
         }
         tx.commit()?;
-        Ok(Recovery {
-            attempts_failed,
-            runs_requeued,
-        })
+        Ok(recovery)
     }
 }
 
@@ -1343,7 +1389,8 @@ mod tests {
             report,
             Recovery {
                 attempts_failed: 1,
-                runs_requeued: 1
+                runs_requeued: 1,
+                resumable: Vec::new()
             }
         );
 
@@ -1397,7 +1444,14 @@ mod tests {
             .unwrap();
 
         let report = store.recover_after_crash(&lock_for(&dir), 30).unwrap();
-        assert_eq!(report, Recovery::default());
+        assert_eq!(
+            report,
+            Recovery {
+                attempts_failed: 0,
+                runs_requeued: 0,
+                resumable: vec![done_run]
+            }
+        );
 
         assert_eq!(store.attempt(ok.id).unwrap().state, AttemptState::Succeeded);
         assert_eq!(
@@ -1406,6 +1460,173 @@ mod tests {
         );
         assert_eq!(store.run(done_run).unwrap().state, RunState::AwaitingCi);
         assert_eq!(store.run(queued).unwrap().state, RunState::Queued);
+    }
+
+    type Case = (
+        &'static str,
+        &'static str,
+        Vec<(&'static str, Option<i64>)>,
+        RunState,
+        bool,
+    );
+
+    struct Seeded {
+        state: &'static str,
+        attempts: Vec<(&'static str, Option<i64>)>,
+    }
+
+    fn seed(store: &Store, subject: u64, spec: &Seeded) -> RunId {
+        let id = store
+            .enqueue_run("o/r", &issue(subject), "issue", 1)
+            .unwrap()
+            .unwrap();
+        force_state(store, id, spec.state);
+        for (n, (state, pr)) in spec.attempts.iter().enumerate() {
+            let class = (*state == "failed").then_some("model_error");
+            store
+                .raw()
+                .execute(
+                    "INSERT INTO attempts (run_id, n, state, pr_number, failure_class, started_at, ended_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                    params![id, n as i64 + 1, state, pr, class, (*state != "dispatched").then_some(2)],
+                )
+                .unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn recovery_is_decided_by_run_state_for_every_state_with_and_without_a_dispatched_attempt() {
+        use RunState::*;
+        let d = ("dispatched", None);
+        let cases: Vec<Case> = vec![
+            ("queued, none", "queued", vec![], Queued, false),
+            ("queued, dispatched", "queued", vec![d], Queued, false),
+            ("running, none", "running", vec![], Queued, false),
+            ("running, dispatched", "running", vec![d], Queued, false),
+            (
+                "running, published and finished",
+                "running",
+                vec![("succeeded", Some(7))],
+                AwaitingCi,
+                true,
+            ),
+            (
+                "running, finished without a pr",
+                "running",
+                vec![("succeeded", None)],
+                Queued,
+                false,
+            ),
+            (
+                "running, earlier failure after a pr",
+                "running",
+                vec![("failed", Some(7))],
+                Queued,
+                false,
+            ),
+            (
+                "running, pr recorded then crashed",
+                "running",
+                vec![("dispatched", Some(7))],
+                AwaitingCi,
+                true,
+            ),
+            (
+                "running, published once then a retry crashed",
+                "running",
+                vec![("succeeded", Some(7)), d],
+                Queued,
+                false,
+            ),
+            ("awaiting_ci, none", "awaiting_ci", vec![], AwaitingCi, true),
+            (
+                "awaiting_ci, dispatched",
+                "awaiting_ci",
+                vec![d],
+                AwaitingCi,
+                true,
+            ),
+            ("judging, none", "judging", vec![], Judging, true),
+            ("judging, dispatched", "judging", vec![d], Judging, true),
+            ("merged, none", "merged", vec![], Merged, false),
+            ("merged, dispatched", "merged", vec![d], Merged, false),
+            ("pr_open, dispatched", "pr_open", vec![d], PrOpen, false),
+            ("failed, dispatched", "failed", vec![d], Failed, false),
+            (
+                "escalated, dispatched",
+                "escalated",
+                vec![d],
+                Escalated,
+                false,
+            ),
+        ];
+        for (name, state, attempts, expected, resumable) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open_in_memory().unwrap();
+            let run = seed(
+                &store,
+                1,
+                &Seeded {
+                    state,
+                    attempts: attempts.clone(),
+                },
+            );
+            let dispatched = attempts.iter().filter(|a| a.0 == "dispatched").count();
+            let lock = lock_for(&dir);
+
+            let report = store.recover_after_crash(&lock, 50).unwrap();
+
+            assert_eq!(store.run(run).unwrap().state, expected, "{name}");
+            assert_eq!(report.resumable.contains(&run), resumable, "{name}");
+            assert_eq!(report.attempts_failed, dispatched, "{name}");
+            assert_eq!(
+                report.runs_requeued,
+                usize::from(expected == Queued && state == "running"),
+                "{name}"
+            );
+            for attempt in store.attempts(run).unwrap() {
+                assert_ne!(attempt.state, AttemptState::Dispatched, "{name}");
+            }
+            let again = store.recover_after_crash(&lock, 60).unwrap();
+            assert_eq!(
+                (again.attempts_failed, again.runs_requeued),
+                (0, 0),
+                "{name}"
+            );
+            assert_eq!(again.resumable, report.resumable, "{name}");
+            assert_eq!(store.run(run).unwrap().state, expected, "{name}");
+            if expected.is_open() {
+                assert!(
+                    store
+                        .enqueue_run("o/r", &issue(1), "issue", 70)
+                        .unwrap()
+                        .is_none(),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_run_with_no_attempt_does_not_wedge_its_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, run) = running_store();
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 13)
+                .unwrap()
+                .is_none()
+        );
+        store.recover_after_crash(&lock_for(&dir), 20).unwrap();
+        assert_eq!(store.run(run).unwrap().state, RunState::Queued);
+        assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, run);
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 21)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
