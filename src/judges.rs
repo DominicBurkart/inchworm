@@ -1433,6 +1433,100 @@ mod tests {
         assert_eq!(client.base_url(), "http://h:1");
     }
 
+    #[test]
+    fn hunk_guards_reject_lines_that_do_not_fit_the_remaining_counts() {
+        let header = "diff --git a/x b/x\n--- a/x\n+++ b/x\n";
+        for body in [
+            "@@ -1,2 +1,0 @@\n-a\n+b\n",
+            "@@ -1,0 +1,2 @@\n-b\n+a\n",
+            "@@ -1,2 +1,0 @@\n-a\n x\n",
+            "@@ -1,0 +1,2 @@\n x\n+a\n",
+            "@@ -1,1 +1,1 @@\n x\n-a\n",
+        ] {
+            let text = format!("{header}{body}");
+            assert!(patch_stats(&text).unparsable_header, "{body:?}");
+            assert!(!diff_judge(&text, 1000, &[]).passed, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_no_newline_marker_inside_a_hunk_is_not_a_hunk_line() {
+        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
+        let stats = patch_stats(text);
+        assert!(!stats.unparsable_header, "{stats:?}");
+        assert_eq!(stats.changed_lines, 2);
+    }
+
+    #[test]
+    fn an_empty_hunk_header_does_not_swallow_the_next_file_header() {
+        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +0,0 @@\n--- a/y\n+++ b/y\n";
+        let stats = patch_stats(text);
+        assert!(!stats.unparsable_header, "{stats:?}");
+        assert!(stats.paths.contains("y"));
+    }
+
+    #[test]
+    fn paths_containing_a_b_slash_sequence_are_taken_from_equal_halves() {
+        let stats = patch_stats("diff --git a/x b/y b/x b/y\n");
+        assert_eq!(stats.paths, BTreeSet::from(["x b/y".to_string()]));
+        let stats = patch_stats("diff --git a/dir b/d/f b/dir b/d/f\n");
+        assert_eq!(stats.paths, BTreeSet::from(["dir b/d/f".to_string()]));
+        let stats = patch_stats("diff --git a/\u{e9}.rs b/\u{e9}.rs\n");
+        assert_eq!(stats.paths, BTreeSet::from(["\u{e9}.rs".to_string()]));
+        assert!(!stats.unparsable_header);
+        let stats = patch_stats("diff --git a/ab b/abc\n");
+        assert_eq!(
+            stats.paths,
+            BTreeSet::from(["ab".to_string(), "abc".to_string()])
+        );
+    }
+
+    #[test]
+    fn size_limits_are_exact() {
+        assert_eq!(MAX_JUDGED_PATCH_BYTES, 65_536);
+        assert_eq!(MAX_REPLY_BYTES, 8_192);
+        let prefix = "{\"score\":9,\"reason\":\"";
+        let suffix = "\"}";
+        let pad = "x".repeat(MAX_REPLY_BYTES - prefix.len() - suffix.len());
+        let exact = format!("{prefix}{pad}{suffix}");
+        assert_eq!(exact.len(), MAX_REPLY_BYTES);
+        assert!(parse_score(&exact).is_ok());
+        assert!(parse_score(&format!("{prefix}x{pad}{suffix}")).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_patch_at_the_size_limit_is_judged_and_one_byte_more_is_not() {
+        let scorer = FakeScorer::new(Ok(r#"{"score":10,"reason":"ok"}"#));
+        let at_limit = "+".repeat(MAX_JUDGED_PATCH_BYTES);
+        assert!(
+            llm_judge(&scorer, &permit(), "r", "m", 10, &at_limit)
+                .await
+                .passed
+        );
+        let over = "+".repeat(MAX_JUDGED_PATCH_BYTES + 1);
+        assert!(
+            !llm_judge(&scorer, &permit(), "r", "m", 10, &over)
+                .await
+                .passed
+        );
+        assert_eq!(scorer.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_maximum_score_is_reachable_and_one_above_is_not() {
+        let scorer = FakeScorer::new(Ok(r#"{"score":10,"reason":"ok"}"#));
+        assert!(
+            llm_judge(&scorer, &permit(), "r", "m", MAX_SCORE, "+x")
+                .await
+                .passed
+        );
+        assert!(
+            !llm_judge(&scorer, &permit(), "r", "m", MAX_SCORE + 1, "+x")
+                .await
+                .passed
+        );
+    }
+
     fn path_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             "[ab]{1,2}",
