@@ -56,11 +56,17 @@ failure_classes! {
     MergeBlocked => "merge_blocked",
 }
 
+fn is_unsafe_char(ch: char) -> bool {
+    (ch.is_control() && ch != '\n' && ch != '\t')
+        || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// ```
 /// use inchworm::model::sanitize_text;
 ///
 /// assert_eq!(sanitize_text("ok\u{1b}[31mred", 100), "ok?[31mred");
 /// assert_eq!(sanitize_text("abcdef", 3), "abc...(truncated)");
+/// assert_eq!(sanitize_text("a\u{202e}b", 100), "a?b");
 /// ```
 pub fn sanitize_text(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
@@ -69,7 +75,7 @@ pub fn sanitize_text(text: &str, max_chars: usize) -> String {
             out.push_str("...(truncated)");
             break;
         }
-        if ch.is_control() && ch != '\n' && ch != '\t' {
+        if is_unsafe_char(ch) {
             out.push('?');
         } else {
             out.push(ch);
@@ -162,7 +168,7 @@ impl RunState {
             (self, to),
             (Queued, Running | Failed)
                 | (Running, AwaitingCi | Failed | Escalated)
-                | (AwaitingCi, Judging | Failed)
+                | (AwaitingCi, Judging | Failed | Running)
                 | (Judging, Merged | PrOpen | Failed | Running)
         )
     }
@@ -288,7 +294,7 @@ mod tests {
     #[test]
     fn a_rejected_judging_can_return_to_running_for_a_retry() {
         assert!(RunState::Judging.can_transition_to(RunState::Running));
-        assert!(!RunState::AwaitingCi.can_transition_to(RunState::Running));
+        assert!(RunState::AwaitingCi.can_transition_to(RunState::Running));
         assert!(!RunState::Judging.can_transition_to(RunState::AwaitingCi));
     }
 

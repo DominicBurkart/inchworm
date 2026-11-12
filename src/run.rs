@@ -404,7 +404,10 @@ pub async fn execute_run(
                     let failure = (*class, raw.clone(), *n);
                     return give_up(ctx, flow, run_id, issue_number, attempts, failure, warnings);
                 }
-                if ctx.store.run(run_id)?.state == RunState::Judging {
+                if matches!(
+                    ctx.store.run(run_id)?.state,
+                    RunState::Judging | RunState::AwaitingCi
+                ) {
                     ctx.store
                         .set_run_state(run_id, RunState::Running, ctx.clock.now())?;
                 }

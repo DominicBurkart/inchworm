@@ -444,6 +444,10 @@ impl Store {
         now: i64,
     ) -> Result<(), StoreError> {
         let tx = self.begin()?;
+        tx.execute(
+            "DELETE FROM verdicts WHERE attempt_id = ?1 AND head_sha = ?2",
+            params![attempt_id, head_sha],
+        )?;
         for verdict in verdicts {
             tx.execute(
                 "INSERT INTO verdicts (attempt_id, head_sha, judge, passed, score, detail, created_at)

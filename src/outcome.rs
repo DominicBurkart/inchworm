@@ -7,6 +7,7 @@ use tokio::sync::Semaphore;
 use crate::clock::Clock;
 use crate::config::OutcomeMode;
 use crate::config::{Flow, Judge};
+use crate::flow::{PROTECTED_DIR, protected_paths_in};
 use crate::github::{GitHub, PrState, PullRequest};
 use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
@@ -260,15 +261,11 @@ fn inspect_live(
             );
         }
     };
-    match live.state {
-        PrState::Merged => return Live::AlreadyMerged,
-        PrState::Closed => {
-            return Live::Rejected(
-                FailureClass::MergeBlocked,
-                format!("pull request {} was closed without merging", live.url),
-            );
-        }
-        PrState::Open => {}
+    if live.state == PrState::Closed {
+        return Live::Rejected(
+            FailureClass::MergeBlocked,
+            format!("pull request {} was closed without merging", live.url),
+        );
     }
     if live.is_cross_repository {
         return Live::Rejected(
@@ -293,6 +290,9 @@ fn inspect_live(
                 live.head_sha
             ),
         );
+    }
+    if live.state == PrState::Merged {
+        return Live::AlreadyMerged;
     }
     Live::Open(live)
 }
@@ -402,6 +402,21 @@ pub async fn conclude(
             );
         }
     };
+    let violations = protected_paths_in(&[], &[Some(&patch)]);
+    if !violations.is_empty() {
+        return reject(
+            ctx,
+            flow,
+            published,
+            FailureClass::ProtectedPathViolation,
+            format!(
+                "pull request #{} touches protected {}/**: {}",
+                published.pr.number,
+                PROTECTED_DIR,
+                violations.join(", ")
+            ),
+        );
+    }
     let verdicts = run_judges(
         flow,
         env,
@@ -488,13 +503,22 @@ pub async fn conclude(
                         state: RunState::Merged,
                     })
                 }
-                Err(err) => reject(
-                    ctx,
-                    flow,
-                    published,
-                    FailureClass::MergeBlocked,
-                    format!("merge was refused: {err}"),
-                ),
+                Err(err) => {
+                    let landed = ctx
+                        .github
+                        .pr(ctx.slug, published.pr.number)
+                        .is_ok_and(|after| after.state == PrState::Merged);
+                    if landed {
+                        return settle_merged(ctx, flow, published, sha, warnings);
+                    }
+                    reject(
+                        ctx,
+                        flow,
+                        published,
+                        FailureClass::MergeBlocked,
+                        format!("merge was refused: {err}"),
+                    )
+                }
             }
         }
         other => {
@@ -520,14 +544,17 @@ fn restore_draft(
     if flow.outcome.mode != OutcomeMode::MergeWhen {
         return None;
     }
-    match ctx.github.pr(ctx.slug, published.pr.number) {
-        Ok(live) if live.state == PrState::Open && !live.is_draft => ctx
-            .github
-            .mark_draft(ctx.slug, published.pr.number)
-            .err()
-            .map(|err| err.to_string()),
-        _ => None,
+    let needs_draft = match ctx.github.pr(ctx.slug, published.pr.number) {
+        Ok(live) => live.state == PrState::Open && !live.is_draft,
+        Err(_) => true,
+    };
+    if !needs_draft {
+        return None;
     }
+    ctx.github
+        .mark_draft(ctx.slug, published.pr.number)
+        .err()
+        .map(|err| err.to_string())
 }
 
 fn reject(
@@ -1676,5 +1703,339 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RunError::NotRunnable { .. }), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod round2_safety {
+    use super::*;
+    use crate::clock::FakeClock;
+    use crate::config::MergeMethod;
+    use crate::github::{FakeGitHub, GitHubError, Issue};
+    use crate::judges::NannaReport;
+    use crate::testing::{FakeScorer, env, flow_with, github_with_issue, pr_at};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct Proxy {
+        inner: FakeGitHub,
+        merge_applies_then_errors: AtomicBool,
+        pr_read_fails_after_ready: AtomicBool,
+    }
+
+    impl GitHub for Proxy {
+        fn open_issues_with_label(&self, r: &str, l: &str) -> Result<Vec<Issue>, GitHubError> {
+            self.inner.open_issues_with_label(r, l)
+        }
+        fn issue(&self, r: &str, n: u64) -> Result<Issue, GitHubError> {
+            self.inner.issue(r, n)
+        }
+        fn labels(&self, r: &str) -> Result<Vec<String>, GitHubError> {
+            self.inner.labels(r)
+        }
+        fn set_labels(&self, r: &str, n: u64, a: &[&str], d: &[&str]) -> Result<(), GitHubError> {
+            self.inner.set_labels(r, n, a, d)
+        }
+        fn comment(&self, r: &str, n: u64, b: &str) -> Result<(), GitHubError> {
+            self.inner.comment(r, n, b)
+        }
+        fn pr_for_branch(&self, r: &str, b: &str) -> Result<Option<PullRequest>, GitHubError> {
+            self.inner.pr_for_branch(r, b)
+        }
+        fn pr_files(&self, r: &str, n: u64) -> Result<Vec<String>, GitHubError> {
+            self.inner.pr_files(r, n)
+        }
+        fn pr(&self, r: &str, n: u64) -> Result<PullRequest, GitHubError> {
+            if self.pr_read_fails_after_ready.load(Ordering::SeqCst)
+                && !self.inner.ready_calls().is_empty()
+            {
+                return Err(GitHubError::Command {
+                    command: "gh pr view".into(),
+                    detail: "HTTP 502".into(),
+                });
+            }
+            self.inner.pr(r, n)
+        }
+        fn pr_patch(&self, r: &str, n: u64) -> Result<String, GitHubError> {
+            self.inner.pr_patch(r, n)
+        }
+        fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.inner.check_runs(r, s)
+        }
+        fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
+            self.inner.mark_ready(r, n)
+        }
+        fn mark_draft(&self, r: &str, n: u64) -> Result<(), GitHubError> {
+            self.inner.mark_draft(r, n)
+        }
+        fn merge_pr(&self, r: &str, n: u64, s: &str, m: MergeMethod) -> Result<(), GitHubError> {
+            if self.merge_applies_then_errors.load(Ordering::SeqCst) {
+                self.inner.merge_pr(r, n, s, m)?;
+                return Err(GitHubError::Command {
+                    command: "gh pr merge".into(),
+                    detail: "timed out after 60s".into(),
+                });
+            }
+            self.inner.merge_pr(r, n, s, m)
+        }
+        fn required_checks(&self, r: &str, b: &str) -> Result<Option<Vec<String>>, GitHubError> {
+            self.inner.required_checks(r, b)
+        }
+    }
+
+    fn proxy(patch: &str) -> Proxy {
+        let inner = github_with_issue();
+        inner.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        inner.set_pr_patch("o/r", 77, patch);
+        inner.push_check_poll(
+            "o/r",
+            SHA,
+            vec![CheckRun {
+                name: "build".into(),
+                head_sha: SHA.into(),
+                conclusion: CheckConclusion::Success,
+            }],
+        );
+        Proxy {
+            inner,
+            merge_applies_then_errors: AtomicBool::new(false),
+            pr_read_fails_after_ready: AtomicBool::new(false),
+        }
+    }
+
+    const SMALL: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1,2 @@\n+a\n+b\n";
+    const TOUCHES_INCHWORM: &str = "diff --git a/.inchworm/flows.toml b/.inchworm/flows.toml\n--- a/.inchworm/flows.toml\n+++ b/.inchworm/flows.toml\n@@ -0,0 +1,2 @@\n+a\n+b\n";
+
+    fn flow(mode: &str) -> Flow {
+        flow_with(
+            1,
+            "",
+            &format!(
+                "[[flow.judge]]\nkind = \"diff\"\nmax_lines = 50\n[flow.outcome]\nmode = \"{mode}\"\nrequired_checks = [\"build\"]\n"
+            ),
+        )
+    }
+
+    async fn conclude_on(gh: &Proxy, flow: &Flow) -> (Concluded, Store) {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(1_000);
+        let scorer = FakeScorer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        store.mark_published(attempt.id, 0, Some(true)).unwrap();
+        store.set_run_state(run, RunState::AwaitingCi, 4).unwrap();
+        let ctx = ConcludeContext {
+            store: &store,
+            github: gh,
+            clock: &clock,
+            slug: "o/r",
+            repo_path: dir.path(),
+            issue: 5,
+        };
+        let pr = pr_at(77, SHA);
+        let published = Published {
+            run_id: run,
+            attempt_id: attempt.id,
+            attempt_n: 1,
+            pr: &pr,
+            judged_sha: SHA,
+            report: NannaReport {
+                denial_count: 0,
+                qa_ok: Some(true),
+            },
+        };
+        let mut warnings = Vec::new();
+        let concluded = conclude(&ctx, &env(&scorer), flow, &published, &mut warnings)
+            .await
+            .unwrap();
+        (concluded, store)
+    }
+
+    #[tokio::test]
+    async fn a_merge_that_landed_but_whose_gh_call_errored_is_not_a_refusal() {
+        let gh = proxy(SMALL);
+        gh.merge_applies_then_errors.store(true, Ordering::SeqCst);
+        let (concluded, _) = conclude_on(&gh, &flow("merge_when")).await;
+        assert_eq!(gh.inner.pr("o/r", 77).unwrap().state, PrState::Merged);
+        assert_eq!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::Merged
+            },
+            "the PR is merged on GitHub but the attempt is recorded as a refused merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_pr_after_a_refused_merge_must_not_leave_the_pr_ready_silently() {
+        let gh = proxy(SMALL);
+        gh.inner.fail_merges_with("not mergeable");
+        gh.pr_read_fails_after_ready.store(true, Ordering::SeqCst);
+        let (concluded, _) = conclude_on(&gh, &flow("merge_when")).await;
+        let Concluded::Rejected { raw, .. } = concluded else {
+            panic!("expected a rejection");
+        };
+        let drafted = !gh.inner.draft_calls().is_empty();
+        assert!(
+            drafted || raw.contains("draft"),
+            "PR left ready-for-review and the rejection does not say so: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_judged_net_diff_must_itself_refuse_inchworm_paths() {
+        let gh = proxy(TOUCHES_INCHWORM);
+        let (concluded, _) = conclude_on(&gh, &flow("draft_pr")).await;
+        assert!(
+            matches!(concluded, Concluded::Rejected { .. }),
+            "net PR diff touching .inchworm/flows.toml was accepted: {concluded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pr_merged_at_a_different_head_is_not_recorded_as_the_judged_merge() {
+        let gh = proxy(SMALL);
+        let mut live = pr_at(77, "fedcba9876543210fedcba9876543210fedcba98");
+        live.state = PrState::Merged;
+        live.is_cross_repository = true;
+        live.base_ref = "elsewhere".into();
+        gh.inner.add_pr("o/r", "inchworm/5-a1", live);
+        let (concluded, _) = conclude_on(&gh, &flow("draft_pr")).await;
+        assert!(
+            matches!(concluded, Concluded::Rejected { .. }),
+            "merged at another head, from a fork, into another base, yet recorded: {concluded:?}"
+        );
+    }
+
+    #[test]
+    fn bidi_overrides_are_stripped_from_sanitised_text() {
+        let out = crate::model::sanitize_text("ok\u{202e}evil\u{2066}x", 100);
+        assert!(
+            !out.contains('\u{202e}') && !out.contains('\u{2066}'),
+            "{out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod round2_correct {
+    use super::*;
+    use crate::clock::FakeClock;
+    use crate::github::PrState;
+    use crate::nanna_client::fake::{Scenario, connect};
+    use crate::run::{RunContext, run_issue};
+    use crate::testing::{FakeScorer, env, flow_with, github_with_issue, pr_at};
+
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA2: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    #[tokio::test]
+    async fn retry_after_an_early_rejection_keeps_the_state_machine_legal() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github_with_issue();
+        let mut closed = pr_at(77, SHA1);
+        closed.state = PrState::Closed;
+        github.add_pr("o/r", "inchworm/5-a1", closed);
+        github.add_pr("o/r", "inchworm/5-a2", pr_at(78, SHA2));
+        github.set_pr_patch(
+            "o/r",
+            78,
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+x\n",
+        );
+        github.push_check_poll(
+            "o/r",
+            SHA2,
+            vec![CheckRun {
+                name: "build".into(),
+                head_sha: SHA2.into(),
+                conclusion: CheckConclusion::Success,
+            }],
+        );
+        let flow = flow_with(
+            2,
+            "\"merge_blocked\"",
+            "[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = [\"build\"]\n[[flow.judge]]\nkind = \"diff\"\nmax_lines = 50\n",
+        );
+        let clock = FakeClock::new(100);
+        let scorer = FakeScorer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext {
+            store: &store,
+            github: &github,
+            slug: "o/r",
+            repo_path: dir.path(),
+            clock: &clock,
+        };
+        let scenarios = (0..4)
+            .map(|_| Scenario::success_with_patch("+x\n", &["src/lib.rs"]))
+            .collect();
+        let (mut client, _f) = connect(scenarios);
+        client.initialize().unwrap();
+        let result = run_issue(&ctx, &env(&scorer), &flow, 5, &mut client).await;
+        let state = store.recent_runs(1).unwrap()[0].state;
+        assert!(
+            result.is_ok(),
+            "retry after early rejection errored: {result:?}; run state {state}"
+        );
+        assert_eq!(result.unwrap().state, RunState::PrOpen);
+    }
+
+    #[tokio::test]
+    async fn resume_after_verdicts_were_recorded_must_not_duplicate_them() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github_with_issue();
+        github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA1));
+        github.set_pr_patch(
+            "o/r",
+            77,
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+x\n",
+        );
+        github.push_check_poll(
+            "o/r",
+            SHA1,
+            vec![CheckRun {
+                name: "build".into(),
+                head_sha: SHA1.into(),
+                conclusion: CheckConclusion::Success,
+            }],
+        );
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let a = store.start_attempt(run, 3).unwrap();
+        store.record_pr(a.id, "inchworm/5-a1", SHA1, 77).unwrap();
+        store.mark_published(a.id, 0, Some(true)).unwrap();
+        store.set_run_state(run, RunState::AwaitingCi, 4).unwrap();
+        store.set_run_state(run, RunState::Judging, 5).unwrap();
+        store
+            .record_verdicts(a.id, SHA1, &[Verdict::pass("diff", "ok")], 6)
+            .unwrap();
+        let flow = flow_with(
+            1,
+            "",
+            "[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = [\"build\"]\n[[flow.judge]]\nkind = \"diff\"\nmax_lines = 50\n",
+        );
+        let clock = FakeClock::new(100);
+        let scorer = FakeScorer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext {
+            store: &store,
+            github: &github,
+            slug: "o/r",
+            repo_path: dir.path(),
+            clock: &clock,
+        };
+        let (mut client, _f) = connect(vec![]);
+        client.initialize().unwrap();
+        crate::run::execute_run(&ctx, &env(&scorer), &flow, run, &mut client, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.verdicts(a.id).unwrap().len(),
+            1,
+            "verdict rows duplicated on resume"
+        );
     }
 }
