@@ -720,6 +720,7 @@ fn result_text(value: &Value) -> String {
 }
 
 fn split_diagnostics(text: &str) -> (String, Option<Value>) {
+    let text = text.replace("\r\n", "\n");
     let mut end = text.len();
     while let Some(at) = text[..end].rfind("\n\n{") {
         if let Ok(diagnostics) = serde_json::from_str::<Value>(&text[at + 2..]) {
@@ -727,7 +728,7 @@ fn split_diagnostics(text: &str) -> (String, Option<Value>) {
         }
         end = at;
     }
-    (text.to_string(), None)
+    (text, None)
 }
 
 fn parse_failure(value: &Value) -> NannaFailure {

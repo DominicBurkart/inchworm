@@ -116,6 +116,20 @@ fn a_multi_paragraph_failure_message_keeps_all_paragraphs_and_recovers_the_error
 }
 
 #[test]
+fn crlf_line_endings_before_the_diagnostics_block_do_not_hide_it() {
+    let text = "went wrong\r\n\r\n{\r\n  \"error_type\": \"StateError\",\r\n  \"denials\": []\r\n}";
+    let outcome = parse_result(TaskState::Failed, &failed_wire(text)).unwrap();
+    assert_eq!(
+        outcome,
+        TaskOutcome::Failed(NannaFailure {
+            failure_kind: None,
+            error_type: Some("StateError".into()),
+            message: "went wrong".into(),
+        })
+    );
+}
+
+#[test]
 fn a_failure_without_a_diagnostics_block_keeps_its_whole_text() {
     let text = "Task was interrupted\n\nsee the operator log";
     let outcome = parse_result(TaskState::Failed, &failed_wire(text)).unwrap();
