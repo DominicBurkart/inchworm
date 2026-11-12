@@ -79,7 +79,13 @@ impl Report {
 
 /// Why a `.nanna/protected.toml` entry would be rejected by nanna's loader.
 ///
-/// Entries are normalised relative literal paths, optionally ending in `/**`.
+/// This mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` at
+/// commit `239a1c94`, rule for rule and in the same order, and is exactly as
+/// strict: it does not reject other control characters (a tab or DEL passes in
+/// nanna too). One trailing `/**` is stripped first. The rules are: not empty;
+/// relative; not starting with `!`; none of `* ? [ ] { } \\`, newline, carriage
+/// return or NUL; no empty, `.` or `..` path segment; no segment ending in a dot
+/// or a space or containing a colon.
 ///
 /// ```
 /// use inchworm::validate::protected_entry_problem;
@@ -88,29 +94,40 @@ impl Report {
 /// assert!(protected_entry_problem("scripts/deploy.sh").is_none());
 /// assert!(protected_entry_problem("/etc/passwd").is_some());
 /// assert!(protected_entry_problem("a/../b").is_some());
-/// assert!(protected_entry_problem("a/*/b").is_some());
+/// assert!(protected_entry_problem("a]b").is_some());
+/// assert!(protected_entry_problem("dir./f").is_some());
 /// ```
 pub fn protected_entry_problem(entry: &str) -> Option<&'static str> {
     let literal = entry.strip_suffix("/**").unwrap_or(entry);
     if literal.is_empty() {
         return Some("is empty");
     }
-    if literal.chars().any(|c| c.is_control() || c == '\\') {
-        return Some("contains a control character or backslash");
-    }
-    if literal.contains('*') || literal.contains('?') || literal.contains('[') {
-        return Some("contains a wildcard other than a trailing /**");
-    }
     if literal.starts_with('/') {
-        return Some("is not a relative path");
+        return Some("must be relative");
     }
-    for part in literal.split('/') {
-        match part {
-            "" => return Some("is not normalised (empty path segment)"),
-            "." => return Some("is not normalised (`.` segment)"),
-            ".." => return Some("contains a `..` segment"),
-            _ => {}
-        }
+    if literal.starts_with('!') {
+        return Some("must not be negated (leading `!`)");
+    }
+    if literal.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r', '\0']) {
+        return Some(
+            "must be a literal path, optionally ending in `/**` (no `* ? [ ] { } \\`, line break or NUL)",
+        );
+    }
+    if literal
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Some(
+            "must be normalised and stay inside the repository (no empty, `.` or `..` segment)",
+        );
+    }
+    if literal
+        .split('/')
+        .any(|part| part.ends_with(['.', ' ']) || part.contains(':'))
+    {
+        return Some(
+            "has a segment ending in a dot or a space, or containing a colon (Windows reads those as another spelling of the same name)",
+        );
     }
     None
 }
@@ -705,10 +722,7 @@ mode = "draft_pr"
             ),
             ("extra = [\".inchworm/**\", 5]\n", "is not a string"),
             ("extra = \".inchworm/**\"\n", "must be an array"),
-            (
-                "extra = [\".inchworm/**\", \"/abs\"]\n",
-                "not a relative path",
-            ),
+            ("extra = [\".inchworm/**\", \"/abs\"]\n", "must be relative"),
             ("extra = [\".inchworm/**\", \"a/../b\"]\n", "`..`"),
             ("extra = [\".inchworm/**\", \"\"]\n", "is empty"),
             ("extra = [", "protected.toml"),
@@ -756,7 +770,49 @@ mode = "draft_pr"
     }
 
     #[test]
-    fn protected_entries_follow_the_loaders_rules() {
+    fn each_of_nannas_entry_rules_rejects_its_own_entries() {
+        let rules: [(&str, &[&str], &str); 8] = [
+            ("empty", &["", "/**"], "is empty"),
+            ("absolute", &["/a", "/a/**"], "must be relative"),
+            ("negated", &["!a", "!a/**", "!"], "must not be negated"),
+            (
+                "forbidden characters",
+                &[
+                    "a*b", "a?b", "a[b", "a]b", "a{b", "a}b", "a\\b", "a\nb", "a\rb", "a\0b",
+                    "a/**/b", "a/**/**",
+                ],
+                "must be a literal path",
+            ),
+            (
+                "not normalised",
+                &["a//b", "a/", "./a", "a/./b", "a/../b", "../a", "a/.."],
+                "must be normalised",
+            ),
+            (
+                "trailing dot",
+                &["x.", "dir./f", "a/b./**"],
+                "dot or a space",
+            ),
+            (
+                "trailing space",
+                &["x ", "a /b", "a/b /**"],
+                "dot or a space",
+            ),
+            ("colon", &["c:d", "a/b:stream", "a:/b"], "colon"),
+        ];
+        for (rule, entries, expected) in rules {
+            for entry in entries {
+                let got = protected_entry_problem(entry);
+                assert!(
+                    got.is_some_and(|message| message.contains(expected)),
+                    "{rule}: {entry:?}: expected `{expected}`, got {got:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn entries_nanna_accepts_are_accepted_too() {
         for good in [
             ".inchworm/**",
             "a",
@@ -764,32 +820,37 @@ mode = "draft_pr"
             "a/b/**",
             "scripts/deploy.sh",
             ".github/**",
+            ".hidden/**",
+            "a.b/c",
+            "a b/c",
+            "a\tb",
+            "a\u{7f}b",
+            "caf\u{e9}/**",
+            "dir/file.txt",
+            "a/b.c/**",
         ] {
-            assert_eq!(protected_entry_problem(good), None, "{good}");
+            assert_eq!(protected_entry_problem(good), None, "{good:?}");
         }
-        let bad = [
-            ("", "is empty"),
-            ("/**", "is empty"),
-            ("/a", "not a relative path"),
-            ("a//b", "empty path segment"),
-            ("a/", "empty path segment"),
-            ("./a", "`.` segment"),
-            ("a/./b", "`.` segment"),
-            ("a/../b", "`..`"),
-            ("a\\b", "backslash"),
-            ("a\nb", "control"),
-            ("a*b", "wildcard"),
-            ("a?b", "wildcard"),
-            ("a[b", "wildcard"),
-            ("a/**/b", "wildcard"),
-        ];
-        for (entry, expected) in bad {
-            let got = protected_entry_problem(entry);
-            assert!(
-                got.is_some_and(|m| m.contains(expected)),
-                "{entry:?}: {got:?}"
-            );
-        }
+    }
+
+    #[test]
+    fn the_reasons_for_overlapping_rules_follow_nannas_order() {
+        assert!(
+            protected_entry_problem("/*")
+                .unwrap()
+                .contains("must be relative")
+        );
+        assert!(protected_entry_problem("!*").unwrap().contains("negated"));
+        assert!(
+            protected_entry_problem("a*/../")
+                .unwrap()
+                .contains("literal")
+        );
+        assert!(
+            protected_entry_problem("a./../b")
+                .unwrap()
+                .contains("normalised")
+        );
     }
 
     #[test]
