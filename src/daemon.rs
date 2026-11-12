@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -16,7 +17,7 @@ use crate::model::RunState;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskOutcome};
 use crate::outcome::{CiPolicy, OutcomeEnv};
 use crate::policy::HumanGate;
-use crate::run::{RunContext, enqueue_issue, execute_run};
+use crate::run::{RunContext, RunError, enqueue_issue, execute_run};
 use crate::scheduler::Scheduler;
 use crate::store::{RunId, Store, StoreError};
 
@@ -178,6 +179,14 @@ struct Job {
     run_id: RunId,
     flow: String,
     repo: RepoEntry,
+    failures: u32,
+}
+
+const MAX_BACKOFF: Duration = Duration::from_secs(900);
+
+fn backoff(poll: Duration, failures: u32) -> Duration {
+    poll.saturating_mul(1u32 << failures.min(3))
+        .min(MAX_BACKOFF)
 }
 
 fn log(message: &str) {
@@ -197,14 +206,13 @@ async fn process(
     deps: &DaemonDeps,
     scheduler: &Scheduler<Job>,
     ci: CiPolicy,
-    _lease: crate::scheduler::Lease<Job>,
 ) -> Option<Job> {
     let repo = &job.repo;
     let file = match load_flows(repo) {
         Ok(file) => file,
         Err(err) => {
             log(&format!("{}: {err}; will retry", repo.slug));
-            return Some(job);
+            return Some(job.failed());
         }
     };
     let Some(flow) = file.flow.iter().find(|flow| flow.name == job.flow) else {
@@ -232,39 +240,135 @@ async fn process(
         inner: None,
     };
     match execute_run(&ctx, &env, flow, job.run_id, &mut dispatcher, None).await {
-        Ok(summary) => log(&format!(
-            "{}: run {} finished as {}",
-            repo.slug, job.run_id, summary.state
-        )),
-        Err(err) => log(&format!("{}: run {} errored: {err}", repo.slug, job.run_id)),
+        Ok(summary) => {
+            log(&format!(
+                "{}: run {} finished as {}",
+                repo.slug, job.run_id, summary.state
+            ));
+            None
+        }
+        Err(err @ RunError::NotRunnable { .. }) => {
+            log(&format!("{}: run {} errored: {err}", repo.slug, job.run_id));
+            None
+        }
+        Err(err) => {
+            log(&format!(
+                "{}: run {} errored: {err}; will retry",
+                repo.slug, job.run_id
+            ));
+            Some(job.failed())
+        }
     }
-    None
+}
+
+impl Job {
+    fn failed(mut self) -> Job {
+        self.failures = self.failures.saturating_add(1);
+        self
+    }
+}
+
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn run_job(
+    job: Job,
+    lease: crate::scheduler::Lease<Job>,
+    settings: &DaemonSettings,
+    deps: &Arc<DaemonDeps>,
+    scheduler: &Scheduler<Job>,
+    retries: &tokio::sync::mpsc::UnboundedSender<Job>,
+    in_flight: &Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    in_flight.fetch_add(1, Ordering::SeqCst);
+    let guard = InFlight(Arc::clone(in_flight));
+    let state_db = settings.state_db.clone();
+    let ci = settings.ci;
+    let deps = Arc::clone(deps);
+    let scheduler = scheduler.clone();
+    let retries = retries.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("inchworm-run-{}", job.run_id))
+        .spawn(move || {
+            let _guard = guard;
+            let slug = job.repo.slug.clone();
+            let id = job.run_id;
+            let fallback = job.clone();
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let store = match Store::open(&state_db) {
+                    Ok(store) => store,
+                    Err(err) => {
+                        log(&format!(
+                            "{slug}: run {id}: cannot open the state database: {err}; will retry"
+                        ));
+                        return Some(job.failed());
+                    }
+                };
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a current-thread runtime can always be built")
+                    .block_on(process(job, &store, &deps, &scheduler, ci))
+            }));
+            let retry = match attempt {
+                Ok(retry) => retry,
+                Err(_) => {
+                    log(&format!("{slug}: run {id} panicked; will retry"));
+                    Some(fallback.failed())
+                }
+            };
+            drop(lease);
+            if let Some(retry) = retry {
+                let _ = retries.send(retry);
+            }
+        });
+    spawned.map(|_| ())
 }
 
 async fn worker(
     settings: DaemonSettings,
-    store: Store,
     deps: Arc<DaemonDeps>,
     scheduler: Scheduler<Job>,
     stop: Arc<Notify>,
 ) {
-    let mut deferred: Vec<Job> = Vec::new();
+    let mut deferred: Vec<(Instant, Job)> = Vec::new();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let (retries, mut returned) = tokio::sync::mpsc::unbounded_channel::<Job>();
     loop {
-        let lease = tokio::select! {
-            () = stop.notified() => return,
-            lease = scheduler.next() => lease,
+        tokio::select! {
+            () = stop.notified() => break,
+            lease = scheduler.next() => {
+                let job = lease.item().clone();
+                let fallback = job.clone();
+                if let Err(err) = run_job(job, lease, &settings, &deps, &scheduler, &retries, &in_flight) {
+                    log(&format!("{}: cannot start a run thread: {err}; will retry", fallback.repo.slug));
+                    let delay = backoff(settings.poll, fallback.failures);
+                    deferred.push((Instant::now() + delay, fallback.failed()));
+                }
+            }
+            Some(job) = returned.recv() => {
+                let delay = backoff(settings.poll, job.failures);
+                deferred.push((Instant::now() + delay, job));
+            }
             () = deps.clock.sleep(settings.poll), if !deferred.is_empty() => {
-                for job in deferred.drain(..) {
+                let now = Instant::now();
+                let (due, waiting): (Vec<_>, Vec<_>) =
+                    deferred.drain(..).partition(|(at, _)| *at <= now);
+                deferred = waiting;
+                for (_, job) in due {
                     let repo = job.repo.slug.clone();
                     scheduler.enqueue(&repo, job);
                 }
-                continue;
             }
-        };
-        let job = lease.item().clone();
-        if let Some(retry) = process(job, &store, &deps, &scheduler, settings.ci, lease).await {
-            deferred.push(retry);
         }
+    }
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -314,6 +418,7 @@ fn poll_repo(
                             run_id,
                             flow: flow.name.clone(),
                             repo: repo.clone(),
+                            failures: 0,
                         },
                     );
                 }
@@ -382,6 +487,7 @@ fn resume(
                     run_id: run.id,
                     flow: run.flow,
                     repo: repo.clone(),
+                    failures: 0,
                 },
             );
         }
@@ -399,7 +505,6 @@ pub async fn run_daemon(
     let scheduler: Scheduler<Job> = Scheduler::new(settings.concurrency);
     resume(&settings, &store, &deps, &scheduler)?;
 
-    let worker_store = Store::open(&settings.state_db)?;
     let deps = Arc::new(deps);
     let stop = Arc::new(Notify::new());
     let handle = {
@@ -414,7 +519,7 @@ pub async fn run_daemon(
                     .enable_all()
                     .build()
                     .expect("a current-thread runtime can always be built")
-                    .block_on(worker(settings, worker_store, deps, scheduler, stop));
+                    .block_on(worker(settings, deps, scheduler, stop));
             })
             .map_err(|err| DaemonError::Worker(err.to_string()))?
     };
@@ -1036,22 +1141,29 @@ required_checks = ["build"]
         assert_eq!(states(&rig.store()), [(5, RunState::Queued)]);
         std::fs::write(rig.dir.path().join("repo/.inchworm/flows.toml"), FLOWS).unwrap();
         wait_for("the run to finish once the file is readable", || {
-            states(&rig.store()) == [(5, RunState::PrOpen)]
+            states(&rig.store()).contains(&(5, RunState::PrOpen))
         });
         running.stop().unwrap();
     }
 
     #[test]
-    fn a_dead_worker_is_reported_instead_of_hanging() {
+    fn a_panicking_run_is_retried_without_killing_the_daemon() {
         let rig = Rig::new(FLOWS);
         let factory = ScriptedFactory {
             panics: true,
             ..ScriptedFactory::default()
         };
         let running = rig.start(rig.settings(), factory);
-        let handle = running.handle;
-        let result = handle.join().unwrap();
-        assert!(matches!(result, Err(DaemonError::WorkerDied)), "{result:?}");
+        wait_for("the run to be queued", || {
+            !rig.store().recent_runs(5).unwrap().is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!running.handle.is_finished());
+        running.stop().unwrap();
+        assert_eq!(
+            rig.store().recent_runs(1).unwrap()[0].state,
+            RunState::Running
+        );
     }
 
     fn script(dir: &std::path::Path, body: &str) -> PathBuf {
@@ -1167,5 +1279,271 @@ required_checks = ["build"]
         let factory = NannaFactory::new(PathBuf::from("/no/such/nanna"));
         let err = factory.make().err().unwrap();
         assert!(err.contains("cannot start"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod round2 {
+    use super::*;
+    use crate::clock::SystemClock;
+    use crate::config::MergeMethod;
+    use crate::github::{FakeGitHub, GitHubError, Issue, PullRequest};
+    use crate::nanna_client::fake::{Scenario, connect};
+    use crate::policy::CheckConclusion;
+    use crate::policy::CheckRun;
+    use crate::testing::{FakeScorer, github_with_issue, pr_at};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+x\n";
+    const FLOWS: &str = r#"
+[[flow]]
+name = "issue"
+max_attempts = 2
+retry_on = ["orchestrator_lost"]
+trigger = { kind = "label", label = "inchworm" }
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+[[flow.step]]
+name = "publish"
+identity = "pr-shepherd"
+[[flow.judge]]
+kind = "diff"
+max_lines = 50
+[flow.outcome]
+mode = "draft_pr"
+required_checks = ["build"]
+"#;
+
+    struct Flaky {
+        inner: FakeGitHub,
+        issue_failures: Mutex<u32>,
+        label_ok_calls: Mutex<Option<u32>>,
+    }
+
+    impl GitHub for Flaky {
+        fn open_issues_with_label(&self, r: &str, l: &str) -> Result<Vec<Issue>, GitHubError> {
+            self.inner.open_issues_with_label(r, l)
+        }
+        fn issue(&self, r: &str, n: u64) -> Result<Issue, GitHubError> {
+            let mut left = self.issue_failures.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(GitHubError::Command {
+                    command: "gh issue view".into(),
+                    detail: "HTTP 502".into(),
+                });
+            }
+            self.inner.issue(r, n)
+        }
+        fn labels(&self, r: &str) -> Result<Vec<String>, GitHubError> {
+            self.inner.labels(r)
+        }
+        fn set_labels(&self, r: &str, n: u64, a: &[&str], d: &[&str]) -> Result<(), GitHubError> {
+            let mut ok = self.label_ok_calls.lock().unwrap();
+            if let Some(left) = ok.as_mut() {
+                if *left == 0 {
+                    return Err(GitHubError::Command {
+                        command: "gh issue edit".into(),
+                        detail: "label inchworm:done not found".into(),
+                    });
+                }
+                *left -= 1;
+            }
+            self.inner.set_labels(r, n, a, d)
+        }
+        fn comment(&self, r: &str, n: u64, b: &str) -> Result<(), GitHubError> {
+            self.inner.comment(r, n, b)
+        }
+        fn pr_for_branch(&self, r: &str, b: &str) -> Result<Option<PullRequest>, GitHubError> {
+            self.inner.pr_for_branch(r, b)
+        }
+        fn pr_files(&self, r: &str, n: u64) -> Result<Vec<String>, GitHubError> {
+            self.inner.pr_files(r, n)
+        }
+        fn pr(&self, r: &str, n: u64) -> Result<PullRequest, GitHubError> {
+            self.inner.pr(r, n)
+        }
+        fn pr_patch(&self, r: &str, n: u64) -> Result<String, GitHubError> {
+            self.inner.pr_patch(r, n)
+        }
+        fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.inner.check_runs(r, s)
+        }
+        fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
+            self.inner.mark_ready(r, n)
+        }
+        fn mark_draft(&self, r: &str, n: u64) -> Result<(), GitHubError> {
+            self.inner.mark_draft(r, n)
+        }
+        fn merge_pr(&self, r: &str, n: u64, h: &str, m: MergeMethod) -> Result<(), GitHubError> {
+            self.inner.merge_pr(r, n, h, m)
+        }
+        fn required_checks(&self, r: &str, b: &str) -> Result<Option<Vec<String>>, GitHubError> {
+            self.inner.required_checks(r, b)
+        }
+    }
+
+    struct Factory(Mutex<Vec<Vec<Scenario>>>);
+    impl DispatcherFactory for Factory {
+        fn make(&self) -> Result<Box<dyn Dispatcher>, String> {
+            let s = self.0.lock().unwrap().pop().unwrap_or_default();
+            let (mut client, _f) = connect(s);
+            client.initialize().map_err(|e| e.to_string())?;
+            Ok(Box::new(client))
+        }
+    }
+
+    fn ok() -> Vec<Scenario> {
+        vec![
+            Scenario::success_with_patch("+x\n", &["src/lib.rs"]),
+            Scenario::success_with_patch("+x\n", &["src/lib.rs"]),
+        ]
+    }
+
+    fn green(g: &FakeGitHub, slug: &str, number: u64, issue: u64) {
+        g.add_pr(slug, &format!("inchworm/{issue}-a1"), pr_at(number, SHA));
+        g.set_pr_patch(slug, number, PATCH);
+        g.push_check_poll(
+            slug,
+            SHA,
+            vec![CheckRun {
+                name: "build".into(),
+                head_sha: SHA.into(),
+                conclusion: CheckConclusion::Success,
+            }],
+        );
+    }
+
+    fn start(
+        settings: DaemonSettings,
+        github: Arc<dyn GitHub + Send + Sync>,
+        batches: Vec<Vec<Scenario>>,
+    ) -> (
+        Arc<Notify>,
+        std::thread::JoinHandle<Result<(), DaemonError>>,
+    ) {
+        let deps = DaemonDeps {
+            github,
+            clock: Arc::new(SystemClock),
+            dispatchers: Arc::new(Factory(Mutex::new(batches))),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let stop = Arc::new(Notify::new());
+        let signal = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_daemon(settings, deps, async move {
+                    signal.notified().await
+                }))
+        });
+        (stop, handle)
+    }
+
+    fn setup(slugs: &[&str]) -> (tempfile::TempDir, DaemonSettings) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repos = Vec::new();
+        for (i, slug) in slugs.iter().enumerate() {
+            let p = dir.path().join(format!("repo{i}"));
+            std::fs::create_dir_all(p.join(".inchworm")).unwrap();
+            std::fs::write(p.join(".inchworm/flows.toml"), FLOWS).unwrap();
+            repos.push(RepoEntry {
+                slug: slug.to_string(),
+                path: p,
+            });
+        }
+        let settings = DaemonSettings {
+            repos,
+            state_db: dir.path().join("state.db"),
+            poll: Duration::from_millis(20),
+            concurrency: 2,
+            ci: CiPolicy {
+                poll_interval: Duration::from_millis(5),
+                timeout: Duration::from_secs(120),
+            },
+            grace: Duration::from_millis(300),
+        };
+        (dir, settings)
+    }
+
+    fn issue(n: u64) -> Issue {
+        Issue {
+            number: n,
+            title: "t".into(),
+            body: String::new(),
+            labels: vec!["inchworm".into()],
+            url: "u".into(),
+        }
+    }
+
+    #[test]
+    fn a_transient_gh_error_when_a_run_starts_must_not_strand_it_until_restart() {
+        let (_dir, settings) = setup(&["o/r"]);
+        let flaky = Arc::new(Flaky {
+            inner: github_with_issue(),
+            issue_failures: Mutex::new(2),
+            label_ok_calls: Mutex::new(None),
+        });
+        green(&flaky.inner, "o/r", 77, 5);
+        let db = settings.state_db.clone();
+        let (stop, handle) = start(settings, flaky.clone(), vec![ok()]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut state = None;
+        while Instant::now() < deadline {
+            let runs = Store::open(&db).unwrap().recent_runs(5).unwrap();
+            state = runs.first().map(|r| r.state);
+            if state == Some(RunState::PrOpen) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.notify_one();
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            state,
+            Some(RunState::PrOpen),
+            "run stranded after one transient `gh issue view` failure"
+        );
+    }
+
+    #[test]
+    fn a_ci_wait_in_one_repo_must_not_block_every_other_repo() {
+        let (_dir, settings) = setup(&["o/a", "o/b"]);
+        let github = FakeGitHub::new();
+        github.add_issue("o/a", issue(1));
+        github.add_issue("o/b", issue(2));
+        github.add_pr(
+            "o/a",
+            "inchworm/1-a1",
+            pr_at(10, "1111111111111111111111111111111111111111"),
+        );
+        github.set_pr_patch("o/a", 10, PATCH);
+        green(&github, "o/b", 20, 2);
+        let db = settings.state_db.clone();
+        let (stop, handle) = start(settings, Arc::new(github), vec![ok(), ok()]);
+        let started = Instant::now();
+        let mut b_done = None;
+        while started.elapsed() < Duration::from_secs(30) {
+            let runs = Store::open(&db).unwrap().recent_runs(5).unwrap();
+            if runs
+                .iter()
+                .any(|r| r.repo == "o/b" && r.state == RunState::PrOpen)
+            {
+                b_done = Some(started.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.notify_one();
+        handle.join().unwrap().unwrap();
+        assert!(
+            b_done.is_some(),
+            "o/b was starved for >30s while o/a waited on CI (a 2h wait in production)"
+        );
     }
 }

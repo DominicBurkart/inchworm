@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -83,6 +84,14 @@ impl SystemRunner {
     }
 }
 
+fn kill_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
 fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buffer = Vec::new();
@@ -99,6 +108,9 @@ impl Runner for SystemRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if self.timeout.is_some() {
+            command.process_group(0);
+        }
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
@@ -119,6 +131,7 @@ impl Runner for SystemRunner {
                 break status;
             }
             if started.elapsed() >= limit {
+                kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(io::Error::new(
@@ -128,6 +141,7 @@ impl Runner for SystemRunner {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
+        kill_group(child.id());
         let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
             handle
                 .and_then(|handle| handle.join().ok())
@@ -273,5 +287,47 @@ mod tests {
     fn system_runner_reports_a_missing_program() {
         let spec = CmdSpec::new("/definitely/not/a/program", [] as [&str; 0]);
         assert!(SystemRunner::default().run(&spec).is_err());
+    }
+
+    #[test]
+    fn a_background_grandchild_after_a_normal_exit_does_not_defeat_the_timeout() {
+        let runner = SystemRunner::with_timeout(Duration::from_millis(500));
+        let started = Instant::now();
+        let out = runner
+            .run(&CmdSpec::new("/bin/sh", ["-c", "sleep 4 & echo hi"]))
+            .unwrap();
+        assert_eq!(out.stdout.trim(), "hi");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let runner = SystemRunner::with_timeout(Duration::from_millis(300));
+        let err = runner
+            .run(&CmdSpec::new("/bin/sh", ["-c", script.as_str()]))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| !stat.contains(") Z"))
+                .unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(), "the grandchild {pid} survived the timeout");
     }
 }
