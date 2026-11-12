@@ -976,7 +976,17 @@ mode = "draft_pr"
     #[test]
     fn a_symlinked_inchworm_directory_is_refused_even_when_everything_inside_is_valid() {
         let f = fixture();
+        write(
+            &f.root,
+            ".inchworm/flows.toml",
+            &FLOWS.replace("llm", "nanna_clean"),
+        );
         let outside = outside_copy_of(&f, ".inchworm");
+        std::fs::write(
+            outside.join("flows.toml"),
+            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"x\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&outside, f.root.join(".inchworm")).unwrap();
         let report = run(&f);
         assert!(!report.is_ok(), "{:?}", messages(&report));
@@ -995,9 +1005,14 @@ mode = "draft_pr"
         std::os::unix::fs::symlink(&outside, f.root.join(".nanna")).unwrap();
         let report = run(&f);
         assert!(!report.is_ok(), "{:?}", messages(&report));
-        assert!(
-            has(&report, "`.nanna` is a symlink"),
-            "{:?}",
+        let hits = messages(&report)
+            .iter()
+            .filter(|m| m.starts_with("`.nanna` is a symlink"))
+            .count();
+        assert_eq!(
+            hits,
+            2,
+            "protected.toml and prompt.md each report it: {:?}",
             messages(&report)
         );
     }

@@ -182,7 +182,6 @@ fn lexically_normalised(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::CurDir => {}
             Component::ParentDir => {
                 if !out.pop() {
                     out.push("..");
@@ -700,6 +699,8 @@ path = "~/code/nanna-coder"
             "http://[::1",
             "http://[::1]x",
             "http://[]",
+            "http://[abc]",
+            "http://[1.2.3.4]",
             "http://:80",
             "http://a b",
             "http://h:",
