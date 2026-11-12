@@ -82,6 +82,10 @@ pub enum StoreError {
     InvalidSubject(String),
     #[error("another inchworm daemon holds {0}")]
     AlreadyRunning(PathBuf),
+    #[error("the daemon lock is for {lock}, not for the database {store}")]
+    LockForDifferentDatabase { lock: PathBuf, store: PathBuf },
+    #[error("only a database file can be recovered, not an in-memory store")]
+    RecoveryNeedsFileStore,
     #[error("cannot use lock file {path}: {source}")]
     LockIo {
         path: PathBuf,
@@ -225,10 +229,13 @@ pub struct Attempt {
     pub ended_at: Option<i64>,
 }
 
-/// Proof that this process is the only daemon using a state database.
+/// Proof that this process is the only daemon using one state database.
 ///
-/// Recovery after a crash may only be run by the holder, because while the
-/// lock is held no other daemon can own a dispatched attempt.
+/// The lock is taken on the canonical path of the database, so a symlinked
+/// path and the real path share one lock, and [`Store::recover_after_crash`]
+/// refuses a lock that belongs to another database. It excludes only other
+/// processes that also take it: a process that dispatches attempts without
+/// calling [`DaemonLock::acquire`] is not stopped.
 ///
 /// ```
 /// use inchworm::store::DaemonLock;
@@ -237,17 +244,43 @@ pub struct Attempt {
 /// let db = dir.path().join("state.db");
 /// let first = DaemonLock::acquire(&db).unwrap();
 /// assert!(DaemonLock::acquire(&db).is_err());
+/// assert!(first.database().ends_with("state.db"));
 /// drop(first);
 /// assert!(DaemonLock::acquire(&db).is_ok());
 /// ```
 #[derive(Debug)]
 pub struct DaemonLock {
     _file: File,
+    database: PathBuf,
+}
+
+fn canonical_db_path(path: &Path) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the database path has no file name",
+                )
+            })?;
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 impl DaemonLock {
     pub fn acquire(db_path: &Path) -> Result<DaemonLock, StoreError> {
-        let mut name = db_path.as_os_str().to_owned();
+        let database = canonical_db_path(db_path).map_err(|source| StoreError::LockIo {
+            path: db_path.to_path_buf(),
+            source,
+        })?;
+        let mut name = database.as_os_str().to_owned();
         name.push(".daemon.lock");
         let path = PathBuf::from(name);
         let file = OpenOptions::new()
@@ -260,10 +293,17 @@ impl DaemonLock {
                 source,
             })?;
         match file.try_lock() {
-            Ok(()) => Ok(DaemonLock { _file: file }),
+            Ok(()) => Ok(DaemonLock {
+                _file: file,
+                database,
+            }),
             Err(TryLockError::WouldBlock) => Err(StoreError::AlreadyRunning(path)),
             Err(TryLockError::Error(source)) => Err(StoreError::LockIo { path, source }),
         }
+    }
+
+    pub fn database(&self) -> &Path {
+        &self.database
     }
 }
 
@@ -276,6 +316,7 @@ pub struct Recovery {
 
 pub struct Store {
     conn: Connection,
+    path: Option<PathBuf>,
 }
 
 fn corrupt<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> StoreError + '_ {
@@ -387,20 +428,22 @@ impl Store {
     /// assert_eq!(store.run(id).unwrap().state, RunState::Running);
     /// ```
     pub fn open_in_memory() -> Result<Store, StoreError> {
-        Store::from_connection(Connection::open_in_memory()?, false)
+        Store::from_connection(Connection::open_in_memory()?, None)
     }
 
     pub fn open(path: &Path) -> Result<Store, StoreError> {
-        Store::from_connection(Connection::open(path)?, true)
+        let conn = Connection::open(path)?;
+        let canonical = canonical_db_path(path).unwrap_or_else(|_| path.to_path_buf());
+        Store::from_connection(conn, Some(canonical))
     }
 
-    fn from_connection(conn: Connection, wal: bool) -> Result<Store, StoreError> {
+    fn from_connection(conn: Connection, path: Option<PathBuf>) -> Result<Store, StoreError> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        if wal {
+        if path.is_some() {
             enable_wal(&conn, BUSY_TIMEOUT)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
-        let mut store = Store { conn };
+        let mut store = Store { conn, path };
         store.migrate()?;
         Ok(store)
     }
@@ -628,6 +671,9 @@ impl Store {
     ///
     /// Calling it again changes nothing and reports the same resumable runs.
     ///
+    /// The lock must be the one for this database (see [`DaemonLock`]); an
+    /// in-memory store cannot be recovered.
+    ///
     /// ```
     /// use inchworm::model::{FailureClass, RunState};
     /// use inchworm::store::{DaemonLock, Store, Subject};
@@ -649,9 +695,19 @@ impl Store {
     /// ```
     pub fn recover_after_crash(
         &self,
-        _daemon: &DaemonLock,
+        daemon: &DaemonLock,
         now: i64,
     ) -> Result<Recovery, StoreError> {
+        let own = self
+            .path
+            .as_deref()
+            .ok_or(StoreError::RecoveryNeedsFileStore)?;
+        if daemon.database() != own {
+            return Err(StoreError::LockForDifferentDatabase {
+                lock: daemon.database().to_path_buf(),
+                store: own.to_path_buf(),
+            });
+        }
         let tx = self.immediate()?;
         let mut statement = tx.prepare("SELECT id FROM attempts WHERE state = 'dispatched'")?;
         let lost: HashSet<AttemptId> = statement
@@ -1368,14 +1424,27 @@ mod tests {
         ));
     }
 
-    fn lock_for(dir: &tempfile::TempDir) -> DaemonLock {
-        DaemonLock::acquire(&dir.path().join("recovery.db")).unwrap()
+    fn file_store(dir: &tempfile::TempDir) -> (Store, DaemonLock) {
+        let path = dir.path().join("recovery.db");
+        let store = Store::open(&path).unwrap();
+        let lock = DaemonLock::acquire(&path).unwrap();
+        (store, lock)
+    }
+
+    fn running_in(store: &Store) -> RunId {
+        let id = store
+            .enqueue_run("o/r", &issue(1), "issue", 10)
+            .unwrap()
+            .unwrap();
+        store.set_run_state(id, RunState::Running, 11).unwrap();
+        id
     }
 
     #[test]
     fn recovery_fails_dispatched_attempts_and_requeues_the_run_so_the_subject_is_not_wedged() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, run) = running_store();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
         let lost = store.start_attempt(run, 12).unwrap();
         assert!(
             store
@@ -1384,7 +1453,7 @@ mod tests {
                 .is_none()
         );
 
-        let report = store.recover_after_crash(&lock_for(&dir), 20).unwrap();
+        let report = store.recover_after_crash(&lock, 20).unwrap();
         assert_eq!(
             report,
             Recovery {
@@ -1422,7 +1491,7 @@ mod tests {
     #[test]
     fn recovery_leaves_finished_attempts_and_other_runs_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory().unwrap();
+        let (store, lock) = file_store(&dir);
         let done_run = store
             .enqueue_run("o/r", &issue(1), "issue", 1)
             .unwrap()
@@ -1443,7 +1512,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let report = store.recover_after_crash(&lock_for(&dir), 30).unwrap();
+        let report = store.recover_after_crash(&lock, 30).unwrap();
         assert_eq!(
             report,
             Recovery {
@@ -1563,7 +1632,7 @@ mod tests {
         ];
         for (name, state, attempts, expected, resumable) in cases {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open_in_memory().unwrap();
+            let (store, lock) = file_store(&dir);
             let run = seed(
                 &store,
                 1,
@@ -1573,8 +1642,6 @@ mod tests {
                 },
             );
             let dispatched = attempts.iter().filter(|a| a.0 == "dispatched").count();
-            let lock = lock_for(&dir);
-
             let report = store.recover_after_crash(&lock, 50).unwrap();
 
             assert_eq!(store.run(run).unwrap().state, expected, "{name}");
@@ -1611,14 +1678,15 @@ mod tests {
     #[test]
     fn a_running_run_with_no_attempt_does_not_wedge_its_subject() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, run) = running_store();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
         assert!(
             store
                 .enqueue_run("o/r", &issue(1), "issue", 13)
                 .unwrap()
                 .is_none()
         );
-        store.recover_after_crash(&lock_for(&dir), 20).unwrap();
+        store.recover_after_crash(&lock, 20).unwrap();
         assert_eq!(store.run(run).unwrap().state, RunState::Queued);
         assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, run);
         assert!(
@@ -1630,10 +1698,97 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_for_another_database_does_not_authorise_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        let store_a = Store::open(&a).unwrap();
+        let run = running_in(&store_a);
+        let attempt = store_a.start_attempt(run, 12).unwrap();
+        let lock_b = DaemonLock::acquire(&b).unwrap();
+
+        let err = store_a.recover_after_crash(&lock_b, 20).unwrap_err();
+        match &err {
+            StoreError::LockForDifferentDatabase { lock, store } => {
+                assert!(lock.ends_with("b.db") && store.ends_with("a.db"), "{err}");
+            }
+            other => panic!("expected LockForDifferentDatabase, got {other}"),
+        }
+        assert_eq!(store_a.run(run).unwrap().state, RunState::Running);
+        assert_eq!(
+            store_a.attempt(attempt.id).unwrap().state,
+            AttemptState::Dispatched
+        );
+    }
+
+    #[test]
+    fn an_in_memory_store_cannot_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let lock = DaemonLock::acquire(&dir.path().join("any.db")).unwrap();
+        assert!(matches!(
+            store.recover_after_crash(&lock, 1),
+            Err(StoreError::RecoveryNeedsFileStore)
+        ));
+    }
+
+    #[test]
+    fn the_lock_reports_the_canonical_path_and_can_be_taken_before_the_database_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("later.db");
+        let lock = DaemonLock::acquire(&path).unwrap();
+        assert_eq!(
+            lock.database(),
+            dir.path().canonicalize().unwrap().join("later.db")
+        );
+        let store = Store::open(&path).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store.recover_after_crash(&lock, 3).unwrap().attempts_failed,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_database_path_shares_one_lock_with_the_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        drop(Store::open(&real).unwrap());
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let first = DaemonLock::acquire(&real).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&link),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+        let via_link = DaemonLock::acquire(&link).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&real),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        assert_eq!(via_link.database(), real.canonicalize().unwrap());
+
+        let store = Store::open(&real).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store
+                .recover_after_crash(&via_link, 3)
+                .unwrap()
+                .attempts_failed,
+            1
+        );
+    }
+
+    #[test]
     fn recovery_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = lock_for(&dir);
-        let (store, run) = running_store();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
         store.start_attempt(run, 12).unwrap();
         assert_eq!(
             store
@@ -1652,10 +1807,11 @@ mod tests {
     #[test]
     fn recovery_does_not_touch_a_run_that_cannot_be_requeued() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, run) = running_store();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
         store.start_attempt(run, 12).unwrap();
         force_state(&store, run, "judging");
-        let report = store.recover_after_crash(&lock_for(&dir), 20).unwrap();
+        let report = store.recover_after_crash(&lock, 20).unwrap();
         assert_eq!(report.attempts_failed, 1);
         assert_eq!(report.runs_requeued, 0);
         assert_eq!(store.run(run).unwrap().state, RunState::Judging);
