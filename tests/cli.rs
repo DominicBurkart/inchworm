@@ -110,10 +110,16 @@ impl Fakes {
 }
 
 fn script(dir: &Path, name: &str, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut body_name = path.clone().into_os_string();
+    body_name.push(".body");
+    std::fs::write(&body_name, body).unwrap();
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/shim"),
+        &path,
+    )
+    .unwrap();
 }
 
 fn fakes() -> Fakes {
@@ -123,7 +129,7 @@ fn fakes() -> Fakes {
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     for name in ["nanna", "gh"] {
-        std::fs::copy(
+        std::os::unix::fs::symlink(
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/").to_string() + name,
             bin.join(name),
         )
@@ -588,4 +594,53 @@ mode = "draft_pr"
         .assert()
         .success()
         .stdout(predicates_contains("llm: score 2 below min_score 7"));
+}
+
+#[test]
+fn run_never_prints_escape_or_bidi_characters_from_failure_text() {
+    let fakes = fakes();
+    fakes.set(
+        "files",
+        "src/lib.rs\n.inchworm/\u{1b}]0;pwned\u{7}\u{1b}[2J\u{202e}.toml",
+    );
+    let out = inchworm(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("failure:"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(!stdout.contains('\u{202e}'), "{stdout:?}");
+}
+
+#[test]
+fn the_shipped_unit_keeps_rootless_podman_working_and_restarts_after_transient_faults() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/contrib/inchworm.service"
+    ))
+    .unwrap();
+    for broken in [
+        "PrivateTmp",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectControlGroups",
+        "LockPersonality",
+        "RestartPreventExitStatus",
+    ] {
+        assert!(!unit.contains(broken), "{broken} is still in the unit");
+    }
+    assert!(unit.contains("Restart=on-failure"));
+    assert!(unit.contains("StartLimitBurst="));
+    assert!(unit.contains("StartLimitIntervalSec="));
+    assert!(unit.contains("NoNewPrivileges=yes"));
+}
+
+#[test]
+fn the_readme_creates_the_state_directory_private() {
+    let readme =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+    assert!(readme.contains("install -d -m 700"));
+    assert!(!readme.contains("mkdir -p ~/.config/inchworm ~/.local/state/inchworm"));
 }

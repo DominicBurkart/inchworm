@@ -190,7 +190,7 @@ fn backoff(poll: Duration, failures: u32) -> Duration {
 }
 
 fn log(message: &str) {
-    eprintln!("inchworm: {message}");
+    eprintln!("inchworm: {}", crate::model::sanitize_text(message, 4000));
 }
 
 fn load_flows(repo: &RepoEntry) -> Result<FlowFile, String> {
@@ -1166,36 +1166,17 @@ required_checks = ["build"]
         );
     }
 
-    fn script(dir: &std::path::Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("nanna");
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    fn make_with_retry(factory: &NannaFactory) -> Result<Box<dyn Dispatcher>, String> {
-        for _ in 0..50 {
-            match factory.make() {
-                Err(err) if err.contains("Text file busy") => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                other => return other,
-            }
-        }
-        factory.make()
-    }
-
     #[test]
     fn nanna_factory_starts_and_initializes_a_server_or_reports_why_not() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = script(
+        let ok = crate::testing::shim_script(
             dir.path(),
-            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nread line\nsleep 5\n",
+            "ok",
+            "read line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nread line\nsleep 5\n",
         );
-        assert!(make_with_retry(&NannaFactory::new(ok)).is_ok());
-        let dead = script(dir.path(), "#!/bin/sh\nexit 3\n");
-        let err = make_with_retry(&NannaFactory::new(dead)).err().unwrap();
+        assert!(NannaFactory::new(ok).make().is_ok());
+        let dead = crate::testing::shim_script(dir.path(), "dead", "exit 3\n");
+        let err = NannaFactory::new(dead).make().err().unwrap();
         assert!(err.contains("initialize failed"), "{err}");
     }
 

@@ -10,7 +10,7 @@ use crate::config::{FlowFile, GlobalConfig, RepoEntry};
 use crate::daemon::{DaemonDeps, DaemonSettings, NannaFactory, run_daemon};
 use crate::github::GhCli;
 use crate::judges::OllamaClient;
-use crate::model::RunState;
+use crate::model::{RunState, sanitize_text};
 use crate::nanna_client::NannaClient;
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
 use crate::outcome::{CiPolicy, OutcomeEnv};
@@ -275,10 +275,10 @@ fn run_command(
         println!("pull request: {} (head {})", pr.url, pr.head_sha);
     }
     if let Some((class, raw)) = &summary.failure {
-        println!("failure: {class}: {raw}");
+        println!("failure: {class}: {}", sanitize_text(raw, 2000));
     }
     for warning in &summary.warnings {
-        eprintln!("warning: {warning}");
+        eprintln!("warning: {}", sanitize_text(warning, 2000));
     }
     Ok(summary.state != RunState::Failed)
 }
@@ -347,7 +347,6 @@ pub fn execute(cli: Cli, tools: &Tools) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     const FLOWS: &str = "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n";
 
@@ -397,8 +396,7 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         for name in ["nanna", "gh"] {
-            let from = format!("{}/tests/fixtures/bin/{name}", env!("CARGO_MANIFEST_DIR"));
-            std::fs::copy(from, bin.join(name)).unwrap();
+            crate::testing::link_fixture(&bin, name);
         }
         write(
             &bin,
@@ -431,9 +429,7 @@ mod tests {
     }
 
     fn fake_nix(env: &Env, body: &str) {
-        let path = env.bin().join("nix");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testing::shim_script(&env.bin(), "nix", &format!("{body}\n"));
     }
 
     #[test]

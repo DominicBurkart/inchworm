@@ -105,3 +105,25 @@ pub fn pr_at(number: u64, sha: &str) -> PullRequest {
         is_cross_repository: false,
     }
 }
+
+pub(crate) fn shim_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut body_name = path.clone().into_os_string();
+    body_name.push(".body");
+    std::fs::write(&body_name, body).unwrap();
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/shim"),
+        &path,
+    )
+    .unwrap();
+    path
+}
+
+pub(crate) fn link_fixture(dir: &std::path::Path, name: &str) {
+    std::os::unix::fs::symlink(
+        format!("{}/tests/fixtures/bin/{name}", env!("CARGO_MANIFEST_DIR")),
+        dir.join(name),
+    )
+    .unwrap();
+}

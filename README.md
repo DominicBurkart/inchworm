@@ -16,7 +16,7 @@ Not done or deliberately off:
 
 ```
 cargo install --path .
-mkdir -p ~/.config/inchworm ~/.local/state/inchworm
+install -d -m 700 ~/.config/inchworm ~/.local/state/inchworm
 $EDITOR ~/.config/inchworm/config.toml
 ```
 
@@ -52,6 +52,12 @@ for repo in DominicBurkart/marigold; do
 done
 ```
 
+Every configured repo needs three files before the daemon can work on it:
+
+- `.inchworm/flows.toml`, the flows (see Flows below)
+- `.nanna/protected.toml` containing `extra = [".inchworm/**"]`, so agents cannot edit their own flows or judges
+- `.nanna/prompt.md`, the prompt nanna gives its agents (`validate` only warns when it is missing)
+
 Check everything before the first run:
 
 ```
@@ -68,19 +74,19 @@ systemctl --user enable --now inchworm
 journalctl --user -u inchworm -f
 ```
 
-The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH_TOKEN` (if you do not rely on `gh auth login`) in `~/.config/inchworm/env`, mode 600, which the unit loads with `EnvironmentFile`; never put it in `Environment=`. The unit does not restart on exit status 2 (a config error). The state directory is created mode 700 and the database mode 600, and a lock file next to the database (`state.db.lock`) makes a second daemon on the same database refuse to start. To keep it running while logged out: `loginctl enable-linger $USER`.
+The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH_TOKEN` (if you do not rely on `gh auth login`) in `~/.config/inchworm/env`, mode 600, which the unit loads with `EnvironmentFile`; never put it in `Environment=`. The unit restarts on failure every 15 seconds and gives up after 5 starts within 10 minutes (`StartLimitBurst`), so a transient fault recovers while a persistent config error does not loop forever; `systemctl --user reset-failed inchworm` clears the limit. The unit deliberately sets only `NoNewPrivileges`, `RestrictSUIDSGID` and `UMask`: `PrivateTmp`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups` and `LockPersonality` each make `podman unshare` fail under a user service (`newuidmap: write to uid_map failed`), which breaks rootless podman and with it nanna's containers. The state directory is created mode 700 and the database mode 600, and a lock file next to the database (`state.db.lock`) makes a second daemon on the same database refuse to start. To keep it running while logged out: `loginctl enable-linger $USER`.
 
 ## Operational notes
 
 - `inchworm daemon` refuses to start when `nanna_bin` is not an executable.
 - Stopping the daemon waits up to 20 seconds for the in-flight run; a run still in flight is marked `orchestrator_lost` on the next start and counts as one attempt. This is a known limitation: there is no cooperative cancel of a dispatched nanna task on shutdown.
-- Every `gh` call is bounded by 60 seconds and the poll cycle runs on its own thread, so SIGTERM stops the daemon even while `gh` hangs. The SIGTERM and SIGINT handlers are installed before the daemon starts.
+- Every `gh` call is bounded by 60 seconds and runs in its own process group that is killed with it and the poll cycle runs on its own thread, so SIGTERM stops the daemon even while `gh` hangs. The SIGTERM and SIGINT handlers are installed before the daemon starts.
 - A failed dispatch drops the nanna client and the next attempt starts a fresh `nanna mcp-serve`.
 - Re-adding the trigger label to an issue whose run finished (`pr_open`, `merged` or `failed`) starts a new run on purpose; remove the label when the work is done.
 - If the initial label swap on an issue fails, the daemon remembers that only in memory; after a restart a stale trigger label next to a finished run can start another run until the label is removed by hand. Known limitation.
-- Text from nanna, `gh` and judges is stripped of control characters and capped before it is printed by `failures` or posted to an issue.
+- Text from nanna, `gh` and judges has control characters and bidirectional override characters replaced and is capped before it is printed by `failures`, `run` or the daemon log, or posted to an issue.
 - Branch protection is compared by required check name only. A passing `validate --online` does not check `enforce_admins`, required reviews or app ids, so it says little about merge safety on its own.
-- Skipped, neutral, cancelled and unknown check conclusions are treated as red.
+- Skipped, neutral, cancelled and unknown check conclusions are treated as red and fail the attempt as `ci_red`, even where GitHub branch protection accepts a skipped job (a path-filtered or conditional job). Do not list such a job in `required_checks`; there is no opt-in for treating `skipped` or `neutral` as green.
 
 ## Commands
 
@@ -121,12 +127,12 @@ With `--online` it also checks that every step identity resolves with `nanna age
 ## Known limitations
 
 - CI is read from check-runs on the head SHA. Legacy commit-status contexts (some coverage bots post those) are not read, so a `required_checks` entry that branch protection satisfies with a status context would wait until the CI timeout and fail as `timeout`.
-- The PR of a rejected attempt stays open, and a merge refused after `gh pr ready` leaves the PR non-draft.
+- The PR of a rejected attempt stays open. A merge refused after `gh pr ready` marks the PR a draft again; if that undo fails the failure text says so.
 - The human gate is never consulted.
 
 ## Daemon
 
-`inchworm daemon` polls every `poll_secs`. On start it marks attempts that were still `dispatched` as `orchestrator_lost`, then resumes queued, running, `awaiting_ci` and `judging` runs from the store (published attempts continue from their stored head SHA; a lost dispatch retries if `orchestrator_lost` is in `retry_on`, else the run fails). Each poll lists open issues with the flow's trigger label, creates a run, and swaps `inchworm` for `inchworm:running`. One run is active per repo (FIFO) and the model permit (`concurrency`, default 1) is shared across repos. SIGTERM or ctrl-c stop polling and give an in-flight run 20 seconds; a run still in flight is recovered on the next start. To retry an issue after `inchworm:failed`, add the `inchworm` label again.
+`inchworm daemon` polls every `poll_secs`. On start it marks attempts that were still `dispatched` as `orchestrator_lost`, then resumes queued, running, `awaiting_ci` and `judging` runs from the store (published attempts continue from their stored head SHA; a lost dispatch retries if `orchestrator_lost` is in `retry_on`, else the run fails). Each poll lists open issues with the flow's trigger label, creates a run, and swaps `inchworm` for `inchworm:running`. Each leased run executes on its own thread, so one repo waiting on CI (up to 2 hours) does not block the others. One run is active per repo (FIFO) and `concurrency` (default 1) is the number of model permits shared across repos: nanna dispatch and the LLM judge wait for a permit, CI waiting and GitHub calls do not. A run that errors on GitHub or the store, or panics, is retried with a delay of 1, 2, 4 and then 8 times `poll_secs` (at most 15 minutes) instead of waiting for a restart. SIGTERM or ctrl-c stop polling and give an in-flight run 20 seconds; a run still in flight is recovered on the next start. To retry an issue after `inchworm:failed`, add the `inchworm` label again.
 
 ## Flows
 
@@ -187,8 +193,8 @@ Residual risk: this reduces but does not eliminate prompt injection. A small loc
 - `policy::decide` rejects with `judge_rejected` unless the verdicts equal the configured judges by kind and index, all passed. If every failed verdict is an infrastructure failure (Ollama down, timeout, bad envelope) the class is `model_error` instead. Judges take precedence over CI: a failed judge with a red check is `judge_rejected`.
 - CI: a required check must be green on the exact judged SHA. A failed run followed by a green rerun with the same name and SHA stays `ci_red`. GitHub conclusions map fail closed: only `success` is green, `skipped`, `neutral`, `cancelled`, `timed_out`, `action_required`, `stale` and anything unknown are red, and anything not `completed` is pending.
 - An unconsulted human gate (the default) never merges: `merge_when` degrades to `draft_pr` until the gate is wired. Every shipped default and example uses `draft_pr`; nothing enables `merge_when`.
-- The scheduler gives each repo one active run at a time. The global `concurrency` limit is a semaphore around model calls (dispatch and the LLM judge), not around leases, so a run that holds its lease can still judge.
-- Not implemented: per-directory configuration, offramps and a per-step auditor (D1 to D3). `Verdict` carries an optional `step` and the judge types are `non_exhaustive` so those can be added.
+- The scheduler gives each repo one active run at a time. The global `concurrency` limit is a semaphore around model calls (dispatch and the LLM judge), not around leases, so runs in different repos wait on CI in parallel and a run that holds its lease can still judge.
+- Not implemented: per-directory configuration, offramps and a per-step auditor (D1 to D3). `Verdict` carries an optional `step` and is `non_exhaustive`; `config::Judge` and `config::Trigger` are not, so adding a variant is a breaking change for code that matches them exhaustively.
 
 ## Development
 
