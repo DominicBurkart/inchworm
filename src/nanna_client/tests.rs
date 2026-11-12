@@ -1185,6 +1185,30 @@ fn a_task_that_finished_but_whose_result_cannot_be_read_is_still_a_timeout() {
 }
 
 #[test]
+fn diagnostics_whose_own_text_contains_a_blank_line_and_brace_are_still_found() {
+    let text = "msg\n\n{\"error_type\":\n\n{\"b\":1}}";
+    let (message, diagnostics) = split_diagnostics(text);
+    assert_eq!(message, "msg");
+    assert_eq!(diagnostics.unwrap()["error_type"]["b"], 1);
+}
+
+#[test]
+fn reading_a_result_directly_clears_the_running_task_so_drop_does_not_cancel() {
+    let replies = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"result":{"isError":false,"content":[{"type":"text","text":"{\"result_summary\":\"done\"}"}]}}"#,
+        "\n",
+    );
+    let sent = Capture::default();
+    let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), sent.clone());
+    client.assign_task(&request("x")).unwrap();
+    client.result("t", TaskState::Completed).unwrap();
+    drop(client);
+    assert!(!sent.text().contains("tasks/cancel"), "{}", sent.text());
+}
+
+#[test]
 fn a_finished_task_is_never_cancelled_on_drop() {
     let replies = concat!(
         r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working"}}}"#,
