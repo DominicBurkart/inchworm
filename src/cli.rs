@@ -29,7 +29,11 @@ pub enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         online: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Also build each repository's devContainerImage with nix (implies --online). \
+                    This evaluates the repository's own Nix code on this machine; use it only on repositories you trust."
+        )]
         build_images: bool,
     },
     Run {
@@ -338,7 +342,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&record).unwrap().trim(),
             format!(
-                "build path:{}#devContainerImage --no-link",
+                "build git+file://{}#devContainerImage --no-link --no-write-lock-file",
                 env.repo.display()
             )
         );

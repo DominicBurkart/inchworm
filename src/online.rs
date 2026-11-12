@@ -101,11 +101,33 @@ impl<R: Runner> NixBuilder<R> {
     }
 }
 
+/// ```
+/// use std::path::Path;
+/// use inchworm::online::flake_url;
+///
+/// assert_eq!(flake_url(Path::new("/code/my repo")), "git+file:///code/my%20repo#devContainerImage");
+/// ```
+pub fn flake_url(repo: &Path) -> String {
+    let absolute = std::path::absolute(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let mut encoded = String::new();
+    for byte in absolute.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("git+file://{encoded}#devContainerImage")
+}
+
 impl<R: Runner> ImageBuilder for NixBuilder<R> {
     fn build(&self, repo: &Path) -> Result<(), String> {
-        let flake = format!("path:{}#devContainerImage", repo.display());
-        let spec = CmdSpec::new(&self.program, ["build", flake.as_str(), "--no-link"])
-            .with_timeout(NIX_BUILD_TIMEOUT);
+        let flake = flake_url(repo);
+        let spec = CmdSpec::new(
+            &self.program,
+            ["build", flake.as_str(), "--no-link", "--no-write-lock-file"],
+        )
+        .with_timeout(NIX_BUILD_TIMEOUT);
         let out = self.runner.run(&spec).map_err(|e| e.to_string())?;
         if out.success() {
             Ok(())
@@ -501,6 +523,55 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn the_flake_url_names_tracked_files_only_and_escapes_the_path() {
+        assert_eq!(
+            flake_url(Path::new("/home/me/code/repo")),
+            "git+file:///home/me/code/repo#devContainerImage"
+        );
+        assert_eq!(
+            flake_url(Path::new("/tmp/my repo/a#b/c?d/100%")),
+            "git+file:///tmp/my%20repo/a%23b/c%3Fd/100%25#devContainerImage"
+        );
+        assert_eq!(
+            flake_url(Path::new("/tmp/caf\u{e9}")),
+            "git+file:///tmp/caf%C3%A9#devContainerImage"
+        );
+        assert!(!flake_url(Path::new("/r")).starts_with("path:"));
+    }
+
+    #[test]
+    fn a_relative_repo_path_becomes_absolute_in_the_flake_url() {
+        let url = flake_url(Path::new("relative/repo"));
+        assert!(url.starts_with("git+file:///"), "{url}");
+        assert!(url.ends_with("/relative/repo#devContainerImage"), "{url}");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn an_escaped_path_never_contains_url_metacharacters_and_decodes_back(
+            segments in proptest::collection::vec("[ -.0-~\u{e9}\u{4e2d}]{1,8}", 1..4)
+        ) {
+            let path = format!("/x{}", segments.join("/x"));
+            let url = flake_url(Path::new(&path));
+            let body = url.strip_prefix("git+file://").unwrap().strip_suffix("#devContainerImage").unwrap();
+            proptest::prop_assert!(!body.contains(['#', '?', ' ', '\n']));
+            let mut decoded = Vec::new();
+            let bytes = body.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    decoded.push(u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap(), 16).unwrap());
+                    i += 3;
+                } else {
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            proptest::prop_assert_eq!(String::from_utf8(decoded).unwrap(), path);
+        }
+    }
+
+    #[test]
     fn nix_builder_builds_the_dev_container_image_flake_output() {
         let runner = ScriptedRunner::new(vec![
             ScriptedRunner::ok(""),
@@ -511,7 +582,7 @@ mode = "draft_pr"
         builder.build(Path::new("/repo")).unwrap();
         assert_eq!(
             builder.runner.calls(),
-            ["nix build path:/repo#devContainerImage --no-link"]
+            ["nix build git+file:///repo#devContainerImage --no-link --no-write-lock-file"]
         );
         assert_eq!(
             builder.build(Path::new("/repo")).unwrap_err(),

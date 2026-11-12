@@ -208,7 +208,7 @@ fn build_images_runs_nix_build_and_reports_failures() {
     assert_eq!(
         recorded.trim(),
         format!(
-            "build path:{}#devContainerImage --no-link",
+            "build git+file://{}#devContainerImage --no-link --no-write-lock-file",
             fakes.repo.display()
         )
     );
@@ -399,4 +399,17 @@ fn sigterm_cancels_the_task_and_ends_the_run_as_cancelled() {
         fakes.bin().join("cancelled").exists(),
         "nanna was never asked to cancel"
     );
+}
+
+#[test]
+fn validate_help_warns_that_build_images_evaluates_repository_nix() {
+    Command::cargo_bin("inchworm")
+        .unwrap()
+        .args(["validate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates_contains(
+            "evaluates the repository's own Nix code",
+        ))
+        .stdout(predicates_contains("only on repositories you trust"));
 }
