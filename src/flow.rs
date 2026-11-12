@@ -16,6 +16,10 @@ pub trait Dispatcher {
         request: &AssignRequest,
         timeout: Duration,
     ) -> Result<TaskOutcome, ClientError>;
+
+    fn is_usable(&self) -> bool {
+        true
+    }
 }
 
 impl Dispatcher for NannaClient {
@@ -25,6 +29,10 @@ impl Dispatcher for NannaClient {
         timeout: Duration,
     ) -> Result<TaskOutcome, ClientError> {
         self.run_task(request, timeout)
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.is_dead()
     }
 }
 
@@ -694,6 +702,22 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_client_is_usable_until_its_connection_dies() {
+        let mut client = NannaClient::new(std::io::BufReader::new(&b""[..]), std::io::sink());
+        assert!(Dispatcher::is_usable(&client));
+        let request = AssignRequest {
+            description: "d".into(),
+            repo_path: std::path::PathBuf::from("/r"),
+            identity: "i".into(),
+            branch: "main".into(),
+        };
+        assert!(client.dispatch(&request, Duration::from_secs(1)).is_err());
+        assert!(!Dispatcher::is_usable(&client));
+        let scripted = Scripted(VecDeque::new());
+        assert!(scripted.is_usable());
     }
 
     #[test]

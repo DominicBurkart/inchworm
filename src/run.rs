@@ -9,7 +9,7 @@ use crate::flow::{
 };
 use crate::github::{GitHub, GitHubError, PullRequest};
 use crate::model::{FailureClass, RunState};
-use crate::store::{RunId, Store, StoreError};
+use crate::store::{AttemptId, RunId, Store, StoreError};
 
 pub const RUNNING_LABEL: &str = "inchworm:running";
 pub const FAILED_LABEL: &str = "inchworm:failed";
@@ -44,6 +44,62 @@ pub struct RunContext<'a> {
     pub slug: &'a str,
     pub repo_path: &'a Path,
     pub now: &'a dyn Fn() -> i64,
+}
+
+struct RunGuard<'a, 'c> {
+    ctx: &'a RunContext<'c>,
+    run_id: RunId,
+    issue: u64,
+    attempt: Option<AttemptId>,
+    armed: bool,
+}
+
+impl<'a, 'c> RunGuard<'a, 'c> {
+    fn new(ctx: &'a RunContext<'c>, run_id: RunId, issue: u64) -> Self {
+        RunGuard {
+            ctx,
+            run_id,
+            issue,
+            attempt: None,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunGuard<'_, '_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let now = (self.ctx.now)();
+        if let Some(attempt) = self.attempt {
+            let _ = self.ctx.store.finish_attempt_failed(
+                attempt,
+                FailureClass::OrchestratorLost,
+                "inchworm stopped before this attempt finished",
+                now,
+            );
+        }
+        let _ = self
+            .ctx
+            .store
+            .set_run_state(self.run_id, RunState::Failed, now);
+        let _ = self.ctx.github.set_labels(
+            self.ctx.slug,
+            self.issue,
+            &[FAILED_LABEL],
+            &[RUNNING_LABEL],
+        );
+        let _ = self.ctx.github.comment(
+            self.ctx.slug,
+            self.issue,
+            "inchworm stopped before this run finished; the run is marked failed and can be started again.",
+        );
+    }
 }
 
 fn trigger_label(flow: &Flow) -> &str {
@@ -154,6 +210,7 @@ pub fn run_issue(
         })?;
     ctx.store
         .set_run_state(run_id, RunState::Running, (ctx.now)())?;
+    let mut guard = RunGuard::new(ctx, run_id, issue_number);
     let mut warnings = Vec::new();
     relabel(
         ctx,
@@ -168,6 +225,7 @@ pub fn run_issue(
     loop {
         attempts += 1;
         let attempt = ctx.store.start_attempt(run_id, (ctx.now)())?;
+        guard.attempt = Some(attempt.id);
         let branch = branch_name(
             issue_number,
             ctx.store.issue_attempt_count(ctx.slug, issue_number)?,
@@ -196,8 +254,10 @@ pub fn run_issue(
                         ctx.store
                             .record_pr(attempt.id, &branch, &pr.head_sha, pr.number)?;
                         ctx.store.finish_attempt_ok(attempt.id, (ctx.now)())?;
+                        guard.attempt = None;
                         ctx.store
                             .set_run_state(run_id, RunState::AwaitingCi, (ctx.now)())?;
+                        guard.disarm();
                         note(
                             ctx,
                             issue_number,
@@ -233,13 +293,17 @@ pub fn run_issue(
         let (class, raw) = outcome;
         ctx.store
             .finish_attempt_failed(attempt.id, class, &raw, (ctx.now)())?;
-        let retry = flow.retry_on.contains(&class) && attempts < flow.max_attempts;
+        guard.attempt = None;
+        let retry = flow.retry_on.contains(&class)
+            && attempts < flow.max_attempts
+            && dispatcher.is_usable();
         if retry {
             previous_failure = Some(describe_failure(class, &raw, attempt.n));
             continue;
         }
         ctx.store
             .set_run_state(run_id, RunState::Failed, (ctx.now)())?;
+        guard.disarm();
         relabel(
             ctx,
             issue_number,
@@ -355,6 +419,103 @@ mode = "draft_pr"
         assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:running"]);
         assert!(github.comments()[0].2.contains("pull/77"));
         assert_eq!(fake.assigned().len(), 2);
+    }
+
+    struct Panics;
+    impl Dispatcher for Panics {
+        fn dispatch(
+            &mut self,
+            _: &crate::nanna_client::AssignRequest,
+            _: std::time::Duration,
+        ) -> Result<crate::nanna_client::TaskOutcome, crate::nanna_client::ClientError> {
+            panic!("dispatcher blew up");
+        }
+    }
+
+    #[test]
+    fn a_panic_mid_run_leaves_a_failed_run_and_the_issue_can_be_run_again() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_issue(&ctx(&store, &github), &flow(2, ""), 5, &mut Panics)
+        }));
+        assert!(result.is_err());
+
+        let run = store.run(1).unwrap();
+        assert_eq!(run.state, RunState::Failed);
+        let attempts = store.attempts(run.id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].failure_class,
+            Some(FailureClass::OrchestratorLost)
+        );
+        assert!(attempts[0].ended_at.is_some());
+        let labels = github.issue("o/r", 5).unwrap().labels;
+        assert_eq!(labels, ["inchworm:failed"]);
+        assert!(
+            github.comments()[0].2.contains("stopped"),
+            "{:?}",
+            github.comments()
+        );
+
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        github.add_pr("o/r", "inchworm/5-a2", pr("deadbeef"));
+        let again = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(again.state, RunState::AwaitingCi);
+    }
+
+    #[test]
+    fn a_run_that_finishes_normally_is_not_touched_by_the_guard() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(summary.state, RunState::AwaitingCi);
+        let attempts = store.attempts(summary.run_id).unwrap();
+        assert_eq!(attempts[0].failure_class, None);
+        assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:running"]);
+    }
+
+    struct DiesWithTheConnection {
+        calls: u32,
+    }
+    impl Dispatcher for DiesWithTheConnection {
+        fn dispatch(
+            &mut self,
+            _: &crate::nanna_client::AssignRequest,
+            _: std::time::Duration,
+        ) -> Result<crate::nanna_client::TaskOutcome, crate::nanna_client::ClientError> {
+            self.calls += 1;
+            Err(crate::nanna_client::ClientError::Eof)
+        }
+
+        fn is_usable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_dead_connection_ends_the_run_instead_of_burning_the_remaining_attempts() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let mut dispatcher = DiesWithTheConnection { calls: 0 };
+        let summary = run_issue(
+            &ctx(&store, &github),
+            &flow(3, "\"orchestrator_lost\""),
+            5,
+            &mut dispatcher,
+        )
+        .unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        assert_eq!(summary.attempts, 1);
+        assert_eq!(dispatcher.calls, 1);
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::OrchestratorLost);
+        assert!(raw.contains("closed the connection"), "{raw}");
+        assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:failed"]);
     }
 
     #[test]
