@@ -520,9 +520,7 @@ impl NannaClient {
             }
             let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
                 if trimmed.contains(BUDGET_UNAVAILABLE_MARKER) {
-                    return Err(ClientError::Protocol(format!(
-                        "nanna cannot use its budget store, so it would deny every budgeted action; another nanna process (a concurrent `inchworm run` or an interactive `nanna mcp-serve`) probably holds the shared budget file: {trimmed}"
-                    )));
+                    return Err(ClientError::Protocol(budget_error(trimmed)));
                 }
                 self.noise_lines += 1;
                 noise_in_exchange += 1;
@@ -749,6 +747,44 @@ fn result_text(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// ```
+/// use inchworm::nanna_client::strip_terminal_codes;
+///
+/// assert_eq!(strip_terminal_codes("\u{1b}[31mred\u{1b}[0m \u{7}ok"), "red ok");
+/// ```
+pub fn strip_terminal_codes(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else if !c.is_control() || c == '\t' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn budget_error(line: &str) -> String {
+    let shown = strip_terminal_codes(line);
+    if shown.contains("in use by another process") {
+        format!(
+            "nanna cannot use its budget store because another nanna process (a concurrent `inchworm run` or an interactive `nanna mcp-serve`) holds it, so it would deny every budgeted action: {shown}"
+        )
+    } else {
+        format!(
+            "nanna cannot use its budget store (the file may be corrupt or unwritable), so it would deny every budgeted action: {shown}"
+        )
+    }
 }
 
 fn split_diagnostics(text: &str) -> (String, Option<Value>) {

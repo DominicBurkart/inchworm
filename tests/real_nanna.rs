@@ -42,14 +42,19 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn sandbox() -> Sandbox {
-    let home_dir = PathBuf::from(std::env::var("HOME").unwrap());
     let bin = std::env::var("INCHWORM_NANNA_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir.join(".local/bin/nanna"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("set INCHWORM_NANNA_BIN or HOME"))
+                .join(".local/bin/nanna")
+        });
     assert!(bin.is_file(), "no nanna binary at {}", bin.display());
     let cards = std::env::var("INCHWORM_NANNA_AGENTS")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir.join(".config/nanna/agents"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("set INCHWORM_NANNA_AGENTS or HOME"))
+                .join(".config/nanna/agents")
+        });
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let config = dir.path().join("config");

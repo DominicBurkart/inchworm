@@ -907,7 +907,11 @@ fn a_stale_queue_file_with_the_same_name_is_removed_before_spawning() {
 }
 
 fn pid_alive(pid: &str) -> bool {
-    Path::new("/proc").join(pid).exists()
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[test]
@@ -1025,12 +1029,14 @@ fn a_dead_connection_does_not_try_to_cancel_on_drop() {
 #[test]
 #[ignore = "needs the real nanna binary at ~/.local/bin/nanna"]
 fn real_binary_speaks_the_pinned_protocol() {
-    let home = std::env::var("HOME").unwrap();
     let bin = std::env::var("INCHWORM_NANNA_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(&home).join(".local/bin/nanna"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("set INCHWORM_NANNA_BIN or HOME"))
+                .join(".local/bin/nanna")
+        });
     let state = tempfile::tempdir().unwrap();
-    let options = SpawnOptions::new(bin, state.path().join("nanna"));
+    let options = SpawnOptions::new(bin, state.path().join("nanna")).with_home(state.path());
     let mut client = NannaClient::spawn(&options).unwrap();
     let init = client.initialize().unwrap();
     assert_eq!(init["protocolVersion"], PROTOCOL_VERSION);
@@ -1104,7 +1110,7 @@ fn a_budget_store_that_nanna_cannot_use_is_an_error_not_noise() {
     let shown = err.to_string();
     assert!(matches!(err, ClientError::Protocol(_)), "{shown}");
     assert!(
-        shown.contains("budget file") && shown.contains("in use by another process"),
+        shown.contains("another nanna process") && shown.contains("in use by another process"),
         "{shown}"
     );
     assert_eq!(client.noise_lines(), 0);
@@ -1127,6 +1133,24 @@ impl Capture {
     fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
+}
+
+#[test]
+fn the_budget_error_tells_a_busy_store_from_a_corrupt_one_and_strips_terminal_codes() {
+    let busy = "\u{1b}[31mERROR\u{1b}[0m durable budget unavailable: budget store /x is in use by another process\n";
+    let corrupt = "ERROR durable budget unavailable, denying budgeted actions: invalid JSON in /x/budget.json\n";
+    let mut shown = Vec::new();
+    for line in [busy, corrupt] {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(line.as_bytes()).unwrap();
+        let mut client = NannaClient::new(BufReader::new(reader), io::sink());
+        shown.push(client.initialize().unwrap_err().to_string());
+    }
+    assert!(shown[0].contains("another nanna process"), "{}", shown[0]);
+    assert!(!shown[0].contains('\u{1b}'), "{}", shown[0]);
+    assert!(shown[0].contains("ERROR durable budget unavailable"));
+    assert!(shown[1].contains("corrupt or unwritable"), "{}", shown[1]);
+    assert!(!shown[1].contains("another nanna process"), "{}", shown[1]);
 }
 
 #[test]
@@ -1206,6 +1230,88 @@ fn reading_a_result_directly_clears_the_running_task_so_drop_does_not_cancel() {
     client.result("t", TaskState::Completed).unwrap();
     drop(client);
     assert!(!sent.text().contains("tasks/cancel"), "{}", sent.text());
+}
+
+#[test]
+fn the_real_spawn_path_waits_out_a_script_that_is_still_open_for_writing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("nanna");
+    let mut writer = std::fs::File::create(&script).unwrap();
+    writer
+        .write_all(format!("#!/bin/sh\n{HANDSHAKE}exec cat >/dev/null\n").as_bytes())
+        .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(writer);
+    });
+    let options = SpawnOptions::new(&script, dir.path().join("state"));
+    let lookup = |key: &str| (key == "HOME").then(|| OsString::from("/h"));
+    let mut client = NannaClient::spawn_with_lookup(&options, &lookup).unwrap();
+    closer.join().unwrap();
+    client.initialize().unwrap();
+}
+
+#[test]
+fn with_home_decides_where_the_shared_state_lives_even_when_the_environment_differs() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report");
+    let body = format!(
+        "echo \"$NANNA_LEASE_PATH\" > {}\n{HANDSHAKE}exec cat >/dev/null\n",
+        report.display()
+    );
+    let options = script_options(dir.path(), &body).with_home("/explicit/home");
+    let mut client = loop {
+        match NannaClient::spawn(&options) {
+            Err(ClientError::Io(err)) if err.kind() == io::ErrorKind::ExecutableFileBusy => {}
+            other => break other.unwrap(),
+        }
+    };
+    client.initialize().unwrap();
+    let lease = std::fs::read_to_string(&report).unwrap();
+    assert!(lease.trim().starts_with("/explicit/home/"), "{lease}");
+}
+
+#[test]
+fn empty_lines_before_the_end_of_the_stream_are_an_eof_not_a_hang() {
+    let mut client = NannaClient::new(BufReader::new(&b"\n\n"[..]), io::sink());
+    assert!(matches!(client.initialize().unwrap_err(), ClientError::Eof));
+}
+
+#[test]
+fn every_fixture_says_inside_itself_whether_it_was_captured_or_reconstructed() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nanna");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let note = value["_provenance"].as_str().unwrap_or_default();
+        assert!(
+            note.starts_with("CAPTURED") || note.starts_with("RECONSTRUCTED"),
+            "{} has no provenance",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 15);
+}
+
+#[test]
+fn the_documented_timeouts_and_limits_are_these_numbers() {
+    assert_eq!(DEFAULT_READ_TIMEOUT, Duration::from_secs(120));
+    assert_eq!(SHUTDOWN_GRACE, Duration::from_secs(5));
+    assert_eq!(CANCEL_ON_DROP_READ_TIMEOUT, Duration::from_secs(2));
+    assert_eq!(INTERRUPT_SLICE, Duration::from_millis(100));
+    assert_eq!(MAX_NOISE_LINES_PER_EXCHANGE, 1000);
+    assert_eq!(crate::exec::DEFAULT_TIMEOUT, Duration::from_secs(120));
+    assert_eq!(crate::exec::DEFAULT_MAX_OUTPUT_BYTES, 33_554_432);
+    assert_eq!(crate::online::NIX_BUILD_TIMEOUT, Duration::from_secs(3600));
+    assert_eq!(crate::github::PR_FILES_LIMIT, 3000);
 }
 
 #[test]

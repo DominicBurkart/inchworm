@@ -720,6 +720,22 @@ mod tests {
     }
 
     #[test]
+    fn rename_sources_do_not_count_toward_the_listing_cap_and_the_jq_tags_files() {
+        let mut listing = String::new();
+        for i in 0..2999 {
+            listing.push_str(&format!("F src/f{i}.rs\nP src/old{i}.rs\n"));
+        }
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&listing)]));
+        assert_eq!(gh.pr_files("o/r", 9).unwrap().len(), 5998);
+        let call = gh.runner.calls()[0].clone();
+        assert!(call.contains("(\"F \" + .filename)"), "{call}");
+        assert!(call.contains("\"P \" + .previous_filename"), "{call}");
+        let exactly: String = (0..3000).map(|i| format!("F src/f{i}.rs\n")).collect();
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&exactly)]));
+        assert!(gh.pr_files("o/r", 9).is_err());
+    }
+
+    #[test]
     fn pr_states_parse() {
         assert_eq!(parse_pr_state("MERGED"), PrState::Merged);
         assert_eq!(parse_pr_state("CLOSED"), PrState::Closed);

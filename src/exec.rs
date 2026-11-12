@@ -323,7 +323,11 @@ mod tests {
 
     #[cfg(unix)]
     fn pid_alive(pid: &str) -> bool {
-        std::path::Path::new("/proc").join(pid).exists()
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     #[cfg(unix)]
@@ -480,6 +484,41 @@ mod tests {
             .unwrap();
         closer.join().unwrap();
         assert_eq!(out.stdout.trim(), "ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_that_stays_busy_gives_up_after_a_bounded_number_of_retries() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let err = spawn_retrying(&mut Command::new(&path)).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ETXTBSY), "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_exactly_at_the_cap_is_allowed_and_one_byte_more_is_not() {
+        let at = CmdSpec::new("sh", ["-c", "head -c 1000 /dev/zero"]).with_max_output(1000);
+        assert_eq!(SystemRunner.run(&at).unwrap().stdout.len(), 1000);
+        let over = CmdSpec::new("sh", ["-c", "head -c 1001 /dev/zero"]).with_max_output(1000);
+        assert!(SystemRunner.run(&over).is_err());
     }
 
     #[cfg(unix)]

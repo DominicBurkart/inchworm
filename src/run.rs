@@ -7,7 +7,7 @@ use crate::flow::{
     Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, PROTECTED_FILE, branch_name,
     protected_paths_in, run_flow,
 };
-use crate::github::{GitHub, GitHubError, Issue, PullRequest, issue_branch_attempt};
+use crate::github::{GitHub, GitHubError, Issue, PrState, PullRequest, issue_branch_attempt};
 use crate::model::{FailureClass, RunState};
 use crate::store::{AttemptId, RunId, Store, StoreError};
 
@@ -322,7 +322,7 @@ pub fn run_issue(
         ctx,
         issue_number,
         &[RUNNING_LABEL],
-        &[trigger_label(flow)],
+        &[trigger_label(flow), FAILED_LABEL],
         &mut warnings,
     );
 
@@ -346,8 +346,16 @@ pub fn run_issue(
             previous_failure: previous_failure.as_deref(),
         };
         let mut leftover: Option<PullRequest> = None;
+        let mut no_retry: Option<String> = None;
         let outcome = match run_flow(flow, &input, dispatcher) {
             FlowOutcome::Completed { .. } => match ctx.github.pr_for_branch(ctx.slug, &branch) {
+                Ok(Some(pr)) if pr.state != PrState::Open => (
+                    FailureClass::AgentFailed,
+                    format!(
+                        "pull request #{} ({}) is {:?}, not open",
+                        pr.number, pr.url, pr.state
+                    ),
+                ),
                 Ok(Some(pr)) if !pr.is_draft => {
                     let failure = (
                         FailureClass::AgentFailed,
@@ -372,11 +380,12 @@ pub fn run_issue(
                         ctx.store
                             .set_run_state(run_id, RunState::AwaitingCi, (ctx.now)())?;
                         guard.disarm();
+                        relabel(ctx, issue_number, &[], &[RUNNING_LABEL], &mut warnings);
                         note(
                             ctx,
                             issue_number,
                             &format!(
-                                "inchworm opened {} for this issue from `{branch}` at `{}`.",
+                                "inchworm found {} for this issue on `{branch}` at `{}` and is waiting for CI.",
                                 pr.url, pr.head_sha
                             ),
                             &mut warnings,
@@ -391,10 +400,18 @@ pub fn run_issue(
                         });
                     }
                 },
-                Ok(None) => (
-                    FailureClass::AgentFailed,
-                    format!("the steps completed but no pull request exists for branch `{branch}`"),
-                ),
+                Ok(None) => {
+                    no_retry = Some(
+                        "replaying the steps cannot create a pull request, so this is not retried"
+                            .to_string(),
+                    );
+                    (
+                        FailureClass::AgentFailed,
+                        format!(
+                            "the steps completed but no pull request exists for branch `{branch}`; inchworm does not publish, so nothing it runs creates one"
+                        ),
+                    )
+                }
                 Err(err) => (FailureClass::AgentFailed, err.to_string()),
             },
             FlowOutcome::Failed {
@@ -403,8 +420,15 @@ pub fn run_issue(
                 raw_error,
                 ..
             } => {
-                if let Ok(Some(pr)) = ctx.github.pr_for_branch(ctx.slug, &branch) {
-                    leftover = Some(pr);
+                match ctx.github.pr_for_branch(ctx.slug, &branch) {
+                    Ok(Some(pr)) => leftover = Some(pr),
+                    Ok(None) => {}
+                    Err(err) => {
+                        no_retry = Some(format!(
+                            "could not check whether a pull request was left on `{branch}` ({}), so the attempt is not retried",
+                            public_text(&err.to_string())
+                        ));
+                    }
                 }
                 (class, format!("step `{step}`: {raw_error}"))
             }
@@ -414,6 +438,7 @@ pub fn run_issue(
             .finish_attempt_failed(attempt.id, class, &raw, (ctx.now)())?;
         guard.attempt = None;
         let retry = leftover.is_none()
+            && no_retry.is_none()
             && flow.retry_on.contains(&class)
             && attempts < flow.max_attempts
             && dispatcher.is_usable();
@@ -437,12 +462,13 @@ pub fn run_issue(
             &format!(
                 "inchworm gave up after {attempts} attempt(s): {}{}",
                 public_text(&describe_failure(class, &raw, attempt.n)),
-                match &leftover {
-                    Some(pr) => format!(
+                match (&leftover, &no_retry) {
+                    (Some(pr), _) => format!(
                         "\n\nPull request {} was left open and was not retried; inchworm does not close pull requests, so close it before running this issue again.",
                         pr.url
                     ),
-                    None => String::new(),
+                    (None, Some(why)) => format!("\n\n{why}."),
+                    (None, None) => String::new(),
                 }
             ),
             &mut warnings,
@@ -548,7 +574,7 @@ mode = "draft_pr"
             store.run(summary.run_id).unwrap().state,
             RunState::AwaitingCi
         );
-        assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:running"]);
+        assert!(github.issue("o/r", 5).unwrap().labels.is_empty());
         assert_eq!(github.comments().len(), 1, "{:?}", github.comments());
         assert!(github.comments()[0].2.contains("pull/77"));
         assert_eq!(fake.assigned().len(), 2);
@@ -738,7 +764,7 @@ mode = "draft_pr"
         assert_eq!(summary.state, RunState::AwaitingCi);
         let attempts = store.attempts(summary.run_id).unwrap();
         assert_eq!(attempts[0].failure_class, None);
-        assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:running"]);
+        assert!(github.issue("o/r", 5).unwrap().labels.is_empty());
     }
 
     struct DiesWithTheConnection {
@@ -858,6 +884,161 @@ mode = "draft_pr"
         assert_eq!(
             public_text(&"x".repeat(MAX_PUBLIC_TEXT_CHARS)).len(),
             MAX_PUBLIC_TEXT_CHARS
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_pull_request_is_not_replayed() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let (mut client, fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = run_issue(
+            &ctx(&store, &github),
+            &flow(3, "\"agent_failed\""),
+            5,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(summary.attempts, 1);
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::AgentFailed);
+        assert!(raw.contains("inchworm does not publish"), "{raw}");
+        assert_eq!(github.comments().len(), 1);
+        assert!(github.comments()[0].2.contains("not retried"));
+        drop(client);
+        assert_eq!(
+            fake.assigned().len(),
+            2,
+            "one attempt of the two steps, not three"
+        );
+    }
+
+    #[test]
+    fn a_protected_pr_is_left_open_and_never_retried() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        github.set_pr_files("o/r", 77, &[".inchworm/flows.toml"]);
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = run_issue(
+            &ctx(&store, &github),
+            &flow(3, "\"protected_path_violation\""),
+            5,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(summary.attempts, 1);
+        assert_eq!(github.comments().len(), 1);
+        assert!(
+            github.comments()[0].2.contains("left open"),
+            "{:?}",
+            github.comments()
+        );
+    }
+
+    #[test]
+    fn a_closed_or_merged_pr_is_not_accepted_as_the_result() {
+        for state in [PrState::Closed, PrState::Merged] {
+            let store = Store::open_in_memory().unwrap();
+            let github = github();
+            let mut gone = pr("deadbeef");
+            gone.state = state;
+            github.add_pr("o/r", "inchworm/5-a1", gone);
+            let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+            client.initialize().unwrap();
+            let summary = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+            assert_eq!(summary.state, RunState::Failed, "{state:?}");
+            assert!(summary.failure.unwrap().1.contains("not open"));
+        }
+    }
+
+    #[test]
+    fn a_rerun_clears_the_failed_label_and_a_success_clears_the_running_label() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let (mut client, _fake) = connect(vec![
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:failed"]);
+        github.add_pr("o/r", "inchworm/5-a2", pr("deadbeef"));
+        change_issue(&github, |issue| issue.labels.push("inchworm".into()));
+        let summary = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(summary.state, RunState::AwaitingCi);
+        assert!(
+            github.issue("o/r", 5).unwrap().labels.is_empty(),
+            "{:?}",
+            github.issue("o/r", 5).unwrap().labels
+        );
+    }
+
+    struct LeftoverLookupFails(FakeGitHub);
+
+    impl GitHub for LeftoverLookupFails {
+        fn open_issues_with_label(&self, r: &str, l: &str) -> Result<Vec<Issue>, GitHubError> {
+            self.0.open_issues_with_label(r, l)
+        }
+        fn issue(&self, r: &str, n: u64) -> Result<Issue, GitHubError> {
+            self.0.issue(r, n)
+        }
+        fn labels(&self, r: &str) -> Result<Vec<String>, GitHubError> {
+            self.0.labels(r)
+        }
+        fn set_labels(&self, r: &str, n: u64, a: &[&str], d: &[&str]) -> Result<(), GitHubError> {
+            self.0.set_labels(r, n, a, d)
+        }
+        fn comment(&self, r: &str, n: u64, b: &str) -> Result<(), GitHubError> {
+            self.0.comment(r, n, b)
+        }
+        fn pr_for_branch(&self, _: &str, _: &str) -> Result<Option<PullRequest>, GitHubError> {
+            Err(GitHubError::NotFound("gh is down".into()))
+        }
+        fn pr_files(&self, r: &str, n: u64) -> Result<Vec<String>, GitHubError> {
+            self.0.pr_files(r, n)
+        }
+        fn open_prs_for_issue(
+            &self,
+            r: &str,
+            n: u64,
+        ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+            self.0.open_prs_for_issue(r, n)
+        }
+    }
+
+    #[test]
+    fn a_failed_step_with_an_unreadable_pr_lookup_is_not_retried() {
+        let store = Store::open_in_memory().unwrap();
+        let github = LeftoverLookupFails(github());
+        let (mut client, _fake) = connect(vec![
+            Scenario::failed_with_message("boom"),
+            Scenario::failed_with_message("boom"),
+        ]);
+        client.initialize().unwrap();
+        let context = RunContext {
+            store: &store,
+            github: &github,
+            slug: "o/r",
+            repo_path: Path::new("/repo"),
+            now: &|| 1,
+        };
+        let summary = run_issue(
+            &context,
+            &flow(3, "\"agent_failed\", \"model_error\", \"max_iterations\""),
+            5,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(summary.attempts, 1);
+        assert!(
+            github.0.comments()[0].2.contains("could not check whether"),
+            "{:?}",
+            github.0.comments()
         );
     }
 
@@ -1005,7 +1186,7 @@ mode = "draft_pr"
             .as_str()
             .unwrap()
             .to_string();
-        assert!(prompt.contains("Branch for any pull request: inchworm/5-a2"));
+        assert!(!prompt.contains("Branch for any pull request"));
     }
 
     #[test]
@@ -1052,7 +1233,7 @@ mode = "draft_pr"
             second_prompt
                 .contains("The previous attempt failed: attempt 1 failed with `max_iterations`")
         );
-        assert!(second_prompt.contains("inchworm/5-a2"));
+        assert!(second_prompt.contains("Attempt: 2"));
     }
 
     #[test]

@@ -227,7 +227,7 @@ fn describe_step(
 ) -> String {
     let step = &flow.step[index];
     let mut text = format!(
-        "Issue #{}: {}\n\n{}\n\n---\nInchworm step {} of {}: {}\nAttempt: {}\nBranch for any pull request: {}\nBase branch: {}\nNever modify anything under {}/.",
+        "Issue #{}: {}\n\n{}\n\n---\nInchworm step {} of {}: {}\nAttempt: {}\nBase branch: {}\nNever modify anything under {}/.",
         input.issue_number,
         input.issue_title,
         input.issue_body,
@@ -235,7 +235,6 @@ fn describe_step(
         flow.step.len(),
         step.name,
         input.attempt,
-        input.branch,
         flow.base,
         PROTECTED_DIR,
     );
@@ -490,7 +489,8 @@ mod tests {
         assert!(first_text.contains("Issue #12: Fix the thing"));
         assert!(first_text.contains("It is broken."));
         assert!(first_text.contains("step 1 of 2: implement"));
-        assert!(first_text.contains("inchworm/12-a2"));
+        assert!(first_text.contains("Attempt: 2"));
+        assert!(!first_text.contains("Branch for any pull request"));
         assert!(!first_text.contains("previous step"));
         let second_text = assigned[1]["description"].as_str().unwrap();
         assert!(second_text.contains("step 2 of 2: publish"));
