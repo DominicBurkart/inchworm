@@ -16,6 +16,8 @@ pub enum ConfigError {
     EmptyFlowName,
     #[error("duplicate flow name `{0}`")]
     DuplicateFlow(String),
+    #[error("flow file defines {0} flows; at most {MAX_FLOWS} flows are allowed")]
+    TooManyFlows(usize),
     #[error("flow `{flow}`: {reason}")]
     Invalid { flow: String, reason: String },
 }
@@ -33,6 +35,15 @@ pub const MAX_STEPS: usize = 20;
 pub const MAX_DIFF_LINES: u32 = 100_000;
 pub const MAX_LABEL_LEN: usize = 50;
 pub const MAX_NAME_LEN: usize = 64;
+pub const MAX_STEP_NAME_LEN: usize = 64;
+pub const MAX_REQUIRED_CHECK_LEN: usize = 200;
+pub const MAX_REQUIRED_CHECKS: usize = 64;
+pub const MAX_FORBID_GLOB_LEN: usize = 200;
+pub const MAX_FORBID_PATHS: usize = 256;
+pub const MAX_MODEL_LEN: usize = 100;
+pub const MAX_RUBRIC_LEN: usize = 200;
+pub const MAX_JUDGES: usize = 20;
+pub const MAX_FLOWS: usize = 32;
 pub const RUBRIC_DIR: &str = ".inchworm";
 
 /// Why a rubric path is not allowed, or `None` when it is acceptable.
@@ -55,6 +66,13 @@ pub fn rubric_path_problem(path: &Path) -> Option<&'static str> {
     }
     if path.to_string_lossy().contains('\\') {
         return Some("rubric must use `/` separators");
+    }
+    let text = path.to_string_lossy();
+    if text.chars().any(char::is_control) {
+        return Some("rubric must not contain control characters");
+    }
+    if text.chars().count() > MAX_RUBRIC_LEN {
+        return Some("rubric must be at most 200 characters");
     }
     let mut components = path.components();
     match components.next() {
@@ -89,7 +107,7 @@ pub fn rubric_path_problem(path: &Path) -> Option<&'static str> {
 /// assert!(!valid_ref_name("../x"));
 /// ```
 pub fn valid_ref_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 200 || name == "@" {
+    if name.is_empty() || name.chars().count() > 200 || name == "@" {
         return false;
     }
     if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') || name.ends_with('.')
@@ -161,6 +179,10 @@ pub fn glob_problem(pattern: &str) -> Option<&'static str> {
         return Some("has a `{` without a matching `}`");
     }
     None
+}
+
+fn char_len(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn has_edge_whitespace(text: &str) -> bool {
@@ -301,6 +323,9 @@ impl FlowFile {
         if self.flow.is_empty() {
             return Err(ConfigError::NoFlows);
         }
+        if self.flow.len() > MAX_FLOWS {
+            return Err(ConfigError::TooManyFlows(self.flow.len()));
+        }
         let mut names = HashSet::new();
         let mut labels: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
         for flow in &self.flow {
@@ -345,7 +370,7 @@ impl Flow {
                 "trigger label must not contain control characters",
             ));
         }
-        if has_edge_whitespace(label) || label.len() > MAX_LABEL_LEN {
+        if has_edge_whitespace(label) || label.chars().count() > MAX_LABEL_LEN {
             return Err(invalid(
                 self,
                 format!("trigger label must be trimmed and at most {MAX_LABEL_LEN} characters"),
@@ -412,6 +437,18 @@ impl Flow {
             if step.name.trim().is_empty() {
                 return Err(invalid(self, "step name must not be empty"));
             }
+            if step.name.chars().any(char::is_control) {
+                return Err(invalid(
+                    self,
+                    "step name must not contain control characters",
+                ));
+            }
+            if char_len(&step.name) > MAX_STEP_NAME_LEN {
+                return Err(invalid(
+                    self,
+                    format!("step name must be at most {MAX_STEP_NAME_LEN} characters"),
+                ));
+            }
             if !identity_is_valid(&step.identity) {
                 return Err(invalid(
                     self,
@@ -432,6 +469,12 @@ impl Flow {
     }
 
     fn validate_judges(&self) -> Result<(), ConfigError> {
+        if self.judge.len() > MAX_JUDGES {
+            return Err(invalid(
+                self,
+                format!("at most {MAX_JUDGES} judges are allowed"),
+            ));
+        }
         for (index, judge) in self.judge.iter().enumerate() {
             if self.judge[..index].contains(judge) {
                 return Err(invalid(
@@ -450,8 +493,30 @@ impl Flow {
                             format!("diff judge max_lines must be between 1 and {MAX_DIFF_LINES}"),
                         ));
                     }
+                    if forbid_paths.len() > MAX_FORBID_PATHS {
+                        return Err(invalid(
+                            self,
+                            format!(
+                                "diff judge allows at most {MAX_FORBID_PATHS} forbid_paths entries"
+                            ),
+                        ));
+                    }
                     let mut seen = HashSet::new();
                     for pattern in forbid_paths {
+                        if pattern.chars().any(char::is_control) {
+                            return Err(invalid(
+                                self,
+                                "diff judge forbid_paths entry must not contain control characters",
+                            ));
+                        }
+                        if char_len(pattern) > MAX_FORBID_GLOB_LEN {
+                            return Err(invalid(
+                                self,
+                                format!(
+                                    "diff judge forbid_paths entry must be at most {MAX_FORBID_GLOB_LEN} characters"
+                                ),
+                            ));
+                        }
                         if pattern.trim().is_empty() || has_edge_whitespace(pattern) {
                             return Err(invalid(
                                 self,
@@ -494,6 +559,12 @@ impl Flow {
                             "llm judge model must not start with `-` or contain whitespace or control characters",
                         ));
                     }
+                    if char_len(model) > MAX_MODEL_LEN {
+                        return Err(invalid(
+                            self,
+                            format!("llm judge model must be at most {MAX_MODEL_LEN} characters"),
+                        ));
+                    }
                     if !(1..=10).contains(min_score) {
                         return Err(invalid(
                             self,
@@ -507,8 +578,28 @@ impl Flow {
     }
 
     fn validate_outcome(&self) -> Result<(), ConfigError> {
+        if self.outcome.required_checks.len() > MAX_REQUIRED_CHECKS {
+            return Err(invalid(
+                self,
+                format!("outcome allows at most {MAX_REQUIRED_CHECKS} required_checks"),
+            ));
+        }
         let mut seen = HashSet::new();
         for check in &self.outcome.required_checks {
+            if check.chars().any(char::is_control) {
+                return Err(invalid(
+                    self,
+                    "required_checks entry must not contain control characters",
+                ));
+            }
+            if char_len(check) > MAX_REQUIRED_CHECK_LEN {
+                return Err(invalid(
+                    self,
+                    format!(
+                        "required_checks entry must be at most {MAX_REQUIRED_CHECK_LEN} characters"
+                    ),
+                ));
+            }
             if check.trim().is_empty() || has_edge_whitespace(check) {
                 return Err(invalid(
                     self,
@@ -630,25 +721,33 @@ mode = "draft_pr"
         assert_eq!(flow.outcome.merge_method, MergeMethod::Merge);
     }
 
+    fn assert_unknown_field(text: &str) {
+        let err = err_text(text);
+        assert!(
+            err.contains("unknown field `surprise`"),
+            "expected an unknown-field error naming `surprise`, got: {err}"
+        );
+    }
+
     #[test]
     fn unknown_keys_are_rejected_everywhere() {
         let top = format!("surprise = 1\n{}", minimal());
-        assert!(FlowFile::parse(&top).is_err());
+        assert_unknown_field(&top);
         let in_flow = minimal().replace("name = \"issue\"", "name = \"issue\"\nsurprise = 1");
-        assert!(FlowFile::parse(&in_flow).is_err());
+        assert_unknown_field(&in_flow);
         let in_step = minimal().replace(
             "identity = \"rust-implementer\"",
             "identity = \"x\"\nsurprise = 1",
         );
-        assert!(FlowFile::parse(&in_step).is_err());
+        assert_unknown_field(&in_step);
         let in_outcome =
             minimal().replace("mode = \"draft_pr\"", "mode = \"draft_pr\"\nsurprise = 1");
-        assert!(FlowFile::parse(&in_outcome).is_err());
+        assert_unknown_field(&in_outcome);
         let in_judge = FULL.replace(
             "kind = \"nanna_clean\"",
             "kind = \"nanna_clean\"\nsurprise = 1",
         );
-        assert!(FlowFile::parse(&in_judge).is_err());
+        assert_unknown_field(&in_judge);
     }
 
     #[test]
@@ -657,7 +756,11 @@ mode = "draft_pr"
             "kind = \"label\", label = \"inchworm\"",
             "kind = \"schedule\", cron = \"* * * * *\"",
         );
-        assert!(FlowFile::parse(&text).is_err());
+        let err = err_text(&text);
+        assert!(
+            err.contains("unknown variant `schedule`") && err.contains("label"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -666,12 +769,14 @@ mode = "draft_pr"
             "name = \"issue\"",
             "name = \"issue\"\nretry_on = [\"nonsense\"]",
         );
-        assert!(FlowFile::parse(&text).is_err());
+        let err = err_text(&text);
+        assert!(err.contains("unknown variant `nonsense`"), "{err}");
     }
 
     #[test]
     fn empty_file_and_empty_flow_list_are_rejected() {
-        assert!(FlowFile::parse("").is_err());
+        let empty = err_text("");
+        assert!(empty.contains("missing field `flow`"), "{empty}");
         assert!(matches!(
             FlowFile::parse("flow = []"),
             Err(ConfigError::NoFlows)
@@ -1142,6 +1247,203 @@ mode = "draft_pr"
                 "duplicate required_checks",
             ),
             (
+                "step name with a newline",
+                |f| f.step[0].name = "a\nb".into(),
+                "step name must not contain control characters",
+            ),
+            (
+                "step name with NUL",
+                |f| f.step[0].name = "a\0b".into(),
+                "step name must not contain control characters",
+            ),
+            (
+                "step name with a tab",
+                |f| f.step[0].name = "a\tb".into(),
+                "step name must not contain control characters",
+            ),
+            (
+                "overlong step name",
+                |f| f.step[0].name = "n".repeat(MAX_STEP_NAME_LEN + 1),
+                "step name must be at most 64 characters",
+            ),
+            (
+                "required check with a newline",
+                |f| f.outcome.required_checks.push("a\nb".into()),
+                "required_checks entry must not contain control characters",
+            ),
+            (
+                "required check with NUL",
+                |f| f.outcome.required_checks.push("a\0b".into()),
+                "required_checks entry must not contain control characters",
+            ),
+            (
+                "required check with a tab",
+                |f| f.outcome.required_checks.push("a\tb".into()),
+                "required_checks entry must not contain control characters",
+            ),
+            (
+                "overlong required check",
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .push("c".repeat(MAX_REQUIRED_CHECK_LEN + 1))
+                },
+                "required_checks entry must be at most 200 characters",
+            ),
+            (
+                "too many required checks",
+                |f| {
+                    f.outcome.required_checks = (0..=MAX_REQUIRED_CHECKS)
+                        .map(|n| format!("check{n}"))
+                        .collect()
+                },
+                "at most 64 required_checks",
+            ),
+            (
+                "forbid glob with a newline",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("a\nb".into())
+                    }
+                },
+                "forbid_paths entry must not contain control characters",
+            ),
+            (
+                "forbid glob with NUL",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("a\0b".into())
+                    }
+                },
+                "forbid_paths entry must not contain control characters",
+            ),
+            (
+                "forbid glob with a tab",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("a\tb".into())
+                    }
+                },
+                "forbid_paths entry must not contain control characters",
+            ),
+            (
+                "overlong forbid glob",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("g".repeat(MAX_FORBID_GLOB_LEN + 1))
+                    }
+                },
+                "forbid_paths entry must be at most 200 characters",
+            ),
+            (
+                "too many forbid globs",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        *forbid_paths = (0..=MAX_FORBID_PATHS).map(|n| format!("p{n}/**")).collect()
+                    }
+                },
+                "at most 256 forbid_paths",
+            ),
+            (
+                "overlong model",
+                |f| {
+                    if let Judge::Llm { model, .. } = llm(f) {
+                        *model = "m".repeat(MAX_MODEL_LEN + 1)
+                    }
+                },
+                "llm judge model must be at most 100 characters",
+            ),
+            (
+                "rubric with a newline",
+                |f| {
+                    if let Judge::Llm { rubric, .. } = llm(f) {
+                        *rubric = ".inchworm/a\nb.md".into()
+                    }
+                },
+                "rubric must not contain control characters",
+            ),
+            (
+                "rubric with a tab",
+                |f| {
+                    if let Judge::Llm { rubric, .. } = llm(f) {
+                        *rubric = ".inchworm/a\tb.md".into()
+                    }
+                },
+                "rubric must not contain control characters",
+            ),
+            (
+                "overlong rubric",
+                |f| {
+                    if let Judge::Llm { rubric, .. } = llm(f) {
+                        *rubric = format!(".inchworm/{}", "r".repeat(MAX_RUBRIC_LEN)).into()
+                    }
+                },
+                "rubric must be at most 200 characters",
+            ),
+            (
+                "too many judges",
+                |f| {
+                    f.judge = (1..=MAX_JUDGES as u32 + 1)
+                        .map(|n| Judge::Diff {
+                            max_lines: n,
+                            forbid_paths: vec![],
+                        })
+                        .collect()
+                },
+                "at most 20 judges",
+            ),
+            (
+                "base with a newline",
+                |f| f.base = "a\nb".into(),
+                "not a valid git branch name",
+            ),
+            (
+                "overlong base",
+                |f| f.base = "b".repeat(201),
+                "not a valid git branch name",
+            ),
+            (
+                "label of 51 multi-byte characters",
+                |f| {
+                    f.trigger = Trigger::Label {
+                        label: "\u{e9}".repeat(MAX_LABEL_LEN + 1),
+                    }
+                },
+                "at most 50 characters",
+            ),
+            (
+                "step name of 65 multi-byte characters",
+                |f| f.step[0].name = "\u{e9}".repeat(MAX_STEP_NAME_LEN + 1),
+                "step name must be at most 64 characters",
+            ),
+            (
+                "required check of 201 multi-byte characters",
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .push("\u{e9}".repeat(MAX_REQUIRED_CHECK_LEN + 1))
+                },
+                "required_checks entry must be at most 200 characters",
+            ),
+            (
+                "forbid glob of 201 multi-byte characters",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("\u{e9}".repeat(MAX_FORBID_GLOB_LEN + 1))
+                    }
+                },
+                "forbid_paths entry must be at most 200 characters",
+            ),
+            (
+                "model of 101 multi-byte characters",
+                |f| {
+                    if let Judge::Llm { model, .. } = llm(f) {
+                        *model = "\u{e9}".repeat(MAX_MODEL_LEN + 1)
+                    }
+                },
+                "llm judge model must be at most 100 characters",
+            ),
+            (
                 "merge_when without judges",
                 |f| f.judge.clear(),
                 "at least one judge",
@@ -1249,6 +1551,78 @@ mode = "draft_pr"
                     *rubric = ".inchworm/judges/a.md".into()
                 }
             }),
+            ("label of 50 multi-byte characters", |f| {
+                f.trigger = Trigger::Label {
+                    label: "\u{e9}".repeat(MAX_LABEL_LEN),
+                }
+            }),
+            ("step name at the cap", |f| {
+                f.step[0].name = "n".repeat(MAX_STEP_NAME_LEN)
+            }),
+            ("step name of 64 multi-byte characters", |f| {
+                f.step[0].name = "\u{e9}".repeat(MAX_STEP_NAME_LEN)
+            }),
+            ("required check at the cap", |f| {
+                f.outcome
+                    .required_checks
+                    .push("c".repeat(MAX_REQUIRED_CHECK_LEN))
+            }),
+            ("required check of 200 multi-byte characters", |f| {
+                f.outcome
+                    .required_checks
+                    .push("\u{e9}".repeat(MAX_REQUIRED_CHECK_LEN))
+            }),
+            ("required checks at the count cap", |f| {
+                f.outcome.required_checks = (0..MAX_REQUIRED_CHECKS)
+                    .map(|n| format!("check{n}"))
+                    .collect()
+            }),
+            ("forbid glob at the cap", |f| {
+                if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                    forbid_paths.push("g".repeat(MAX_FORBID_GLOB_LEN))
+                }
+            }),
+            ("forbid glob of 200 multi-byte characters", |f| {
+                if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                    forbid_paths.push("\u{e9}".repeat(MAX_FORBID_GLOB_LEN))
+                }
+            }),
+            ("forbid globs at the count cap", |f| {
+                if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                    *forbid_paths = (0..MAX_FORBID_PATHS).map(|n| format!("p{n}/**")).collect()
+                }
+            }),
+            ("model at the cap", |f| {
+                if let Judge::Llm { model, .. } = llm(f) {
+                    *model = "m".repeat(MAX_MODEL_LEN)
+                }
+            }),
+            ("model of 100 multi-byte characters", |f| {
+                if let Judge::Llm { model, .. } = llm(f) {
+                    *model = "\u{e9}".repeat(MAX_MODEL_LEN)
+                }
+            }),
+            ("rubric at the cap", |f| {
+                if let Judge::Llm { rubric, .. } = llm(f) {
+                    *rubric = format!(".inchworm/{}", "r".repeat(MAX_RUBRIC_LEN - 10)).into()
+                }
+            }),
+            ("rubric of 200 multi-byte characters", |f| {
+                if let Judge::Llm { rubric, .. } = llm(f) {
+                    *rubric = format!(".inchworm/{}", "\u{e9}".repeat(MAX_RUBRIC_LEN - 10)).into()
+                }
+            }),
+            ("judges at the cap", |f| {
+                f.judge = (1..=MAX_JUDGES as u32)
+                    .map(|n| Judge::Diff {
+                        max_lines: n,
+                        forbid_paths: vec![],
+                    })
+                    .collect()
+            }),
+            ("base of 200 multi-byte characters", |f| {
+                f.base = "\u{e9}".repeat(200)
+            }),
             ("slash in base", |f| f.base = "release/1.0".into()),
             ("version tag as base", |f| f.base = "v1.2.3".into()),
         ];
@@ -1257,6 +1631,41 @@ mode = "draft_pr"
             mutate(&mut flow);
             assert_eq!(reason(&flow), "", "{name}");
         }
+    }
+
+    fn many_flows(count: usize) -> FlowFile {
+        FlowFile {
+            flow: (0..count)
+                .map(|n| {
+                    let mut flow = base_flow();
+                    flow.name = format!("flow{n}");
+                    flow.trigger = Trigger::Label {
+                        label: format!("label{n}"),
+                    };
+                    flow
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_file_may_hold_at_most_32_flows() {
+        assert!(many_flows(MAX_FLOWS).validate().is_ok());
+        let err = many_flows(MAX_FLOWS + 1).validate().unwrap_err();
+        assert!(matches!(err, ConfigError::TooManyFlows(33)), "{err}");
+        assert!(err.to_string().contains("at most 32 flows"), "{err}");
+    }
+
+    #[test]
+    fn a_hundred_thousand_character_step_name_is_rejected() {
+        let huge = "x".repeat(100_000);
+        let text = minimal()
+            .replace("name = \"implement\"", &format!("name = \"{huge}\""))
+            .replace(
+                "mode = \"draft_pr\"",
+                &format!("mode = \"draft_pr\"\nrequired_checks = [\"{huge}\"]"),
+            );
+        assert!(err_text(&text).contains("step name must be at most 64"));
     }
 
     #[test]
@@ -1334,7 +1743,11 @@ mode = "draft_pr"
         let file = FlowFile {
             flow: vec![base_flow(), other.clone()],
         };
-        assert!(file.validate().is_err());
+        let err = file.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("INCHWORM") && err.contains("trigger label"),
+            "{err}"
+        );
 
         other.trigger = Trigger::Label {
             label: "another".into(),
@@ -1351,7 +1764,8 @@ mode = "draft_pr"
             "trigger = { kind = \"label\", label = \"inchworm\" }",
             "trigger = { kind = \"label\", label = \"inchworm\", extra = 1 }",
         );
-        assert!(FlowFile::parse(&text).is_err());
+        let err = err_text(&text);
+        assert!(err.contains("unknown field `extra`"), "{err}");
         assert!(FlowFile::parse(&minimal()).is_ok());
     }
 
@@ -1520,14 +1934,22 @@ mode = "draft_pr"
             let (name, mutate, _) = table[index % table.len()];
             let mut flow = base_flow();
             mutate(&mut flow);
-            prop_assert!(flow.validate().is_err(), "{}", name);
+            prop_assert!(
+                matches!(flow.validate(), Err(ConfigError::Invalid { .. })),
+                "{}",
+                name
+            );
         }
 
         #[test]
         fn merge_when_without_judges_is_always_rejected(mut flow in flow_strategy()) {
             flow.outcome.mode = OutcomeMode::MergeWhen;
             flow.judge.clear();
-            prop_assert!(flow.validate().is_err());
+            prop_assert!(
+                matches!(&flow.validate(), Err(ConfigError::Invalid { reason, .. }) if reason.contains("at least one judge")),
+                "{:?}",
+                flow.validate()
+            );
         }
 
         #[test]
