@@ -291,3 +291,176 @@ fn tracing_output_that_nanna_writes_to_stdout_is_skipped_not_fatal() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[cfg(unix)]
+mod validate_online_against_the_real_nanna {
+    use super::*;
+    use assert_cmd::Command as Cmd;
+
+    struct Online {
+        sandbox: Sandbox,
+        repo: PathBuf,
+        config: PathBuf,
+        bin_dir: PathBuf,
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn online() -> Online {
+        use std::os::unix::fs::PermissionsExt;
+        let sandbox = sandbox();
+        let root = sandbox.home.parent().unwrap().to_path_buf();
+        let repo = root.join("target-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write(
+            &repo.join(".inchworm/flows.toml"),
+            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        );
+        write(
+            &repo.join(".nanna/protected.toml"),
+            "extra = [\".inchworm/**\"]\n",
+        );
+        write(&repo.join(".nanna/prompt.md"), "prompt");
+        let bin_dir = root.join("fake-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let gh = bin_dir.join("gh");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/gh"),
+            &gh,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("inchworm.toml");
+        write(
+            &config,
+            &format!(
+                "nanna_bin = \"{}\"\nstate_db = \"{}\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
+                sandbox.bin.display(),
+                root.join("state/state.db").display(),
+                repo.display()
+            ),
+        );
+        Online {
+            sandbox,
+            repo,
+            config,
+            bin_dir,
+        }
+    }
+
+    impl Online {
+        fn validate(&self) -> assert_cmd::assert::Assert {
+            let path = format!(
+                "{}:{}",
+                self.bin_dir.display(),
+                std::env::var("PATH").unwrap()
+            );
+            Cmd::cargo_bin("inchworm")
+                .unwrap()
+                .env("PATH", path)
+                .env("NANNA_CONFIG_DIR", &self.sandbox.config)
+                .env("HOME", &self.sandbox.home)
+                .args(["validate", "--online", "--config"])
+                .arg(&self.config)
+                .assert()
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real nanna binary: set INCHWORM_NANNA_BIN or install ~/.local/bin/nanna"]
+    fn a_repo_card_whose_prompt_file_is_missing_is_reported_with_nannas_own_message() {
+        let online = online();
+        let global =
+            std::fs::read_to_string(online.sandbox.config.join("agents/rust-implementer.toml"))
+                .unwrap();
+        write(
+            &online.repo.join(".nanna/agents/rust-implementer.toml"),
+            &global,
+        );
+        let assert = online.validate().code(1);
+        let out = stdout_of(&assert);
+        assert!(
+            out.contains("prompts/rust-implementer.md") && out.contains("No such file"),
+            "{out}"
+        );
+    }
+
+    fn stdout_of(assert: &assert_cmd::assert::Assert) -> String {
+        String::from_utf8_lossy(&assert.get_output().stdout).to_string()
+    }
+
+    #[test]
+    #[ignore = "needs a real nanna binary: set INCHWORM_NANNA_BIN or install ~/.local/bin/nanna"]
+    fn a_catalog_with_the_auditor_and_the_flows_identity_validates_cleanly() {
+        let online = online();
+        let assert = online.validate().success();
+        assert!(
+            stdout_of(&assert).contains("0 error(s)"),
+            "{}",
+            stdout_of(&assert)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real nanna binary: set INCHWORM_NANNA_BIN or install ~/.local/bin/nanna"]
+    fn a_missing_auditor_card_is_reported_before_nanna_would_refuse_to_start() {
+        let online = online();
+        std::fs::remove_file(online.sandbox.config.join("agents/auditor.toml")).unwrap();
+        let assert = online.validate().code(1);
+        let out = stdout_of(&assert);
+        assert!(
+            out.contains("`auditor`") && out.contains("refuses to start"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real nanna binary: set INCHWORM_NANNA_BIN or install ~/.local/bin/nanna"]
+    fn a_repo_card_that_widens_its_global_base_is_reported_with_nannas_own_message() {
+        let online = online();
+        let global =
+            std::fs::read_to_string(online.sandbox.config.join("agents/rust-implementer.toml"))
+                .unwrap();
+        let widened = global.replace("max_effect = \"workspace\"", "max_effect = \"production\"");
+        assert_ne!(
+            widened, global,
+            "the sandbox card no longer says max_effect = \"workspace\""
+        );
+        copy_dir(
+            &online.sandbox.config.join("agents/prompts"),
+            &online.repo.join(".nanna/agents/prompts"),
+        );
+        write(
+            &online.repo.join(".nanna/agents/rust-implementer.toml"),
+            &widened,
+        );
+        let assert = online.validate().code(1);
+        let out = stdout_of(&assert);
+        assert!(
+            out.contains("cannot list identities with `nanna agents list`")
+                && out.contains("widens"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real nanna binary: set INCHWORM_NANNA_BIN or install ~/.local/bin/nanna"]
+    fn a_repo_card_with_no_global_base_is_reported_with_nannas_own_message() {
+        let online = online();
+        let global =
+            std::fs::read_to_string(online.sandbox.config.join("agents/rust-implementer.toml"))
+                .unwrap();
+        let orphan = global.replace("name = \"rust-implementer\"", "name = \"ghost\"");
+        copy_dir(
+            &online.sandbox.config.join("agents/prompts"),
+            &online.repo.join(".nanna/agents/prompts"),
+        );
+        write(&online.repo.join(".nanna/agents/ghost.toml"), &orphan);
+        let assert = online.validate().code(1);
+        let out = stdout_of(&assert);
+        assert!(out.contains("no global identity to narrow"), "{out}");
+    }
+}
