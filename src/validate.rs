@@ -2,9 +2,7 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::{
-    FlowFile, GlobalConfig, Judge, OutcomeMode, RUBRIC_DIR, RepoEntry, rubric_path_problem,
-};
+use crate::config::{FlowFile, GlobalConfig, Judge, OutcomeMode, RUBRIC_DIR, RepoEntry};
 use crate::fsutil::read_regular_text;
 
 pub const PROTECTED_GLOB: &str = ".inchworm/**";
@@ -236,9 +234,6 @@ fn validate_repo(repo: &RepoEntry, report: &mut Report) {
 }
 
 fn rubric_problem(root: &Path, rubric: &Path) -> Option<String> {
-    if let Some(problem) = rubric_path_problem(rubric) {
-        return Some(problem.to_string());
-    }
     let full = root.join(rubric);
     let meta = match std::fs::symlink_metadata(&full) {
         Ok(meta) => meta,
@@ -250,10 +245,11 @@ fn rubric_problem(root: &Path, rubric: &Path) -> Option<String> {
     if !meta.is_file() {
         return Some(format!("rubric {} is not a regular file", rubric.display()));
     }
-    let inside = match (full.canonicalize(), root.join(RUBRIC_DIR).canonicalize()) {
-        (Ok(file), Ok(dir)) => file.starts_with(dir),
-        _ => false,
-    };
+    let inside = full
+        .canonicalize()
+        .ok()
+        .zip(root.join(RUBRIC_DIR).canonicalize().ok())
+        .is_some_and(|(file, dir)| file.starts_with(dir));
     if !inside {
         return Some(format!(
             "rubric {} resolves outside {RUBRIC_DIR}/",
