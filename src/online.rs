@@ -415,6 +415,57 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn every_status_label_is_required_and_named_in_its_own_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(&["inchworm"]);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            builder: None,
+        };
+        let found = messages(&validate_online(&config, &online));
+        assert_eq!(found.len(), 3, "{found:?}");
+        for label in ["inchworm:running", "inchworm:failed", "inchworm:done"] {
+            assert!(
+                found.iter().any(|m| m.contains(&format!("`{label}`"))),
+                "{label}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_trigger_label_must_exist_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        let flows = std::fs::read_to_string(dir.path().join(".inchworm/flows.toml")).unwrap();
+        std::fs::write(
+            dir.path().join(".inchworm/flows.toml"),
+            flows.replace("label = \"inchworm\"", "label = \"queue-me\""),
+        )
+        .unwrap();
+        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(&[
+            "inchworm",
+            "inchworm:running",
+            "inchworm:failed",
+            "inchworm:done",
+        ]);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            builder: None,
+        };
+        let found = messages(&validate_online(&config, &online));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("`queue-me`") && found[0].contains("gh label create queue-me -R o/r"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
     fn missing_labels_are_errors_with_the_fix() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());

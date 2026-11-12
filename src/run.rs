@@ -477,6 +477,9 @@ mode = "draft_pr"
         assert_eq!(summary.pr.as_ref().unwrap().number, 77);
         assert!(summary.warnings.is_empty());
         let attempt = &store.attempts(summary.run_id).unwrap()[0];
+        assert_eq!(attempt.state, crate::store::AttemptState::Succeeded);
+        assert!(attempt.ended_at.is_some());
+        assert_eq!(attempt.failure_class, None);
         assert_eq!(attempt.pr_number, Some(77));
         assert_eq!(attempt.head_sha.as_deref(), Some("deadbeef"));
         assert_eq!(attempt.branch.as_deref(), Some("inchworm/5-a1"));

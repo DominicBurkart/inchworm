@@ -496,6 +496,22 @@ mod tests {
     }
 
     #[test]
+    fn the_attempt_count_is_scoped_to_one_repo_and_one_issue() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = store.enqueue_run("o/r", 1, "issue", 1).unwrap().unwrap();
+        let other_issue = store.enqueue_run("o/r", 2, "issue", 1).unwrap().unwrap();
+        let other_repo = store.enqueue_run("o/x", 1, "issue", 1).unwrap().unwrap();
+        for run in [mine, mine, other_issue, other_repo, other_repo, other_repo] {
+            store.start_attempt(run, 2).unwrap();
+        }
+        assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 2);
+        assert_eq!(store.issue_attempt_count("o/r", 2).unwrap(), 1);
+        assert_eq!(store.issue_attempt_count("o/x", 1).unwrap(), 3);
+        assert_eq!(store.issue_attempt_count("o/r", 3).unwrap(), 0);
+        assert_eq!(store.issue_attempt_count("o/none", 1).unwrap(), 0);
+    }
+
+    #[test]
     fn open_run_finds_a_live_run_for_the_exact_issue_and_flow_only() {
         let (store, id) = store_with_run();
         assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));

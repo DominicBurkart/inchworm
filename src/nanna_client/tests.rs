@@ -368,6 +368,132 @@ fn an_interrupted_client_is_not_usable_for_another_attempt() {
 }
 
 #[test]
+fn input_required_counts_as_still_working_and_unknown_states_are_protocol_errors() {
+    assert_eq!(
+        TaskState::parse("input_required").unwrap(),
+        TaskState::Working
+    );
+    assert!(!TaskState::parse("input_required").unwrap().is_terminal());
+    assert_eq!(TaskState::parse("working").unwrap(), TaskState::Working);
+    for terminal in ["completed", "failed", "cancelled"] {
+        assert!(
+            TaskState::parse(terminal).unwrap().is_terminal(),
+            "{terminal}"
+        );
+    }
+    assert!(matches!(
+        TaskState::parse("paused").unwrap_err(),
+        ClientError::Protocol(_)
+    ));
+}
+
+#[test]
+fn a_task_without_a_poll_interval_gets_the_default() {
+    let info = TaskInfo::from_wire(&json!({"taskId": "t", "status": "working"})).unwrap();
+    assert_eq!(info.poll_interval_ms, 2000);
+    let info = TaskInfo::from_wire(&json!({"taskId": "t", "status": "working", "pollInterval": 7}))
+        .unwrap();
+    assert_eq!(info.poll_interval_ms, 7);
+    assert_eq!(info.status_message, None);
+    let info =
+        TaskInfo::from_wire(&json!({"taskId": "t", "status": "failed", "statusMessage": "boom"}))
+            .unwrap();
+    assert_eq!(info.status_message.as_deref(), Some("boom"));
+}
+
+#[test]
+fn a_cancelled_kind_in_a_failed_result_is_a_cancellation() {
+    let wire = json!({
+        "isError": true,
+        "structuredContent": {"failure_kind": "cancelled"},
+        "content": [{"type": "text", "text": "Task was cancelled after 3 iterations."}]
+    });
+    assert_eq!(
+        parse_result(TaskState::Failed, &wire).unwrap(),
+        TaskOutcome::Cancelled
+    );
+    assert_eq!(
+        parse_result(TaskState::Completed, &wire).unwrap(),
+        TaskOutcome::Cancelled
+    );
+    let other = json!({
+        "isError": true,
+        "structuredContent": {"failure_kind": "max_iterations"},
+        "content": [{"type": "text", "text": "boom"}]
+    });
+    assert!(matches!(
+        parse_result(TaskState::Failed, &other).unwrap(),
+        TaskOutcome::Failed(_)
+    ));
+}
+
+#[test]
+fn structured_error_fields_win_over_the_text_they_accompany() {
+    let wire = json!({
+        "isError": true,
+        "structuredContent": {
+            "failure_kind": "state_error",
+            "error_type": "StateError",
+            "error": "structured message"
+        },
+        "content": [{"type": "text", "text": "text message\n\n{\"error_type\": \"SomethingElse\"}"}]
+    });
+    assert_eq!(
+        parse_result(TaskState::Failed, &wire).unwrap(),
+        TaskOutcome::Failed(NannaFailure {
+            failure_kind: Some("state_error".into()),
+            error_type: Some("StateError".into()),
+            message: "structured message".into(),
+        })
+    );
+}
+
+#[test]
+fn empty_strings_in_a_result_count_as_absent() {
+    let text = json!({
+        "result_summary": "",
+        "changes_patch": "",
+        "format_patch": "",
+        "model_used": "",
+        "files_modified": [],
+        "denial_count": 3,
+    })
+    .to_string();
+    let wire = json!({"isError": false, "content": [{"type": "text", "text": text}]});
+    let TaskOutcome::Completed(done) = parse_result(TaskState::Completed, &wire).unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(done.changes_patch, None);
+    assert_eq!(done.format_patch, None);
+    assert_eq!(done.result_summary, "");
+    assert_eq!(done.model_used, "");
+    assert!(!done.has_changes());
+    assert_eq!(done.denial_count, 3);
+}
+
+#[test]
+fn the_wait_between_polls_never_runs_past_the_deadline() {
+    let reply = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working","pollInterval":60000}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"result":{"taskId":"t","status":"working","pollInterval":60000}}"#,
+        "\n"
+    );
+    let mut client = NannaClient::new(BufReader::new(reply.as_bytes()), io::sink());
+    client.set_read_timeout(Duration::from_millis(50));
+    let started = Instant::now();
+    let outcome = client
+        .run_task(&request("x"), Duration::from_millis(150))
+        .unwrap();
+    assert_eq!(outcome, TaskOutcome::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn a_fresh_client_is_not_dead() {
     let (client, _fake) = connect(vec![]);
     assert!(!client.is_dead());

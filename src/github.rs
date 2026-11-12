@@ -615,6 +615,25 @@ mod tests {
     }
 
     #[test]
+    fn the_draft_flag_and_state_of_a_pull_request_are_read_as_reported() {
+        let ready = r#"[{"number":9,"headRefOid":"abc","isDraft":false,"state":"OPEN","url":"u"}]"#;
+        let missing = r#"[{"number":9,"headRefOid":"abc","state":"OPEN","url":"u"}]"#;
+        let merged =
+            r#"[{"number":9,"headRefOid":"abc","isDraft":true,"state":"MERGED","url":"u"}]"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(ready),
+            ScriptedRunner::ok(missing),
+            ScriptedRunner::ok(merged),
+        ]));
+        assert!(!gh.pr_for_branch("o/r", "b").unwrap().unwrap().is_draft);
+        assert!(!gh.pr_for_branch("o/r", "b").unwrap().unwrap().is_draft);
+        assert_eq!(
+            gh.pr_for_branch("o/r", "b").unwrap().unwrap().state,
+            PrState::Merged
+        );
+    }
+
+    #[test]
     fn gh_finds_the_pr_for_a_branch_or_none() {
         let pr = r#"[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]"#;
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![
