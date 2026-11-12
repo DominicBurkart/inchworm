@@ -224,7 +224,9 @@ fn validate_repo(repo: &RepoEntry, report: &mut Report) {
     }
     check_flows(repo, report);
     check_protected(repo, report);
-    if !repo.path.join(".nanna/prompt.md").is_file() {
+    if let Some(message) = symlink_message(&repo.path, ".nanna/prompt.md") {
+        report.push(slug, Severity::Error, message);
+    } else if !repo.path.join(".nanna/prompt.md").is_file() {
         report.push(
             slug,
             Severity::Warning,
@@ -233,22 +235,55 @@ fn validate_repo(repo: &RepoEntry, report: &mut Report) {
     }
 }
 
+/// The first prefix of `relative` (resolved under `root`) that is a symlink.
+///
+/// The walk goes from the root down and stops at the first missing component,
+/// so a symlinked directory is reported before anything below it is read.
+///
+/// ```
+/// use std::path::Path;
+/// use inchworm::validate::symlink_component;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// assert_eq!(symlink_component(dir.path(), Path::new("a/b")), None);
+/// ```
+pub fn symlink_component(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in relative.components() {
+        prefix.push(component);
+        match std::fs::symlink_metadata(root.join(&prefix)) {
+            Ok(meta) if meta.file_type().is_symlink() => return Some(prefix),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn symlink_message(root: &Path, relative: &str) -> Option<String> {
+    symlink_component(root, Path::new(relative))
+        .map(|prefix| format!("`{}` is a symlink, which is not followed", prefix.display()))
+}
+
 fn rubric_problem(root: &Path, rubric: &Path) -> Option<String> {
+    if let Some(prefix) = symlink_component(root, rubric) {
+        return Some(format!(
+            "rubric component `{}` is a symlink, which is not followed",
+            prefix.display()
+        ));
+    }
     let full = root.join(rubric);
     let meta = match std::fs::symlink_metadata(&full) {
         Ok(meta) => meta,
         Err(_) => return Some(format!("rubric {} does not exist", rubric.display())),
     };
-    if meta.file_type().is_symlink() {
-        return Some(format!("rubric {} is a symlink", rubric.display()));
-    }
     if !meta.is_file() {
         return Some(format!("rubric {} is not a regular file", rubric.display()));
     }
     let inside = full
         .canonicalize()
         .ok()
-        .zip(root.join(RUBRIC_DIR).canonicalize().ok())
+        .zip(root.canonicalize().ok().map(|root| root.join(RUBRIC_DIR)))
         .is_some_and(|(file, dir)| file.starts_with(dir));
     if !inside {
         return Some(format!(
@@ -261,6 +296,10 @@ fn rubric_problem(root: &Path, rubric: &Path) -> Option<String> {
 
 fn check_flows(repo: &RepoEntry, report: &mut Report) {
     let slug = Some(repo.slug.as_str());
+    if let Some(message) = symlink_message(&repo.path, ".inchworm/flows.toml") {
+        report.push(slug, Severity::Error, message);
+        return;
+    }
     let path = repo.path.join(".inchworm/flows.toml");
     let text = match read_regular_text(&path, MAX_FLOWS_BYTES) {
         Ok(text) => text,
@@ -311,6 +350,10 @@ fn check_flows(repo: &RepoEntry, report: &mut Report) {
 
 fn check_protected(repo: &RepoEntry, report: &mut Report) {
     let slug = Some(repo.slug.as_str());
+    if let Some(message) = symlink_message(&repo.path, ".nanna/protected.toml") {
+        report.push(slug, Severity::Error, message);
+        return;
+    }
     let path = repo.path.join(".nanna/protected.toml");
     let text = match read_regular_text(&path, MAX_PROTECTED_BYTES) {
         Ok(text) => text,
@@ -647,7 +690,7 @@ mode = "draft_pr"
             ".inchworm/flows.toml",
             &FLOWS.replace(".inchworm/rubric.md", ".inchworm/judges/passwd"),
         );
-        assert!(has(&run(&f), "resolves outside"));
+        assert!(has(&run(&f), "is a symlink"));
     }
 
     #[test]
@@ -828,6 +871,110 @@ mode = "draft_pr"
             &validate(&config, Some(&path)),
             "was not found on PATH"
         ));
+    }
+
+    #[cfg(unix)]
+    fn outside_copy_of(f: &Fixture, directory: &str) -> PathBuf {
+        let outside = f
+            .root
+            .parent()
+            .unwrap()
+            .join(format!("outside-{}", directory.trim_start_matches('.')));
+        std::fs::create_dir_all(&outside).unwrap();
+        for entry in std::fs::read_dir(f.root.join(directory)).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), outside.join(entry.file_name())).unwrap();
+        }
+        std::fs::remove_dir_all(f.root.join(directory)).unwrap();
+        outside
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_inchworm_directory_is_refused_even_when_everything_inside_is_valid() {
+        let f = fixture();
+        let outside = outside_copy_of(&f, ".inchworm");
+        std::os::unix::fs::symlink(&outside, f.root.join(".inchworm")).unwrap();
+        let report = run(&f);
+        assert!(!report.is_ok(), "{:?}", messages(&report));
+        assert!(
+            has(&report, "`.inchworm` is a symlink"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_nanna_directory_is_refused_even_when_everything_inside_is_valid() {
+        let f = fixture();
+        let outside = outside_copy_of(&f, ".nanna");
+        std::os::unix::fs::symlink(&outside, f.root.join(".nanna")).unwrap();
+        let report = run(&f);
+        assert!(!report.is_ok(), "{:?}", messages(&report));
+        assert!(
+            has(&report, "`.nanna` is a symlink"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_prompt_is_refused_but_a_missing_one_is_only_a_warning() {
+        let f = fixture();
+        let real = f.root.join("prompt-real.md");
+        std::fs::write(&real, "p").unwrap();
+        std::fs::remove_file(f.root.join(".nanna/prompt.md")).unwrap();
+        std::os::unix::fs::symlink(&real, f.root.join(".nanna/prompt.md")).unwrap();
+        let report = run(&f);
+        assert!(!report.is_ok(), "{:?}", messages(&report));
+        assert!(
+            has(&report, "`.nanna/prompt.md` is a symlink"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_intermediate_rubric_directory_names_the_component() {
+        let f = fixture();
+        let outside = f.root.parent().unwrap().join("outside-judges");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("r.md"), "rubric").unwrap();
+        std::os::unix::fs::symlink(&outside, f.root.join(".inchworm/judges")).unwrap();
+        write(
+            &f.root,
+            ".inchworm/flows.toml",
+            &FLOWS.replace(".inchworm/rubric.md", ".inchworm/judges/r.md"),
+        );
+        let report = run(&f);
+        assert!(
+            has(&report, "`.inchworm/judges` is a symlink"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repo_reached_through_a_symlinked_path_is_still_valid() {
+        let f = fixture();
+        let alias = f.root.parent().unwrap().join("alias-to-repo");
+        std::os::unix::fs::symlink(&f.root, &alias).unwrap();
+        let report = validate(&config_for(&alias, &f.bin), None);
+        assert!(report.is_ok(), "{:?}", messages(&report));
+    }
+
+    #[test]
+    fn components_are_checked_from_the_repo_root_down_and_stop_at_a_missing_one() {
+        let f = fixture();
+        assert_eq!(
+            symlink_component(&f.root, Path::new(".inchworm/flows.toml")),
+            None
+        );
+        assert_eq!(symlink_component(&f.root, Path::new(".nope/a/b")), None);
     }
 
     #[test]

@@ -122,3 +122,22 @@ fn unknown_subcommands_exit_two_and_print_usage() {
         .code(2)
         .stderr(predicate::str::contains("Usage"));
 }
+
+#[cfg(unix)]
+#[test]
+fn validate_exits_one_when_the_inchworm_directory_is_a_symlink_to_an_outside_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    write(&repo, ".inchworm/rubric.md", "rubric");
+    let outside = dir.path().join("outside");
+    std::fs::rename(repo.join(".inchworm"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join(".inchworm")).unwrap();
+    let config = config(dir.path(), &repo);
+    inchworm()
+        .args(["validate", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("`.inchworm` is a symlink"));
+}
