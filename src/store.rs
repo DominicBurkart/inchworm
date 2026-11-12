@@ -204,13 +204,13 @@ impl SubjectKind {
 /// subject therefore cannot both be opened.
 ///
 /// ```
-/// use inchworm::store::{Subject, SubjectKind};
+/// use inchworm::store::{StoreError, Subject, SubjectKind};
 ///
 /// let issue = Subject::issue(7).unwrap();
 /// assert_eq!(issue.kind(), SubjectKind::Issue);
 /// assert_eq!(issue.reference(), "7");
-/// assert!(Subject::issue(0).is_err());
-/// assert!(Subject::commit("0123abc").is_err());
+/// assert!(matches!(Subject::issue(0), Err(StoreError::InvalidSubject(_))));
+/// assert!(matches!(Subject::commit("0123abc"), Err(StoreError::InvalidSubject(_))));
 /// let sha = "0123456789ABCDEF0123456789abcdef01234567";
 /// assert_eq!(Subject::commit(sha).unwrap().reference(), sha.to_ascii_lowercase());
 /// ```
@@ -341,12 +341,12 @@ pub struct Attempt {
 /// when no store of the same process is in the middle of a transaction.
 ///
 /// ```
-/// use inchworm::store::DaemonLock;
+/// use inchworm::store::{DaemonLock, StoreError};
 ///
 /// let dir = tempfile::tempdir().unwrap();
 /// let db = dir.path().join("state.db");
 /// let first = DaemonLock::acquire(&db).unwrap();
-/// assert!(DaemonLock::acquire(&db).is_err());
+/// assert!(matches!(DaemonLock::acquire(&db), Err(StoreError::AlreadyRunning(_))));
 /// assert!(first.database().ends_with("state.db"));
 /// drop(first);
 /// assert!(DaemonLock::acquire(&db).is_ok());
@@ -574,7 +574,14 @@ fn is_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static WAL_TIMEOUT_SEEN: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
 fn enable_wal(conn: &Connection, timeout: Duration) -> Result<(), StoreError> {
+    #[cfg(test)]
+    WAL_TIMEOUT_SEEN.with(|seen| seen.set(Some(timeout)));
     let deadline = Instant::now() + timeout;
     let mut pause = Duration::from_millis(2);
     loop {
@@ -1501,6 +1508,7 @@ CREATE TABLE attempts (
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("released.db");
         let holder = hold_exclusive_lock(&path);
+        let started = Instant::now();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
             holder.execute_batch("COMMIT").unwrap();
@@ -1508,6 +1516,11 @@ CREATE TABLE attempts (
         let waiter = Connection::open(&path).unwrap();
         waiter.busy_timeout(Duration::ZERO).unwrap();
         enable_wal(&waiter, Duration::from_secs(5)).expect("must retry until the lock is gone");
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "returned after {:?}, before the lock was released",
+            started.elapsed()
+        );
         releaser.join().unwrap();
         let mode: String = waiter
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -1594,11 +1607,18 @@ CREATE TABLE attempts (
         let result = within_ten_seconds(move || {
             Store::open_with_busy_timeout(&path, Duration::from_millis(100)).map(|_| ())
         });
-        assert!(result.is_err());
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "waited {:?} instead of about 100 ms",
-            started.elapsed()
+            matches!(&result, Err(StoreError::Sqlite(inner)) if is_busy(inner)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "gave up after {elapsed:?}, before the 100 ms timeout"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100) + Duration::from_secs(3),
+            "waited {elapsed:?} instead of about 100 ms"
         );
         drop(holder);
     }
@@ -1611,6 +1631,7 @@ CREATE TABLE attempts (
         reader
             .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1); BEGIN; SELECT * FROM t;")
             .unwrap();
+        let started = Instant::now();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             reader.execute_batch("COMMIT").unwrap();
@@ -1619,6 +1640,11 @@ CREATE TABLE attempts (
             Store::open_with_busy_timeout(&path, Duration::from_secs(5))
         })
         .expect("open must keep retrying the WAL switch until the reader is gone");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "opened after {:?}, before the reader released",
+            started.elapsed()
+        );
         releaser.join().unwrap();
         assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
     }
@@ -1628,6 +1654,7 @@ CREATE TABLE attempts (
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("released-open.db");
         let holder = hold_exclusive_lock(&path);
+        let started = Instant::now();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             holder.execute_batch("COMMIT").unwrap();
@@ -1636,8 +1663,90 @@ CREATE TABLE attempts (
             Store::open_with_busy_timeout(&path, Duration::from_secs(5))
         })
         .expect("open must wait for the lock instead of giving up");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "opened after {:?}, before the lock was released",
+            started.elapsed()
+        );
         releaser.join().unwrap();
         assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn open_passes_its_timeout_to_the_wal_switch_and_in_memory_stores_skip_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(1234);
+        WAL_TIMEOUT_SEEN.with(|seen| seen.set(None));
+        drop(Store::open_with_busy_timeout(&dir.path().join("a.db"), timeout).unwrap());
+        assert_eq!(WAL_TIMEOUT_SEEN.with(|seen| seen.get()), Some(timeout));
+
+        WAL_TIMEOUT_SEEN.with(|seen| seen.set(None));
+        drop(Store::open(&dir.path().join("b.db")).unwrap());
+        assert_eq!(WAL_TIMEOUT_SEEN.with(|seen| seen.get()), Some(BUSY_TIMEOUT));
+
+        WAL_TIMEOUT_SEEN.with(|seen| seen.set(None));
+        drop(Store::open_in_memory().unwrap());
+        drop(Store::open(Path::new(":memory:")).unwrap());
+        assert_eq!(WAL_TIMEOUT_SEEN.with(|seen| seen.get()), None);
+    }
+
+    #[test]
+    fn a_pr_subject_is_read_back_from_a_file_store_as_a_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr.db");
+        let store = Store::open(&path).unwrap();
+        let pr = Subject::pr(12).unwrap();
+        let id = store.enqueue_run("o/r", &pr, "issue", 1).unwrap().unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let run = reopened.run(id).unwrap();
+        assert_eq!(run.subject.kind(), SubjectKind::Pr);
+        assert_eq!(run.subject, pr);
+        assert_eq!(reopened.next_queued("o/r").unwrap().unwrap().subject, pr);
+        assert_eq!(SubjectKind::parse("pr").unwrap(), SubjectKind::Pr);
+        assert_eq!(SubjectKind::parse("issue").unwrap(), SubjectKind::Issue);
+        assert_eq!(SubjectKind::parse("commit").unwrap(), SubjectKind::Commit);
+    }
+
+    #[test]
+    fn a_bare_relative_database_path_resolves_against_the_current_directory() {
+        let name = format!("inchworm-no-such-{}.db", std::process::id());
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert!(!cwd.join(&name).exists());
+        assert_eq!(
+            canonical_db_path(Path::new(&name)).unwrap(),
+            cwd.join(&name)
+        );
+        assert_eq!(
+            canonical_db_path(&Path::new(".").join(&name)).unwrap(),
+            cwd.join(&name)
+        );
+    }
+
+    #[test]
+    fn canonical_db_path_keeps_a_missing_file_under_its_real_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            canonical_db_path(&dir.path().join("new.db")).unwrap(),
+            real.join("new.db")
+        );
+        let err = canonical_db_path(&dir.path().join("missing").join("new.db")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn corrupt_errors_carry_the_exact_description_and_cause() {
+        match corrupt::<&str>("pr number")("out of range") {
+            StoreError::Corrupt(text) => assert_eq!(text, "pr number: out of range"),
+            other => panic!("expected Corrupt, got {other}"),
+        }
+        let cause = u32::try_from(-1i64).unwrap_err();
+        let shown = corrupt("attempt n")(cause);
+        assert_eq!(
+            shown.to_string(),
+            "stored value is corrupt: attempt n: out of range integral type conversion attempted"
+        );
     }
 
     #[test]
@@ -1647,7 +1756,14 @@ CREATE TABLE attempts (
             "INSERT INTO attempts (run_id, n, state, started_at) VALUES (999, 1, 'dispatched', 1)",
             [],
         );
-        assert!(orphan.is_err());
+        assert!(
+            matches!(
+                &orphan,
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            ),
+            "{orphan:?}"
+        );
     }
 
     #[test]
@@ -1781,12 +1897,12 @@ CREATE TABLE attempts (
             &SHA256[..41],
             &SHA256[..63],
         ] {
-            assert!(Subject::commit(bad).is_err(), "{bad:?}");
+            assert!(is_invalid_subject(&Subject::commit(bad)), "{bad:?}");
         }
         let too_long = format!("{SHA256}0");
-        assert!(Subject::commit(&too_long).is_err());
+        assert!(is_invalid_subject(&Subject::commit(&too_long)));
         let not_hex = format!("g{}", &SHA1[1..]);
-        assert!(Subject::commit(&not_hex).is_err());
+        assert!(is_invalid_subject(&Subject::commit(&not_hex)));
         assert!(Subject::commit(SHA1).is_ok());
         assert!(Subject::commit(SHA256).is_ok());
         assert_eq!(
@@ -1800,10 +1916,19 @@ CREATE TABLE attempts (
     #[test]
     fn from_parts_only_accepts_the_canonical_spelling() {
         let upper = SHA1.to_ascii_uppercase();
-        assert!(Subject::from_parts(SubjectKind::Commit, &upper).is_err());
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Commit,
+            &upper
+        )));
         assert!(Subject::from_parts(SubjectKind::Commit, SHA1).is_ok());
-        assert!(Subject::from_parts(SubjectKind::Commit, "7").is_err());
-        assert!(Subject::from_parts(SubjectKind::Issue, SHA1).is_err());
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Commit,
+            "7"
+        )));
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Issue,
+            SHA1
+        )));
     }
 
     #[test]
@@ -1823,7 +1948,10 @@ CREATE TABLE attempts (
                 .unwrap()
                 .is_none()
         );
-        assert!(Subject::from_parts(SubjectKind::Issue, "07").is_err());
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Issue,
+            "07"
+        )));
         let lower = Subject::commit(SHA1).unwrap();
         let upper = Subject::commit(&SHA1.to_ascii_uppercase()).unwrap();
         assert!(
@@ -2052,6 +2180,10 @@ CREATE TABLE attempts (
         assert_eq!(done.pr_number, Some(42));
         assert_eq!(done.failure_class, None);
         assert_eq!(done.raw_error, None);
+    }
+
+    fn is_invalid_subject<T>(result: &Result<T, StoreError>) -> bool {
+        matches!(result, Err(StoreError::InvalidSubject(_)))
     }
 
     fn invalid_pr(result: Result<(), StoreError>) -> String {
@@ -2496,7 +2628,7 @@ CREATE TABLE attempts (
         ));
         drop(via_link);
 
-        let lock = DaemonLock::acquire(&link_dir.join("new.db")).unwrap();
+        let lock = acquire_after_release(&link_dir.join("new.db"));
         let store = Store::open(&real_dir.join("new.db")).unwrap();
         let run = running_in(&store);
         store.start_attempt(run, 2).unwrap();
@@ -2521,7 +2653,7 @@ CREATE TABLE attempts (
             Err(StoreError::AlreadyRunning(_))
         ));
         drop(first);
-        let via_link = DaemonLock::acquire(&link).unwrap();
+        let via_link = acquire_after_release(&link);
         assert!(matches!(
             DaemonLock::acquire(&real),
             Err(StoreError::AlreadyRunning(_))
@@ -2553,6 +2685,18 @@ CREATE TABLE attempts (
         assert_eq!(report.runs_requeued, 1);
     }
 
+    fn acquire_after_release(path: &Path) -> DaemonLock {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match DaemonLock::acquire(path) {
+                Err(StoreError::AlreadyRunning(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => return other.unwrap(),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn two_hard_links_to_one_database_share_one_lock() {
@@ -2578,7 +2722,7 @@ CREATE TABLE attempts (
             1
         );
         drop(first);
-        assert!(DaemonLock::acquire(&b).is_ok());
+        acquire_after_release(&b);
     }
 
     #[cfg(unix)]
@@ -2619,7 +2763,7 @@ CREATE TABLE attempts (
             Err(StoreError::AlreadyRunning(_))
         ));
         drop(first);
-        assert!(DaemonLock::acquire(&db).is_ok());
+        acquire_after_release(&db);
     }
 
     #[test]
@@ -2717,7 +2861,7 @@ CREATE TABLE attempts (
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
         drop(first);
-        assert!(DaemonLock::acquire(&db).is_ok());
+        acquire_after_release(&db);
         let missing = dir.path().join("no-such-dir").join("state.db");
         assert!(matches!(
             DaemonLock::acquire(&missing),
@@ -2824,7 +2968,7 @@ CREATE TABLE attempts (
         fn commit_ids_of_any_other_length_or_alphabet_are_rejected(
             sha in "[0-9a-f]{0,39}|[0-9a-f]{41,63}|[0-9a-f]{65,70}|[0-9a-f]{10,30}[g-z][0-9a-f]{10,30}",
         ) {
-            prop_assert!(Subject::commit(&sha).is_err());
+            prop_assert!(is_invalid_subject(&Subject::commit(&sha)));
         }
 
         #[test]
@@ -2836,7 +2980,7 @@ CREATE TABLE attempts (
             prop_assert_eq!(subject.reference(), number.to_string());
             prop_assert_eq!(Subject::from_parts(SubjectKind::Issue, subject.reference()).unwrap(), subject);
             let padded = format!("{zeros}{number}");
-            prop_assert!(Subject::from_parts(SubjectKind::Issue, &padded).is_err());
+            prop_assert!(is_invalid_subject(&Subject::from_parts(SubjectKind::Issue, &padded)));
         }
 
         #[test]
