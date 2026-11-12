@@ -32,6 +32,7 @@ pub const MAX_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_STEPS: usize = 20;
 pub const MAX_DIFF_LINES: u32 = 100_000;
 pub const MAX_LABEL_LEN: usize = 50;
+pub const MAX_NAME_LEN: usize = 64;
 pub const RUBRIC_DIR: &str = ".inchworm";
 
 /// Why a rubric path is not allowed, or `None` when it is acceptable.
@@ -106,6 +107,60 @@ pub fn valid_ref_name(name: &str) -> bool {
     }
     name.split('/')
         .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+fn flow_name_is_valid(name: &str) -> bool {
+    (1..=MAX_NAME_LEN).contains(&name.len())
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Why a `forbid_paths` entry cannot be a glob over repository-relative paths.
+///
+/// ```
+/// use inchworm::config::glob_problem;
+///
+/// assert!(glob_problem("src/{a,b}/**").is_none());
+/// assert!(glob_problem("[abc]*").is_none());
+/// assert!(glob_problem("[").is_some());
+/// assert!(glob_problem("a}").is_some());
+/// assert!(glob_problem("/etc").is_some());
+/// assert!(glob_problem("../x").is_some());
+/// ```
+pub fn glob_problem(pattern: &str) -> Option<&'static str> {
+    if pattern.starts_with('/') {
+        return Some("must be relative to the repository root");
+    }
+    if pattern.split('/').any(|part| part == "..") {
+        return Some("must not contain a `..` segment");
+    }
+    let mut chars = pattern.chars();
+    let mut braces = 0usize;
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '{' if !in_class => braces += 1,
+            '}' if !in_class => match braces.checked_sub(1) {
+                Some(rest) => braces = rest,
+                None => return Some("has a `}` without a matching `{`"),
+            },
+            _ => {}
+        }
+    }
+    if in_class {
+        return Some("has a `[` without a matching `]`");
+    }
+    if braces != 0 {
+        return Some("has a `{` without a matching `}`");
+    }
+    None
 }
 
 fn has_edge_whitespace(text: &str) -> bool {
@@ -247,6 +302,7 @@ impl FlowFile {
             return Err(ConfigError::NoFlows);
         }
         let mut names = HashSet::new();
+        let mut labels: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
         for flow in &self.flow {
             if flow.name.trim().is_empty() {
                 return Err(ConfigError::EmptyFlowName);
@@ -255,6 +311,15 @@ impl FlowFile {
                 return Err(ConfigError::DuplicateFlow(flow.name.clone()));
             }
             flow.validate()?;
+            let Trigger::Label { label } = &flow.trigger;
+            if let Some(other) = labels.insert(label.to_lowercase(), flow.name.as_str()) {
+                return Err(ConfigError::Invalid {
+                    flow: flow.name.clone(),
+                    reason: format!(
+                        "trigger label `{label}` is also used by flow `{other}`, so one issue would match both"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -262,9 +327,23 @@ impl FlowFile {
 
 impl Flow {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !flow_name_is_valid(&self.name) {
+            return Err(invalid(
+                self,
+                format!(
+                    "flow name must be 1 to {MAX_NAME_LEN} characters of letters, digits, `.`, `_` or `-` and must not start with `.`"
+                ),
+            ));
+        }
         let Trigger::Label { label } = &self.trigger;
         if label.trim().is_empty() {
             return Err(invalid(self, "trigger label must not be empty"));
+        }
+        if label.chars().any(char::is_control) {
+            return Err(invalid(
+                self,
+                "trigger label must not contain control characters",
+            ));
         }
         if has_edge_whitespace(label) || label.len() > MAX_LABEL_LEN {
             return Err(invalid(
@@ -379,6 +458,14 @@ impl Flow {
                                 "diff judge forbid_paths entries must be non-empty and trimmed",
                             ));
                         }
+                        if let Some(problem) = glob_problem(pattern) {
+                            return Err(invalid(
+                                self,
+                                format!(
+                                    "diff judge forbid_paths entry `{pattern}` is not a valid glob: it {problem}"
+                                ),
+                            ));
+                        }
                         if !seen.insert(pattern.as_str()) {
                             return Err(invalid(
                                 self,
@@ -398,6 +485,14 @@ impl Flow {
                     }
                     if model.trim().is_empty() || has_edge_whitespace(model) {
                         return Err(invalid(self, "llm judge needs a trimmed, non-empty model"));
+                    }
+                    if model.starts_with('-')
+                        || model.chars().any(|c| c.is_control() || c.is_whitespace())
+                    {
+                        return Err(invalid(
+                            self,
+                            "llm judge model must not start with `-` or contain whitespace or control characters",
+                        ));
                     }
                     if !(1..=10).contains(min_score) {
                         return Err(invalid(
@@ -660,6 +755,121 @@ mode = "draft_pr"
                 "untrimmed trigger label",
                 |f| f.trigger = Trigger::Label { label: " x".into() },
                 "trimmed",
+            ),
+            (
+                "flow name with a slash",
+                |f| f.name = "../x".into(),
+                "flow name",
+            ),
+            (
+                "flow name with a newline",
+                |f| f.name = "a\nb".into(),
+                "flow name",
+            ),
+            (
+                "flow name with a space",
+                |f| f.name = "a b".into(),
+                "flow name",
+            ),
+            (
+                "flow name starting with a dot",
+                |f| f.name = ".x".into(),
+                "flow name",
+            ),
+            (
+                "overlong flow name",
+                |f| f.name = "n".repeat(MAX_NAME_LEN + 1),
+                "flow name",
+            ),
+            (
+                "trigger label with NUL",
+                |f| {
+                    f.trigger = Trigger::Label {
+                        label: "a\0b".into(),
+                    }
+                },
+                "control character",
+            ),
+            (
+                "trigger label with a newline",
+                |f| {
+                    f.trigger = Trigger::Label {
+                        label: "a\nb".into(),
+                    }
+                },
+                "control character",
+            ),
+            (
+                "model that looks like an option",
+                |f| {
+                    if let Judge::Llm { model, .. } = llm(f) {
+                        *model = "--flag".into()
+                    }
+                },
+                "model",
+            ),
+            (
+                "model with inner whitespace",
+                |f| {
+                    if let Judge::Llm { model, .. } = llm(f) {
+                        *model = "a b".into()
+                    }
+                },
+                "model",
+            ),
+            (
+                "model with a control character",
+                |f| {
+                    if let Judge::Llm { model, .. } = llm(f) {
+                        *model = "a\u{1}b".into()
+                    }
+                },
+                "model",
+            ),
+            (
+                "forbid_paths with an unclosed bracket",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("[".into())
+                    }
+                },
+                "valid glob",
+            ),
+            (
+                "forbid_paths with an unclosed brace",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("{a,b".into())
+                    }
+                },
+                "valid glob",
+            ),
+            (
+                "forbid_paths with a stray closing brace",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("a}".into())
+                    }
+                },
+                "valid glob",
+            ),
+            (
+                "absolute forbid_paths entry",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("/etc".into())
+                    }
+                },
+                "valid glob",
+            ),
+            (
+                "forbid_paths entry with a parent segment",
+                |f| {
+                    if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                        forbid_paths.push("../x".into())
+                    }
+                },
+                "valid glob",
             ),
             (
                 "overlong trigger label",
@@ -969,6 +1179,30 @@ mode = "draft_pr"
                 f.max_attempts = 1;
                 f.retry_on.clear()
             }),
+            ("flow name of 64 characters", |f| {
+                f.name = "n".repeat(MAX_NAME_LEN)
+            }),
+            ("flow name with dot, dash and underscore", |f| {
+                f.name = "A.b_c-9".into()
+            }),
+            ("label with spaces and a colon", |f| {
+                f.trigger = Trigger::Label {
+                    label: "needs: review".into(),
+                }
+            }),
+            ("model with a colon and a dot", |f| {
+                if let Judge::Llm { model, .. } = llm(f) {
+                    *model = "gemma4:e4b-q4.K_M".into()
+                }
+            }),
+            ("globs with classes, braces and stars", |f| {
+                if let Judge::Diff { forbid_paths, .. } = diff(f) {
+                    forbid_paths.extend(
+                        ["**/*.rs", "src/{a,b}/**", "[abc]*", "a\\[b", "docs/[!x]*"]
+                            .map(String::from),
+                    )
+                }
+            }),
             ("max_attempts at the cap", |f| f.max_attempts = MAX_ATTEMPTS),
             ("timeout 1", |f| f.attempt_timeout_secs = 1),
             ("timeout at the cap", |f| {
@@ -1045,6 +1279,82 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn glob_validity_covers_classes_braces_escapes_and_nesting() {
+        for good in [
+            "**/*.rs",
+            "src/{a,b}/**",
+            "{a,{b,c}}",
+            "[abc]*",
+            "[]]",
+            "a\\[b",
+            "a\\{b",
+            "[{]",
+            "docs/[!x]*",
+            "",
+        ] {
+            assert_eq!(glob_problem(good), None, "{good:?}");
+        }
+        for (bad, expected) in [
+            ("[", "`[`"),
+            ("a[b", "`[`"),
+            ("{", "`{`"),
+            ("{a,b", "`{`"),
+            ("a}", "`}`"),
+            ("}{", "`}`"),
+            ("{a}}", "`}`"),
+            ("/etc", "relative"),
+            ("../x", "`..`"),
+            ("a/../b", "`..`"),
+        ] {
+            let got = glob_problem(bad);
+            assert!(
+                got.is_some_and(|message| message.contains(expected)),
+                "{bad:?}: expected `{expected}`, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_flows_may_not_share_a_trigger_label_ignoring_case() {
+        let mut other = base_flow();
+        other.name = "second".into();
+        let file = FlowFile {
+            flow: vec![base_flow(), other.clone()],
+        };
+        let err = file.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("second") && err.contains("trigger label"),
+            "{err}"
+        );
+
+        other.trigger = Trigger::Label {
+            label: "INCHWORM".into(),
+        };
+        let file = FlowFile {
+            flow: vec![base_flow(), other.clone()],
+        };
+        assert!(file.validate().is_err());
+
+        other.trigger = Trigger::Label {
+            label: "another".into(),
+        };
+        let file = FlowFile {
+            flow: vec![base_flow(), other],
+        };
+        assert!(file.validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_keys_inside_a_trigger_are_rejected() {
+        let text = minimal().replace(
+            "trigger = { kind = \"label\", label = \"inchworm\" }",
+            "trigger = { kind = \"label\", label = \"inchworm\", extra = 1 }",
+        );
+        assert!(FlowFile::parse(&text).is_err());
+        assert!(FlowFile::parse(&minimal()).is_ok());
+    }
+
+    #[test]
     fn rubric_paths_are_confined_to_the_inchworm_directory() {
         let accepted = [
             ".inchworm/rubric.md",
@@ -1101,7 +1411,7 @@ mode = "draft_pr"
     fn judges_strategy() -> impl Strategy<Value = Vec<Judge>> {
         let diff = (
             1u32..5000,
-            prop::collection::btree_set("[a-z./*]{1,12}", 0..3),
+            prop::collection::btree_set("[a-z*]{1,6}(/[a-z*]{1,6}){0,2}", 0..3),
         )
             .prop_map(|(max_lines, forbid_paths)| Judge::Diff {
                 max_lines,

@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{FlowFile, GlobalConfig, Judge, OutcomeMode, RUBRIC_DIR, RepoEntry};
-use crate::fsutil::read_regular_text;
+use crate::fsutil::{read_regular_text, read_text_following_symlinks};
 
 pub const PROTECTED_GLOB: &str = ".inchworm/**";
 pub const MAX_FLOWS_BYTES: u64 = 256 * 1024;
@@ -208,11 +208,11 @@ pub fn validate(config: &GlobalConfig, path_var: Option<&OsStr>) -> Report {
 
 fn is_git_repository(root: &Path) -> Result<(), &'static str> {
     let git = root.join(".git");
-    let meta = std::fs::symlink_metadata(&git).map_err(|_| "path is not a git repository")?;
+    let meta = std::fs::metadata(&git).map_err(|_| "path is not a git repository")?;
     if meta.is_dir() {
         return Ok(());
     }
-    let text = read_regular_text(&git, MAX_GITFILE_BYTES)
+    let text = read_text_following_symlinks(&git, MAX_GITFILE_BYTES)
         .map_err(|_| ".git is not a directory or a readable gitdir file")?;
     let target = text
         .trim()
@@ -590,6 +590,28 @@ mode = "draft_pr"
         std::fs::remove_file(f.root.join(".git")).unwrap();
         write(&f.root, ".git", &"x".repeat(MAX_GITFILE_BYTES as usize + 1));
         assert!(has(&run(&f), "readable gitdir file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_entry_that_is_a_symlink_to_a_gitdir_is_accepted() {
+        let f = fixture();
+        let real = f.root.parent().unwrap().join("real-gitdir");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::remove_dir_all(f.root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&real, f.root.join(".git")).unwrap();
+        assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
+
+        std::fs::remove_file(f.root.join(".git")).unwrap();
+        let gitfile = f.root.parent().unwrap().join("gitfile");
+        std::fs::write(&gitfile, format!("gitdir: {}\n", real.display())).unwrap();
+        std::os::unix::fs::symlink(&gitfile, f.root.join(".git")).unwrap();
+        assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
+
+        std::fs::remove_file(f.root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(f.root.parent().unwrap().join("gone"), f.root.join(".git"))
+            .unwrap();
+        assert!(!run(&f).is_ok());
     }
 
     #[test]

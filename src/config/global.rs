@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -66,16 +66,19 @@ fn invalid(message: impl Into<String>) -> GlobalConfigError {
 ///
 /// assert!(slug_is_valid("DominicBurkart/marigold"));
 /// assert!(slug_is_valid("o/.github"));
+/// assert!(slug_is_valid("octo_acme/x"));
 /// assert!(!slug_is_valid("../x"));
 /// assert!(!slug_is_valid("a/b/c"));
-/// assert!(!slug_is_valid("a_b/c"));
+/// assert!(!slug_is_valid("a.b/c"));
 /// ```
 pub fn slug_is_valid(slug: &str) -> bool {
     let Some((owner, name)) = slug.split_once('/') else {
         return false;
     };
     let owner_ok = (1..=39).contains(&owner.len())
-        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         && !owner.starts_with('-')
         && !owner.ends_with('-');
     let name_ok = (1..=100).contains(&name.len())
@@ -113,26 +116,30 @@ pub fn url_problem(url: &str) -> Option<&'static str> {
     if authority.contains('@') {
         return Some("must not contain credentials");
     }
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        match bracketed.split_once(']') {
-            Some((host, "")) => (host, None),
+    let (host, port, bracketed) = if let Some(inner) = authority.strip_prefix('[') {
+        match inner.split_once(']') {
+            Some((host, "")) => (host, None, true),
             Some((host, tail)) => match tail.strip_prefix(':') {
-                Some(port) => (host, Some(port)),
+                Some(port) => (host, Some(port), true),
                 None => return Some("has an invalid host"),
             },
             None => return Some("has an invalid host"),
         }
     } else {
         match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
+            Some((host, port)) => (host, Some(port), false),
+            None => (authority, None, false),
         }
     };
-    if host.is_empty()
-        || !host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
-    {
+    let host_chars_ok = if bracketed {
+        host.chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'))
+            && host.contains(':')
+    } else {
+        host.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    if !host.chars().any(|c| c.is_ascii_alphanumeric()) || !host_chars_ok {
         return Some("needs a host");
     }
     if let Some(port) = port
@@ -145,6 +152,46 @@ pub fn url_problem(url: &str) -> Option<&'static str> {
 
 fn uses_home(path: &Path) -> bool {
     path.starts_with("~")
+}
+
+/// Why `path` cannot be used as a configured location, or `None`.
+///
+/// A path must be absolute or start with `~` (a bare `~` component, so
+/// `~root/x` is relative), and must not contain a NUL byte.
+///
+/// ```
+/// use std::path::Path;
+/// use inchworm::config::path_problem;
+///
+/// assert!(path_problem(Path::new("/srv/repo")).is_none());
+/// assert!(path_problem(Path::new("~/repo")).is_none());
+/// assert!(path_problem(Path::new("repo")).is_some());
+/// assert!(path_problem(Path::new("~root/repo")).is_some());
+/// ```
+pub fn path_problem(path: &Path) -> Option<&'static str> {
+    if path.to_string_lossy().contains('\0') {
+        return Some("must not contain a NUL byte");
+    }
+    if !(path.is_absolute() || uses_home(path)) {
+        return Some("must be an absolute path or start with `~/`");
+    }
+    None
+}
+
+fn lexically_normalised(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn expand(path: &Path, home: &Path) -> PathBuf {
@@ -188,7 +235,8 @@ impl GlobalConfig {
             path: path.to_path_buf(),
             source,
         };
-        let text = crate::fsutil::read_regular_text(path, MAX_CONFIG_BYTES).map_err(io)?;
+        let text =
+            crate::fsutil::read_text_following_symlinks(path, MAX_CONFIG_BYTES).map_err(io)?;
         let config = GlobalConfig::parse(&text)?;
         let needs_home =
             uses_home(&config.nanna_bin) || config.repo.iter().any(|repo| uses_home(&repo.path));
@@ -233,10 +281,13 @@ impl GlobalConfig {
                 "poll_secs must be between 1 and {MAX_POLL_SECS}"
             )));
         }
-        if let Some(state_db) = &self.state_db
-            && state_db.to_string_lossy().trim().is_empty()
-        {
-            return Err(invalid("state_db must not be empty"));
+        if let Some(state_db) = &self.state_db {
+            if state_db.to_string_lossy().trim().is_empty() {
+                return Err(invalid("state_db must not be empty"));
+            }
+            if let Some(problem) = path_problem(state_db) {
+                return Err(invalid(format!("state_db {problem}")));
+            }
         }
         if self.repo.is_empty() {
             return Err(invalid("at least one [[repo]] is required"));
@@ -256,7 +307,10 @@ impl GlobalConfig {
             if repo.path.to_string_lossy().trim().is_empty() {
                 return Err(invalid(format!("repo `{}` has an empty path", repo.slug)));
             }
-            if !paths.insert(repo.path.clone()) {
+            if let Some(problem) = path_problem(&repo.path) {
+                return Err(invalid(format!("repo `{}` path {problem}", repo.slug)));
+            }
+            if !paths.insert(lexically_normalised(&repo.path)) {
                 return Err(invalid(format!(
                     "repo `{}` reuses the path {}",
                     repo.slug,
@@ -470,9 +524,74 @@ path = "~/code/nanna-coder"
                 "poll_secs must be between 1 and 86400",
             ),
             (
-                "slug with an underscore owner",
-                |c| c.repo[0].slug = "a_b/c".into(),
+                "slug with a dot in the owner",
+                |c| c.repo[0].slug = "a.b/c".into(),
                 "owner/name",
+            ),
+            (
+                "relative repo path",
+                |c| c.repo[0].path = "code/marigold".into(),
+                "absolute path",
+            ),
+            (
+                "tilde user repo path",
+                |c| c.repo[0].path = "~root/x".into(),
+                "absolute path",
+            ),
+            (
+                "repo path with a NUL",
+                |c| c.repo[0].path = "/a\0b".into(),
+                "NUL",
+            ),
+            (
+                "relative state_db",
+                |c| c.state_db = Some("state.db".into()),
+                "absolute path",
+            ),
+            (
+                "state_db with a NUL",
+                |c| c.state_db = Some("/a\0b".into()),
+                "NUL",
+            ),
+            (
+                "nanna_bin with a NUL",
+                |c| c.nanna_bin = "na\0nna".into(),
+                "nanna_bin",
+            ),
+            (
+                "url host that is a dot",
+                |c| c.ollama_url = "http://.".into(),
+                "needs a host",
+            ),
+            (
+                "url host that is a dash",
+                |c| c.ollama_url = "http://-".into(),
+                "needs a host",
+            ),
+            (
+                "url with an unbracketed ipv6 address",
+                |c| c.ollama_url = "http://::1".into(),
+                "needs a host",
+            ),
+            (
+                "url host with two colons",
+                |c| c.ollama_url = "http://a:b:11434".into(),
+                "needs a host",
+            ),
+            (
+                "empty bracketed host",
+                |c| c.ollama_url = "http://[]".into(),
+                "needs a host",
+            ),
+            (
+                "the same repo reached by two lexically different paths",
+                |c| c.repo[1].path = "/home/dominic/code/../code/marigold".into(),
+                "reuses the path",
+            ),
+            (
+                "the same repo with a dot segment",
+                |c| c.repo[1].path = "/home/dominic/./code/marigold/".into(),
+                "reuses the path",
             ),
             (
                 "slugs differing only in case",
@@ -527,6 +646,19 @@ path = "~/code/nanna-coder"
             ("bare command name", |c| c.nanna_bin = "nanna".into()),
             ("https url", |c| {
                 c.ollama_url = "https://ollama.example.com/api".into()
+            }),
+            ("underscore in a slug owner", |c| {
+                c.repo[0].slug = "octo_acme/x".into()
+            }),
+            ("underscore in the url host", |c| {
+                c.ollama_url = "http://ollama_srv:11434".into()
+            }),
+            ("tilde repo path", |c| {
+                c.repo[0].path = "~/code/marigold".into()
+            }),
+            ("tilde state_db", |c| c.state_db = Some("~/s.db".into())),
+            ("two different absolute repos", |c| {
+                c.repo[1].path = "/home/dominic/code/other".into()
             }),
             ("ipv6 url", |c| c.ollama_url = "http://[::1]:11434".into()),
             ("ipv6 url without a port", |c| {
@@ -673,6 +805,30 @@ path = "~/code/nanna-coder"
         let no_tilde = "nanna_bin = \"/bin/nanna\"\n[[repo]]\nslug = \"a/b\"\npath = \"/x\"\n";
         std::fs::write(&path, no_tilde).unwrap();
         assert!(GlobalConfig::load(&path, None).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_follows_a_symlinked_config_but_still_needs_a_regular_bounded_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, FULL).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let config = GlobalConfig::load(&link, Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(config.repo.len(), 2);
+
+        let to_dir = dir.path().join("to-dir.toml");
+        std::os::unix::fs::symlink(dir.path(), &to_dir).unwrap();
+        let err = GlobalConfig::load(&to_dir, None).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let big = dir.path().join("big.toml");
+        std::fs::write(&big, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        let to_big = dir.path().join("to-big.toml");
+        std::os::unix::fs::symlink(&big, &to_big).unwrap();
+        let err = GlobalConfig::load(&to_big, None).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
     }
 
     #[test]
