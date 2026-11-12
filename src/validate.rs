@@ -325,6 +325,27 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn a_malformed_forbid_paths_glob_is_an_error_before_any_agent_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        let broken = FLOWS.replace(
+            "[flow.outcome]",
+            "[[flow.judge]]\nkind = \"diff\"\nmax_lines = 10\nforbid_paths = [\"[\"]\n\n[flow.outcome]",
+        );
+        assert_ne!(broken, FLOWS);
+        write(dir.path(), ".inchworm/flows.toml", &broken);
+        let report = validate(&config_for(dir.path()));
+        assert!(!report.is_ok());
+        assert!(
+            messages(&report)
+                .iter()
+                .any(|m| m.contains("forbid_paths") && m.contains("[")),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[test]
     fn a_missing_rubric_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         good_repo(dir.path());

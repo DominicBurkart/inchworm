@@ -220,6 +220,10 @@ impl Flow {
                         return Err(invalid(self, "llm judge min_score must be at most 10"));
                     }
                 }
+                Judge::Diff { forbid_paths, .. } => {
+                    crate::judges::compile_forbid_paths(forbid_paths)
+                        .map_err(|reason| invalid(self, reason))?;
+                }
                 _ => {}
             }
         }
@@ -461,18 +465,39 @@ mode = "draft_pr"
         assert!(err_text(&empty_check).contains("empty names"));
     }
 
+    #[test]
+    fn malformed_or_empty_forbid_paths_globs_are_rejected_at_load() {
+        for bad in ["[", "a/[b", "{a,b", "[z-a]", ""] {
+            let text = FULL.replace(
+                "forbid_paths = [\"publish.sh\", \".github/**\"]",
+                &format!("forbid_paths = [\"publish.sh\", \"{bad}\"]"),
+            );
+            let message = err_text(&text);
+            assert!(message.contains("forbid_paths"), "{bad}: {message}");
+        }
+        for good in ["[!a]*", "{a,b}.rs", "a\\\\.rs", "**/x", ".github"] {
+            let text = FULL.replace(
+                "forbid_paths = [\"publish.sh\", \".github/**\"]",
+                &format!("forbid_paths = [\"{good}\"]"),
+            );
+            assert!(FlowFile::parse(&text).is_ok(), "{good}");
+        }
+    }
+
     fn name_strategy() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_-]{0,10}".prop_map(String::from)
     }
 
     fn judge_strategy() -> impl Strategy<Value = Judge> {
         prop_oneof![
-            (1u32..5000, prop::collection::vec("[a-z./*]{1,12}", 0..3)).prop_map(
-                |(max_lines, forbid_paths)| Judge::Diff {
+            (
+                1u32..5000,
+                prop::collection::vec("([a-z]{1,4}/){0,2}(\\*\\*|\\*|[a-z.]{1,4})", 0..3)
+            )
+                .prop_map(|(max_lines, forbid_paths)| Judge::Diff {
                     max_lines,
                     forbid_paths
-                }
-            ),
+                }),
             Just(Judge::NannaClean {}),
             ("[a-z./]{1,12}", name_strategy(), 0u8..=10).prop_map(|(rubric, model, min_score)| {
                 Judge::Llm {
