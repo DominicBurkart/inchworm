@@ -32,7 +32,7 @@ impl Dispatcher for NannaClient {
     }
 
     fn is_usable(&self) -> bool {
-        !self.is_dead()
+        NannaClient::is_usable(self)
     }
 }
 

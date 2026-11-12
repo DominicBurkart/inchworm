@@ -1,5 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -300,6 +302,55 @@ fn a_server_initiated_message_that_reuses_our_id_is_not_taken_as_the_response() 
     let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), io::sink());
     let init = client.initialize().unwrap();
     assert_eq!(init["protocolVersion"], PROTOCOL_VERSION);
+}
+
+#[test]
+fn an_interrupt_cancels_the_running_task_and_reports_it_cancelled() {
+    let (mut client, mut fake) = connect(vec![Scenario::Hang]);
+    client.initialize().unwrap();
+    let flag = Arc::new(AtomicBool::new(true));
+    client.set_interrupt(Arc::clone(&flag));
+    let outcome = client.run_task(&request("x"), WAIT).unwrap();
+    assert_eq!(outcome, TaskOutcome::Cancelled);
+    assert!(!client.is_dead());
+    drop(client);
+    fake.settle();
+    assert!(fake.methods().contains(&"tasks/cancel".to_string()));
+}
+
+#[test]
+fn an_interrupt_raised_while_waiting_is_noticed_within_a_poll_slice() {
+    let (mut client, _fake) = connect(vec![Scenario::Hang]);
+    client.initialize().unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    client.set_interrupt(Arc::clone(&flag));
+    let raiser = {
+        let flag = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            flag.store(true, Ordering::SeqCst);
+        })
+    };
+    let started = Instant::now();
+    let outcome = client.run_task(&request("x"), WAIT).unwrap();
+    raiser.join().unwrap();
+    assert_eq!(outcome, TaskOutcome::Cancelled);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn an_interrupted_client_is_not_usable_for_another_attempt() {
+    let (mut client, _fake) = connect(vec![]);
+    let flag = Arc::new(AtomicBool::new(false));
+    client.set_interrupt(Arc::clone(&flag));
+    assert!(client.is_usable());
+    flag.store(true, Ordering::SeqCst);
+    assert!(!client.is_usable());
+    assert!(!client.is_dead());
 }
 
 #[test]

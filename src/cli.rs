@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -99,6 +101,20 @@ fn validate_command(config: GlobalConfig, tools: &Tools, online: bool, build_ima
     report.is_ok()
 }
 
+fn install_interrupt() -> Result<Arc<AtomicBool>> {
+    static INSTALLED: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+    let mut installed = INSTALLED.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(flag) = installed.as_ref() {
+        return Ok(Arc::clone(flag));
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&flag);
+    ctrlc::set_handler(move || handler_flag.store(true, Ordering::SeqCst))
+        .context("cannot install the SIGINT/SIGTERM handler")?;
+    *installed = Some(Arc::clone(&flag));
+    Ok(flag)
+}
+
 fn run_command(
     config: GlobalConfig,
     tools: &Tools,
@@ -133,6 +149,7 @@ fn run_command(
         SpawnOptions::new(config.nanna_bin.clone(), state_dir_for(&config.state_db));
     let mut client = NannaClient::spawn(&spawn_options)
         .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
+    client.set_interrupt(install_interrupt()?);
     client.initialize()?;
 
     let clock = now;

@@ -2,7 +2,8 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -197,6 +198,8 @@ pub const MAX_NOISE_LINES_PER_EXCHANGE: u64 = 1000;
 
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+const INTERRUPT_SLICE: Duration = Duration::from_millis(100);
+
 const CANCEL_ON_DROP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +344,7 @@ pub struct NannaClient {
     queue_file: Option<PathBuf>,
     active_task: Option<String>,
     shutdown_grace: Duration,
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl NannaClient {
@@ -356,6 +360,32 @@ impl NannaClient {
             queue_file: None,
             active_task: None,
             shutdown_grace: SHUTDOWN_GRACE,
+            interrupt: None,
+        }
+    }
+
+    pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
+        self.interrupt = Some(flag);
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    pub fn is_usable(&self) -> bool {
+        !self.dead && !self.interrupted()
+    }
+
+    fn pause(&self, total: Duration) {
+        let end = Instant::now() + total;
+        loop {
+            let now = Instant::now();
+            if self.interrupted() || now >= end {
+                return;
+            }
+            std::thread::sleep((end - now).min(INTERRUPT_SLICE));
         }
     }
 
@@ -620,12 +650,15 @@ impl NannaClient {
         };
         let mut current = info;
         while !current.state.is_terminal() {
+            if self.interrupted() {
+                let _ = self.cancel(&current.task_id);
+                return Ok(TaskOutcome::Cancelled);
+            }
             let now = Instant::now();
             if now >= deadline {
                 return self.cancel_or_collect(&current.task_id);
             }
-            let pause = Duration::from_millis(current.poll_interval_ms).min(deadline - now);
-            std::thread::sleep(pause);
+            self.pause(Duration::from_millis(current.poll_interval_ms).min(deadline - now));
             current = self.get(&current.task_id)?;
         }
         self.result(&current.task_id, current.state)

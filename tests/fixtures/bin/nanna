@@ -15,7 +15,8 @@ while read -r line; do
   id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
   case "$line" in
     *'"method":"initialize"'*) reply "$id" initialize_result ;;
-    *'"method":"tools/call"'*) reply "$id" create_task_result ;;
+    *'"method":"tools/call"'*) : > "$D/started"; reply "$id" create_task_result ;;
+    *'"method":"tasks/cancel"'*) : > "$D/cancelled"; reply "$id" task_cancelled ;;
     *'"method":"tasks/get"'*) reply "$id" "$STATE" ;;
     *'"method":"tasks/result"'*) reply "$id" "$RESULT" ;;
   esac

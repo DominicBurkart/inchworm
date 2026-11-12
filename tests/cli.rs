@@ -321,3 +321,82 @@ fn run_fails_cleanly_when_nanna_cannot_start_or_flows_are_missing() {
         .code(2)
         .stderr(predicates_contains("cannot read"));
 }
+
+#[cfg(unix)]
+fn run_and_signal(signal: &str) -> (Option<i32>, String, Fakes) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let fakes = fakes();
+    fakes.set("state", "task_working");
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("inchworm"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fakes.bin().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = fakes.bin().join("started");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "the task never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inchworm did not stop after {signal}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    (exit.code(), stdout, fakes)
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_the_task_and_ends_the_run_as_cancelled() {
+    let (code, stdout, fakes) = run_and_signal("INT");
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.contains("failure: cancelled"), "{stdout}");
+    assert!(
+        fakes.bin().join("cancelled").exists(),
+        "nanna was never asked to cancel"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_cancels_the_task_and_ends_the_run_as_cancelled() {
+    let (code, stdout, fakes) = run_and_signal("TERM");
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.contains("failure: cancelled"), "{stdout}");
+    assert!(
+        fakes.bin().join("cancelled").exists(),
+        "nanna was never asked to cancel"
+    );
+}
