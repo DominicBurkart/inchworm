@@ -2792,6 +2792,67 @@ CREATE TABLE attempts (
         }
     }
 
+    fn lock_io(result: Result<DaemonLock, StoreError>) -> (PathBuf, std::io::Error) {
+        match result {
+            Err(StoreError::LockIo { path, source }) => (path, source),
+            other => panic!("expected LockIo, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_as_the_database_path_is_a_lock_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let err = canonical_db_path(&a).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+        let (path, source) = lock_io(DaemonLock::acquire(&a));
+        assert_eq!(path, a);
+        assert_eq!(source.raw_os_error(), Some(libc::ELOOP), "{source}");
+        assert!(matches!(Store::open(&a), Err(StoreError::Sqlite(_))));
+    }
+
+    #[test]
+    fn a_path_ending_in_dot_dot_below_a_missing_directory_has_no_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join("nonexistent").join("..");
+        let err = canonical_db_path(&odd).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "the database path has no file name");
+        let (path, source) = lock_io(DaemonLock::acquire(&odd));
+        assert_eq!(path, odd);
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_place_of_the_database_file_is_a_lock_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        std::fs::create_dir(&db).unwrap();
+        let (path, source) = lock_io(DaemonLock::acquire(&db));
+        assert_eq!(path, db.canonicalize().unwrap());
+        assert_eq!(source.raw_os_error(), Some(libc::EISDIR), "{source}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_named_like_the_old_side_file_does_not_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        std::fs::create_dir(dir.path().join("state.db.daemon.lock")).unwrap();
+        let first = DaemonLock::acquire(&db).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&db),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+    }
+
     #[test]
     fn recovery_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
