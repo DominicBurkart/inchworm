@@ -45,6 +45,17 @@ impl Scenario {
         Scenario::Success { result }
     }
 
+    pub fn success_with_format_patch(patch: &str, files: &[&str]) -> Scenario {
+        let mut result = fixture("result_success");
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        let mut body: Value = serde_json::from_str(&text).unwrap();
+        body["changes_patch"] = Value::Null;
+        body["format_patch"] = json!(patch);
+        body["files_modified"] = json!(files);
+        result["content"][0]["text"] = json!(body.to_string());
+        Scenario::Success { result }
+    }
+
     pub fn success_empty() -> Scenario {
         let mut result = fixture("result_success");
         let text = result["content"][0]["text"].as_str().unwrap().to_string();

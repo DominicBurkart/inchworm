@@ -727,6 +727,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bare_old_and_new_file_lines_are_scanned_and_quoted_headers_report_a_clean_path() {
+        let minus = "--- a/.inchworm/x\n";
+        assert_eq!(protected_paths_in(&[], &[Some(minus)]), [".inchworm/x"]);
+        let plus = "+++ b/.inchworm/y\n";
+        assert_eq!(protected_paths_in(&[], &[Some(plus)]), [".inchworm/y"]);
+        let quoted = "diff --git \"a/.inchworm/x\" \"b/.inchworm/x\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(quoted)]), [".inchworm/x"]);
+        let quoted_minus = "--- \"a/.inchworm/z\"\n";
+        assert_eq!(
+            protected_paths_in(&[], &[Some(quoted_minus)]),
+            [".inchworm/z"]
+        );
+    }
+
+    #[test]
+    fn protected_output_that_only_appears_in_the_format_patch_is_rejected() {
+        let format_patch = "From abc Mon Sep 17 00:00:00 2001\nSubject: x\n\n---\n .inchworm/flows.toml | 1 +\ndiff --git a/.inchworm/flows.toml b/.inchworm/flows.toml\n";
+        let (mut client, fake) = connect(vec![
+            Scenario::success_with_format_patch(format_patch, &["src/a.rs"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(
+                outcome,
+                FlowOutcome::Failed {
+                    class: FailureClass::ProtectedPathViolation,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(fake.assigned().len(), 1);
+    }
+
+    #[test]
+    fn a_format_patch_is_handed_to_the_next_step_when_there_is_no_changes_patch() {
+        let (mut client, fake) = connect(vec![
+            Scenario::success_with_format_patch("FORMAT PATCH BODY", &["a.rs"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let text = fake.assigned()[1]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("Patch:\nFORMAT PATCH BODY"), "{text}");
+    }
+
+    struct Recording<'a> {
+        client: &'a mut NannaClient,
+        timeouts: Vec<Duration>,
+        pause: Duration,
+    }
+
+    impl Dispatcher for Recording<'_> {
+        fn dispatch(
+            &mut self,
+            request: &AssignRequest,
+            timeout: Duration,
+        ) -> Result<TaskOutcome, ClientError> {
+            self.timeouts.push(timeout);
+            std::thread::sleep(self.pause);
+            self.client.dispatch(request, timeout)
+        }
+    }
+
+    #[test]
+    fn the_attempt_budget_is_shared_across_steps() {
+        let mut f = two_steps();
+        f.attempt_timeout_secs = 10;
+        let (mut client, _fake) = connect(vec![
+            Scenario::success_with_patch("diff --git a/a b/a\n", &["a"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let mut recording = Recording {
+            client: &mut client,
+            timeouts: Vec::new(),
+            pause: Duration::from_millis(150),
+        };
+        let outcome = run_flow(&f, &input(None), &mut recording);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(recording.timeouts.len(), 2);
+        assert!(recording.timeouts[0] <= Duration::from_secs(10));
+        assert!(
+            recording.timeouts[1] + Duration::from_millis(140) <= recording.timeouts[0],
+            "{:?}",
+            recording.timeouts
+        );
+    }
+
     struct Scripted(VecDeque<Result<TaskOutcome, ClientError>>);
 
     impl Dispatcher for Scripted {
