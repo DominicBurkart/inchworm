@@ -440,9 +440,34 @@ impl NannaClient {
             }
             let pause = Duration::from_millis(current.poll_interval_ms).min(deadline - now);
             std::thread::sleep(pause);
-            current = self.get(&current.task_id)?;
+            current = match self.get(&current.task_id) {
+                Ok(next) => next,
+                Err(err) => {
+                    self.cancel_after_timeout(&current.task_id, &err);
+                    return Err(err);
+                }
+            };
         }
-        self.result(&current.task_id, current.state)
+        match self.result(&current.task_id, current.state) {
+            Err(err) => {
+                self.cancel_after_timeout(&current.task_id, &err);
+                Err(err)
+            }
+            done => done,
+        }
+    }
+
+    fn cancel_after_timeout(&mut self, task_id: &str, err: &ClientError) {
+        if matches!(err, ClientError::ReadTimeout(_)) {
+            self.next_id += 1;
+            let id = self.next_id;
+            let _ = self.send(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tasks/cancel",
+                "params": {"taskId": task_id}
+            }));
+        }
     }
 }
 

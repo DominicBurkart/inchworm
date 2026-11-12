@@ -122,19 +122,22 @@ fn report_command(
     Ok(true)
 }
 
-async fn termination_signal() {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("a SIGTERM handler can be installed");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
-    }
+fn termination_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
 }
 
-fn daemon_command(
+fn daemon_command<S: std::future::Future<Output = ()>>(
     config: GlobalConfig,
     tools: &Tools,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl FnOnce() -> std::io::Result<S>,
 ) -> Result<bool> {
     drop(open_store(&config)?);
     let settings = DaemonSettings::from_config(&config);
@@ -147,6 +150,8 @@ fn daemon_command(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let _entered = runtime.enter();
+    let shutdown = shutdown().context("cannot install the termination signal handlers")?;
     runtime.block_on(run_daemon(settings, deps, shutdown))?;
     Ok(true)
 }
@@ -290,7 +295,7 @@ pub fn execute(cli: Cli, tools: &Tools) -> Result<bool> {
             })
         }
         Command::Daemon { config } => {
-            daemon_command(load_config(config, tools)?, tools, termination_signal())
+            daemon_command(load_config(config, tools)?, tools, termination_signal)
         }
         Command::Run {
             repo,
@@ -492,8 +497,21 @@ mod tests {
     fn the_daemon_starts_polls_and_stops_on_shutdown() {
         let env = env();
         let config = GlobalConfig::load(&env.config, &env.tools.home).unwrap();
-        assert!(daemon_command(config, &env.tools, std::future::ready(())).unwrap());
+        assert!(daemon_command(config, &env.tools, || Ok(std::future::ready(()))).unwrap());
         assert!(env.dir.path().join("state/state.db").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sigterm_sent_before_the_shutdown_future_is_first_polled_is_not_lost() {
+        let shutdown = termination_signal().unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("the SIGTERM was handled");
     }
 
     #[test]

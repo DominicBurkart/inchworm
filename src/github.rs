@@ -156,6 +156,8 @@ fn parse_pr_state(state: &str) -> PrState {
     }
 }
 
+pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct GhCli<R: Runner = SystemRunner> {
     runner: R,
     program: String,
@@ -163,12 +165,12 @@ pub struct GhCli<R: Runner = SystemRunner> {
 
 impl GhCli<SystemRunner> {
     pub fn new() -> Self {
-        GhCli::with_runner(SystemRunner)
+        GhCli::with_runner(SystemRunner::with_timeout(GH_TIMEOUT))
     }
 
     pub fn with_program(program: impl Into<String>) -> Self {
         GhCli {
-            runner: SystemRunner,
+            runner: SystemRunner::with_timeout(GH_TIMEOUT),
             program: program.into(),
         }
     }

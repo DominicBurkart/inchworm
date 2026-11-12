@@ -23,7 +23,7 @@ pub struct NannaCatalog<R: Runner = SystemRunner> {
 
 impl NannaCatalog<SystemRunner> {
     pub fn new(nanna_bin: &Path) -> Self {
-        NannaCatalog::with_runner(SystemRunner, nanna_bin)
+        NannaCatalog::with_runner(SystemRunner::default(), nanna_bin)
     }
 }
 
@@ -73,12 +73,12 @@ pub struct NixBuilder<R: Runner = SystemRunner> {
 
 impl NixBuilder<SystemRunner> {
     pub fn new() -> Self {
-        NixBuilder::with_runner(SystemRunner)
+        NixBuilder::with_runner(SystemRunner::default())
     }
 
     pub fn with_program(program: impl Into<String>) -> Self {
         NixBuilder {
-            runner: SystemRunner,
+            runner: SystemRunner::default(),
             program: program.into(),
         }
     }

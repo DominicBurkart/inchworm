@@ -138,11 +138,31 @@ impl DispatcherFactory for NannaFactory {
     }
 }
 
-struct Unavailable(String);
+struct Reconnecting {
+    factory: Arc<dyn DispatcherFactory>,
+    inner: Option<Box<dyn Dispatcher>>,
+}
 
-impl Dispatcher for Unavailable {
-    fn dispatch(&mut self, _: &AssignRequest, _: Duration) -> Result<TaskOutcome, ClientError> {
-        Err(ClientError::Protocol(self.0.clone()))
+impl Dispatcher for Reconnecting {
+    fn dispatch(
+        &mut self,
+        request: &AssignRequest,
+        timeout: Duration,
+    ) -> Result<TaskOutcome, ClientError> {
+        if self.inner.is_none() {
+            match self.factory.make() {
+                Ok(dispatcher) => self.inner = Some(dispatcher),
+                Err(message) => return Err(ClientError::Protocol(message)),
+            }
+        }
+        let result = match self.inner.as_mut() {
+            Some(dispatcher) => dispatcher.dispatch(request, timeout),
+            None => return Err(ClientError::Protocol("no dispatcher".into())),
+        };
+        if result.is_err() {
+            self.inner = None;
+        }
+        result
     }
 }
 
@@ -178,17 +198,21 @@ async fn process(
     scheduler: &Scheduler<Job>,
     ci: CiPolicy,
     _lease: crate::scheduler::Lease<Job>,
-) {
+) -> Option<Job> {
     let repo = &job.repo;
     let file = match load_flows(repo) {
         Ok(file) => file,
-        Err(err) => return log(&format!("{}: {err}", repo.slug)),
+        Err(err) => {
+            log(&format!("{}: {err}; will retry", repo.slug));
+            return Some(job);
+        }
     };
     let Some(flow) = file.flow.iter().find(|flow| flow.name == job.flow) else {
-        return log(&format!(
+        log(&format!(
             "{}: run {} uses flow `{}` which is no longer configured",
             repo.slug, job.run_id, job.flow
         ));
+        return None;
     };
     let ctx = RunContext {
         store,
@@ -203,17 +227,18 @@ async fn process(
         ci,
         human_gate: HumanGate::NotConsulted,
     };
-    let mut dispatcher = deps
-        .dispatchers
-        .make()
-        .unwrap_or_else(|err| Box::new(Unavailable(err)));
-    match execute_run(&ctx, &env, flow, job.run_id, dispatcher.as_mut(), None).await {
+    let mut dispatcher = Reconnecting {
+        factory: Arc::clone(&deps.dispatchers),
+        inner: None,
+    };
+    match execute_run(&ctx, &env, flow, job.run_id, &mut dispatcher, None).await {
         Ok(summary) => log(&format!(
             "{}: run {} finished as {}",
             repo.slug, job.run_id, summary.state
         )),
         Err(err) => log(&format!("{}: run {} errored: {err}", repo.slug, job.run_id)),
     }
+    None
 }
 
 async fn worker(
@@ -223,13 +248,23 @@ async fn worker(
     scheduler: Scheduler<Job>,
     stop: Arc<Notify>,
 ) {
+    let mut deferred: Vec<Job> = Vec::new();
     loop {
         let lease = tokio::select! {
             () = stop.notified() => return,
             lease = scheduler.next() => lease,
+            () = deps.clock.sleep(settings.poll), if !deferred.is_empty() => {
+                for job in deferred.drain(..) {
+                    let repo = job.repo.slug.clone();
+                    scheduler.enqueue(&repo, job);
+                }
+                continue;
+            }
         };
         let job = lease.item().clone();
-        process(job, &store, &deps, &scheduler, settings.ci, lease).await;
+        if let Some(retry) = process(job, &store, &deps, &scheduler, settings.ci, lease).await {
+            deferred.push(retry);
+        }
     }
 }
 
@@ -293,6 +328,23 @@ fn poll_repo(
     Ok(())
 }
 
+fn poll_all(
+    settings: &DaemonSettings,
+    deps: &DaemonDeps,
+    scheduler: &Scheduler<Job>,
+    unswapped: &mut Unswapped,
+) {
+    let store = match Store::open(&settings.state_db) {
+        Ok(store) => store,
+        Err(err) => return log(&format!("cannot open the state database to poll: {err}")),
+    };
+    for repo in &settings.repos {
+        if let Err(err) = poll_repo(repo, &store, deps, scheduler, unswapped) {
+            log(&format!("{}: {err}", repo.slug));
+        }
+    }
+}
+
 fn resume(
     settings: &DaemonSettings,
     store: &Store,
@@ -312,7 +364,14 @@ fn resume(
         RunState::Judging,
     ])?;
     for run in open {
-        if let Some(repo) = settings.repos.iter().find(|repo| repo.slug == run.repo) {
+        let Some(repo) = settings.repos.iter().find(|repo| repo.slug == run.repo) else {
+            log(&format!(
+                "run {} ({}#{}) belongs to a repo that is no longer configured; leaving it as {}",
+                run.id, run.repo, run.issue, run.state
+            ));
+            continue;
+        };
+        {
             log(&format!(
                 "resuming run {} ({}#{})",
                 run.id, run.repo, run.issue
@@ -363,9 +422,25 @@ pub async fn run_daemon(
     tokio::pin!(shutdown);
     let mut unswapped = Unswapped::new();
     let outcome = loop {
-        for repo in &settings.repos {
-            if let Err(err) = poll_repo(repo, &store, &deps, &scheduler, &mut unswapped) {
-                log(&format!("{}: {err}", repo.slug));
+        let (done, finished) = tokio::sync::oneshot::channel();
+        {
+            let settings = settings.clone();
+            let deps = Arc::clone(&deps);
+            let scheduler = scheduler.clone();
+            let mut taken = std::mem::take(&mut unswapped);
+            std::thread::spawn(move || {
+                poll_all(&settings, &deps, &scheduler, &mut taken);
+                let _ = done.send(taken);
+            });
+        }
+        tokio::select! {
+            () = &mut shutdown => break Ok(()),
+            taken = finished => {
+                if let Ok(taken) = taken {
+                    unswapped = taken;
+                } else {
+                    log("a poll cycle died; starting over");
+                }
             }
         }
         if handle.is_finished() {
@@ -841,6 +916,131 @@ required_checks = ["build"]
         assert_eq!(store.run(run).unwrap().state, RunState::Running);
     }
 
+    struct HungRunner;
+
+    impl crate::exec::Runner for HungRunner {
+        fn run(&self, _: &crate::exec::CmdSpec) -> std::io::Result<crate::exec::CmdOutput> {
+            std::thread::sleep(Duration::from_secs(30));
+            Err(std::io::Error::other("hung"))
+        }
+    }
+
+    #[test]
+    fn a_stop_request_ends_the_daemon_promptly_even_while_gh_is_hung() {
+        let rig = Rig::new(FLOWS);
+        let deps = DaemonDeps {
+            github: Arc::new(crate::github::GhCli::with_runner(HungRunner)),
+            clock: Arc::new(SystemClock),
+            dispatchers: Arc::new(ScriptedFactory::default()),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let stop = Arc::new(Notify::new());
+        let signal = Arc::clone(&stop);
+        let settings = rig.settings();
+        let handle = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_daemon(settings, deps, async move {
+                    signal.notified().await;
+                }))
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        let started = Instant::now();
+        stop.notify_one();
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    struct Flaky(bool);
+
+    impl Dispatcher for Flaky {
+        fn dispatch(&mut self, _: &AssignRequest, _: Duration) -> Result<TaskOutcome, ClientError> {
+            if self.0 {
+                Err(ClientError::ReadTimeout(Duration::from_millis(1)))
+            } else {
+                Ok(TaskOutcome::TimedOut)
+            }
+        }
+    }
+
+    struct FlakyFactory(Mutex<usize>);
+
+    impl DispatcherFactory for FlakyFactory {
+        fn make(&self) -> Result<Box<dyn Dispatcher>, String> {
+            let mut made = self.0.lock().unwrap();
+            *made += 1;
+            Ok(Box::new(Flaky(*made == 1)))
+        }
+    }
+
+    fn assign() -> AssignRequest {
+        AssignRequest {
+            description: "d".into(),
+            repo_path: PathBuf::from("/r"),
+            identity: "i".into(),
+            branch: "b".into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_dispatch_drops_the_client_so_the_next_attempt_gets_a_fresh_one() {
+        let factory = Arc::new(FlakyFactory(Mutex::new(0)));
+        let mut dispatcher = Reconnecting {
+            factory: Arc::clone(&factory) as Arc<dyn DispatcherFactory>,
+            inner: None,
+        };
+        let timeout = Duration::from_secs(1);
+        assert!(matches!(
+            dispatcher.dispatch(&assign(), timeout),
+            Err(ClientError::ReadTimeout(_))
+        ));
+        assert!(matches!(
+            dispatcher.dispatch(&assign(), timeout),
+            Ok(TaskOutcome::TimedOut)
+        ));
+        assert!(dispatcher.dispatch(&assign(), timeout).is_ok());
+        assert_eq!(*factory.0.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_factory_failure_is_reported_on_every_dispatch_and_retried() {
+        let factory = Arc::new(ScriptedFactory {
+            failure: Some("cannot start".into()),
+            ..ScriptedFactory::default()
+        });
+        let mut dispatcher = Reconnecting {
+            factory: Arc::clone(&factory) as Arc<dyn DispatcherFactory>,
+            inner: None,
+        };
+        for _ in 0..2 {
+            let err = dispatcher
+                .dispatch(&assign(), Duration::from_secs(1))
+                .unwrap_err();
+            assert!(err.to_string().contains("cannot start"));
+        }
+        assert_eq!(*factory.made.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_queued_run_waits_out_an_unreadable_flows_file_instead_of_stalling_until_restart() {
+        let rig = Rig::new("not toml at all [");
+        let store = rig.store();
+        store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        drop(store);
+        rig.green(77, 5, 1, SHA);
+        let running = rig.start(rig.settings(), ScriptedFactory::with(vec![successes()]));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(states(&rig.store()), [(5, RunState::Queued)]);
+        std::fs::write(rig.dir.path().join("repo/.inchworm/flows.toml"), FLOWS).unwrap();
+        wait_for("the run to finish once the file is readable", || {
+            states(&rig.store()) == [(5, RunState::PrOpen)]
+        });
+        running.stop().unwrap();
+    }
+
     #[test]
     fn a_dead_worker_is_reported_instead_of_hanging() {
         let rig = Rig::new(FLOWS);
@@ -908,10 +1108,7 @@ required_checks = ["build"]
         let missing_issue = store.enqueue_run("o/r", 98, "issue", 2).unwrap().unwrap();
         drop(store);
         rig.green(77, 5, 1, SHA);
-        let running = rig.start(
-            rig.settings(),
-            ScriptedFactory::with(vec![vec![], successes()]),
-        );
+        let running = rig.start(rig.settings(), ScriptedFactory::with(vec![successes()]));
         wait_for("the healthy issue to finish", || {
             rig.store()
                 .runs_in_states(&[RunState::PrOpen])
@@ -970,20 +1167,5 @@ required_checks = ["build"]
         let factory = NannaFactory::new(PathBuf::from("/no/such/nanna"));
         let err = factory.make().err().unwrap();
         assert!(err.contains("cannot start"), "{err}");
-    }
-
-    #[test]
-    fn unavailable_dispatchers_fail_every_dispatch() {
-        let mut dispatcher = Unavailable("down".into());
-        let request = AssignRequest {
-            description: String::new(),
-            repo_path: PathBuf::new(),
-            identity: String::new(),
-            branch: String::new(),
-        };
-        let err = dispatcher
-            .dispatch(&request, Duration::from_secs(1))
-            .unwrap_err();
-        assert!(err.to_string().contains("down"));
     }
 }

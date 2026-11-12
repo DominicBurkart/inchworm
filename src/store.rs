@@ -246,6 +246,13 @@ impl Store {
         Ok(store)
     }
 
+    fn begin(&self) -> Result<rusqlite::Transaction<'_>, StoreError> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
+
     pub fn schema_version(&self) -> Result<usize, StoreError> {
         let version: i64 = self
             .conn
@@ -303,7 +310,7 @@ impl Store {
     }
 
     pub fn set_run_state(&self, id: RunId, to: RunState, now: i64) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin()?;
         let current = self.run(id)?;
         current.state.transition(to)?;
         tx.execute(
@@ -338,7 +345,7 @@ impl Store {
     }
 
     pub fn start_attempt(&self, run_id: RunId, now: i64) -> Result<Attempt, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin()?;
         self.run(run_id)?;
         let n: i64 = tx.query_row(
             "SELECT COALESCE(MAX(n), 0) + 1 FROM attempts WHERE run_id = ?1",
@@ -436,7 +443,7 @@ impl Store {
         verdicts: &[Verdict],
         now: i64,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin()?;
         for verdict in verdicts {
             tx.execute(
                 "INSERT INTO verdicts (attempt_id, head_sha, judge, passed, score, detail, created_at)
@@ -603,7 +610,7 @@ impl Store {
         to: RunState,
         now: i64,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin()?;
         self.run(run)?.state.transition(to)?;
         self.finish(attempt, AttemptState::Succeeded, None, None, now)?;
         self.conn.execute(

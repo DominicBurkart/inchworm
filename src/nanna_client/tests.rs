@@ -376,3 +376,62 @@ fn malformed_json_and_read_errors_are_fatal_to_the_connection() {
         ClientError::Io(_)
     ));
 }
+
+#[derive(Clone, Default)]
+struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn working_then_silent() -> (NannaClient, SharedWriter, std::io::PipeWriter) {
+    use std::io::Read;
+    let first = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working","pollInterval":1}}}"#,
+        "\n"
+    );
+    let (silent, keep_open) = std::io::pipe().unwrap();
+    let reader = BufReader::new(io::Cursor::new(first.as_bytes().to_vec()).chain(silent));
+    let writer = SharedWriter::default();
+    let mut client = NannaClient::new(reader, writer.clone());
+    client.set_read_timeout(Duration::from_millis(400));
+    (client, writer, keep_open)
+}
+
+#[test]
+fn a_read_timeout_while_polling_a_task_sends_tasks_cancel() {
+    let (mut client, writer, _keep_open) = working_then_silent();
+    let err = client
+        .run_task(&request("x"), Duration::from_secs(30))
+        .unwrap_err();
+    assert!(matches!(err, ClientError::ReadTimeout(_)), "{err:?}");
+    let sent = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    let last = sent.lines().last().unwrap();
+    assert!(last.contains("\"method\":\"tasks/cancel\""), "{sent}");
+    assert!(last.contains("\"taskId\":\"t\""), "{sent}");
+}
+
+#[test]
+fn a_non_timeout_error_while_polling_does_not_send_a_cancel() {
+    let first = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working","pollInterval":1}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom"}}"#,
+        "\n"
+    );
+    let writer = SharedWriter::default();
+    let mut client = NannaClient::new(BufReader::new(first.as_bytes()), writer.clone());
+    let err = client
+        .run_task(&request("x"), Duration::from_secs(30))
+        .unwrap_err();
+    assert!(matches!(err, ClientError::Rpc { .. }), "{err:?}");
+    let sent = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    assert!(!sent.contains("tasks/cancel"), "{sent}");
+}
