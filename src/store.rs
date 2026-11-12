@@ -347,8 +347,8 @@ fn is_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-fn enable_wal(conn: &Connection) -> Result<(), StoreError> {
-    let deadline = Instant::now() + BUSY_TIMEOUT;
+fn enable_wal(conn: &Connection, timeout: Duration) -> Result<(), StoreError> {
+    let deadline = Instant::now() + timeout;
     let mut pause = Duration::from_millis(2);
     loop {
         let switched = conn
@@ -395,7 +395,7 @@ impl Store {
     fn from_connection(conn: Connection, wal: bool) -> Result<Store, StoreError> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         if wal {
-            enable_wal(&conn)?;
+            enable_wal(&conn, BUSY_TIMEOUT)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store { conn };
@@ -850,6 +850,107 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert_eq!(foreign_keys, 1);
+    }
+
+    fn hold_exclusive_lock(path: &Path) -> Connection {
+        let holder = Connection::open(path).unwrap();
+        holder
+            .execute_batch("CREATE TABLE IF NOT EXISTS t (x); BEGIN EXCLUSIVE")
+            .unwrap();
+        holder
+    }
+
+    #[test]
+    fn switching_to_wal_retries_while_the_database_is_busy_and_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let holder = hold_exclusive_lock(&path);
+        let waiter = Connection::open(&path).unwrap();
+        waiter.busy_timeout(Duration::ZERO).unwrap();
+
+        let started = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(enable_wal(&waiter, Duration::from_millis(150)));
+        });
+        let err = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("enable_wal ignored its deadline")
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Sqlite(inner) if is_busy(inner)),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "gave up too early"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "ignored the deadline"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn switching_to_wal_succeeds_once_the_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released.db");
+        let holder = hold_exclusive_lock(&path);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let waiter = Connection::open(&path).unwrap();
+        waiter.busy_timeout(Duration::ZERO).unwrap();
+        enable_wal(&waiter, Duration::from_secs(5)).expect("must retry until the lock is gone");
+        releaser.join().unwrap();
+        let mode: String = waiter
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn switching_to_wal_reports_a_non_busy_error_at_once_without_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.db");
+        drop(hold_exclusive_lock(&path));
+        let readonly = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let err = enable_wal(&readonly, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Sqlite(inner) if !is_busy(inner)),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "retried a non-busy error"
+        );
+    }
+
+    #[test]
+    fn busy_and_locked_are_retryable_and_other_errors_are_not() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(is_busy(&busy) && is_busy(&locked));
+        assert!(!is_busy(&constraint));
+        assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
     }
 
     #[test]
