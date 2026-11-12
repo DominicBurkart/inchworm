@@ -38,13 +38,24 @@ pub struct CheckRun {
     pub conclusion: CheckConclusion,
 }
 
+/// Whether a repository-declared rule currently grants this orchestrator the right to merge there.
+///
+/// The caller supplies it; nothing in this crate reads a repository file to decide it. Merging
+/// is unreachable in production until nanna-coder#1043 defines the capability and a later change
+/// wires `Granted` to it, so every production caller passes `Denied` and `merge_when` degrades to
+/// a draft pull request.
+///
+/// ```
+/// use inchworm::policy::MergeGrant;
+///
+/// assert_eq!(MergeGrant::default(), MergeGrant::Denied);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HumanGate {
+#[non_exhaustive]
+pub enum MergeGrant {
     #[default]
-    NotConsulted,
-    Absent,
-    Github,
-    Solo,
+    Denied,
+    Granted,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +68,7 @@ pub struct PolicyInput<'a> {
     pub live_head_sha: &'a str,
     pub expected_judges: &'a [String],
     pub verdicts: &'a [Verdict],
-    pub human_gate: HumanGate,
+    pub merge_grant: MergeGrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +134,7 @@ fn verdicts_match_judges(expected: &[String], verdicts: &[Verdict]) -> bool {
 /// ```
 /// use inchworm::config::{MergeMethod, OutcomeMode};
 /// use inchworm::judges::Verdict;
-/// use inchworm::policy::{decide, Decision, HumanGate, PolicyInput};
+/// use inchworm::policy::{decide, Decision, MergeGrant, PolicyInput};
 ///
 /// let verdicts = [Verdict::pass("diff", "ok")];
 /// let sha = "a".repeat(40);
@@ -136,7 +147,7 @@ fn verdicts_match_judges(expected: &[String], verdicts: &[Verdict]) -> bool {
 ///     live_head_sha: &sha,
 ///     expected_judges: &["diff".to_string()],
 ///     verdicts: &verdicts,
-///     human_gate: HumanGate::NotConsulted,
+///     merge_grant: MergeGrant::Denied,
 /// };
 /// assert_eq!(decide(&input), Decision::DraftPr);
 /// ```
@@ -165,7 +176,7 @@ pub fn decide(input: &PolicyInput<'_>) -> Decision {
     match input.mode {
         OutcomeMode::DraftPr => Decision::DraftPr,
         OutcomeMode::MergeWhen => {
-            if matches!(input.human_gate, HumanGate::Solo | HumanGate::NotConsulted) {
+            if input.merge_grant != MergeGrant::Granted {
                 return Decision::DraftPr;
             }
             if input.required_checks.is_empty()
@@ -249,7 +260,7 @@ mod tests {
         live: String,
         expected: Vec<String>,
         verdicts: Vec<Verdict>,
-        gate: HumanGate,
+        grant: MergeGrant,
     }
 
     impl Case {
@@ -266,7 +277,7 @@ mod tests {
                 live: SHA.into(),
                 expected: names(&["diff", "llm"]),
                 verdicts: vec![passed("diff", 0), passed("llm", 1)],
-                gate: HumanGate::Absent,
+                grant: MergeGrant::Granted,
             }
         }
 
@@ -280,7 +291,7 @@ mod tests {
                 live_head_sha: &self.live,
                 expected_judges: &self.expected,
                 verdicts: &self.verdicts,
-                human_gate: self.gate,
+                merge_grant: self.grant,
             })
         }
     }
@@ -563,37 +574,57 @@ mod tests {
     }
 
     #[test]
-    fn unconsulted_and_solo_human_gates_downgrade_merge_to_draft() {
-        for gate in [HumanGate::Solo, HumanGate::NotConsulted] {
-            let mut case = Case::merge_ready();
-            case.gate = gate;
-            assert_eq!(case.decide(), Decision::DraftPr, "{gate:?}");
-        }
-        assert_eq!(HumanGate::default(), HumanGate::NotConsulted);
+    fn a_denied_grant_downgrades_merge_to_draft_and_is_the_default() {
+        let mut case = Case::merge_ready();
+        case.grant = MergeGrant::Denied;
+        assert_eq!(case.decide(), Decision::DraftPr);
+        assert_eq!(MergeGrant::default(), MergeGrant::Denied);
     }
 
     #[test]
-    fn absent_and_github_human_gates_allow_merge() {
-        for gate in [HumanGate::Absent, HumanGate::Github] {
-            let mut case = Case::merge_ready();
-            case.gate = gate;
-            assert_eq!(case.decide(), merged());
-        }
+    fn a_granted_grant_allows_merge() {
+        assert_eq!(Case::merge_ready().decide(), merged());
     }
 
     #[test]
-    fn the_unconsulted_gate_still_rejects_bad_judges_and_red_checks() {
+    fn a_denied_grant_still_rejects_bad_judges_and_red_checks() {
         let mut bad_judge = Case::merge_ready();
-        bad_judge.gate = HumanGate::NotConsulted;
+        bad_judge.grant = MergeGrant::Denied;
         bad_judge.verdicts[0] = failed("diff", 0);
         assert_eq!(
             bad_judge.decide(),
             Decision::Reject(FailureClass::JudgeRejected)
         );
         let mut red = Case::merge_ready();
-        red.gate = HumanGate::NotConsulted;
+        red.grant = MergeGrant::Denied;
         red.checks[0].conclusion = CheckConclusion::Failure;
         assert_eq!(red.decide(), Decision::Reject(FailureClass::CiRed));
+    }
+
+    #[test]
+    fn merge_requires_the_grant_the_mode_and_every_safety_condition_exhaustively() {
+        let mutations: [fn(&mut Case); 8] = [
+            |_| {},
+            |c| c.mode = OutcomeMode::DraftPr,
+            |c| c.grant = MergeGrant::Denied,
+            |c| c.live = "b".repeat(40),
+            |c| c.checks[0].conclusion = CheckConclusion::Failure,
+            |c| c.checks[0].conclusion = CheckConclusion::Pending,
+            |c| c.verdicts[1] = failed("llm", 1),
+            |c| c.required.clear(),
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            for grant in [MergeGrant::Denied, MergeGrant::Granted] {
+                let mut case = Case::merge_ready();
+                mutate(&mut case);
+                if index != 2 {
+                    case.grant = grant;
+                }
+                let merges = matches!(case.decide(), Decision::Merge { .. });
+                let expected = index == 0 && grant == MergeGrant::Granted;
+                assert_eq!(merges, expected, "mutation {index} grant {grant:?}");
+            }
+        }
     }
 
     #[test]
@@ -672,13 +703,8 @@ mod tests {
         )
     }
 
-    fn gate() -> impl Strategy<Value = HumanGate> {
-        prop_oneof![
-            Just(HumanGate::NotConsulted),
-            Just(HumanGate::Absent),
-            Just(HumanGate::Github),
-            Just(HumanGate::Solo),
-        ]
+    fn grant() -> impl Strategy<Value = MergeGrant> {
+        prop_oneof![Just(MergeGrant::Denied), Just(MergeGrant::Granted)]
     }
 
     proptest! {
@@ -691,7 +717,7 @@ mod tests {
             expected in judge_names(),
             reported in judge_names(),
             passes in prop::collection::vec(any::<bool>(), 0..4),
-            gate in gate(),
+            grant in grant(),
             required in prop::collection::vec("[ab]", 0..3),
         ) {
             let checks: Vec<CheckRun> = runs.iter().map(|(n, s, c)| check(n, s, *c)).collect();
@@ -712,11 +738,11 @@ mod tests {
                 live_head_sha: &live,
                 expected_judges: &expected,
                 verdicts: &verdicts,
-                human_gate: gate,
+                merge_grant: grant,
             });
             if let Decision::Merge { head_sha, .. } = decision {
                 prop_assert_eq!(mode, OutcomeMode::MergeWhen);
-                prop_assert!(gate == HumanGate::Absent || gate == HumanGate::Github);
+                prop_assert_eq!(grant, MergeGrant::Granted);
                 prop_assert!(!required.is_empty());
                 prop_assert!(!expected.is_empty());
                 prop_assert_eq!(&expected, &reported);
@@ -738,7 +764,6 @@ mod tests {
         fn every_condition_holding_always_merges(
             expected in judge_names().prop_filter("needs a judge", |names| !names.is_empty()),
             required in prop::collection::vec("[ab]", 1..3),
-            use_github_gate in any::<bool>(),
             use_sha64 in any::<bool>(),
             upper in any::<bool>(),
         ) {
@@ -762,7 +787,7 @@ mod tests {
                 live_head_sha: &live,
                 expected_judges: &expected,
                 verdicts: &verdicts,
-                human_gate: if use_github_gate { HumanGate::Github } else { HumanGate::Absent },
+                merge_grant: MergeGrant::Granted,
             });
             prop_assert_eq!(
                 decision,

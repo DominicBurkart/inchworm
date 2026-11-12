@@ -1113,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn a_passing_llm_verdict_never_overrides_a_failed_deterministic_judge() {
         use crate::config::{MergeMethod, OutcomeMode};
-        use crate::policy::{Decision, HumanGate, PolicyInput, decide};
+        use crate::policy::{Decision, MergeGrant, PolicyInput, decide};
         let sha = "a".repeat(40);
         for patch in injection_corpus() {
             let tainted = patch.replace("src/a.rs", ".github/ci.yml");
@@ -1133,7 +1133,7 @@ mod tests {
                     live_head_sha: &sha,
                     expected_judges: &["diff".to_string(), "llm".to_string()],
                     verdicts: &verdicts,
-                    human_gate: HumanGate::NotConsulted,
+                    merge_grant: MergeGrant::Denied,
                 });
                 assert!(matches!(decision, Decision::Reject(_)), "{decision:?}");
             }
