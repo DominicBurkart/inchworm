@@ -14,7 +14,6 @@ pub type RunId = i64;
 pub type AttemptId = i64;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_REFERENCE_LEN: usize = 200;
 
 fn states_sql(states: &[RunState]) -> String {
     states
@@ -121,59 +120,75 @@ impl SubjectKind {
 
 /// What a run is about: an issue, a pull request or a commit.
 ///
+/// A subject is valid by construction and has exactly one spelling: issue and
+/// pull request numbers are positive decimals without leading zeros, and a
+/// commit is a full SHA-1 or SHA-256 in lowercase hex. Two spellings of one
+/// subject therefore cannot both be opened.
+///
 /// ```
 /// use inchworm::store::{Subject, SubjectKind};
 ///
-/// let issue = Subject::issue(7);
-/// assert_eq!(issue.kind, SubjectKind::Issue);
-/// assert_eq!(issue.reference, "7");
-/// assert!(Subject::commit("not-hex").is_err());
-/// assert_eq!(Subject::commit("0123abc").unwrap().kind, SubjectKind::Commit);
+/// let issue = Subject::issue(7).unwrap();
+/// assert_eq!(issue.kind(), SubjectKind::Issue);
+/// assert_eq!(issue.reference(), "7");
+/// assert!(Subject::issue(0).is_err());
+/// assert!(Subject::commit("0123abc").is_err());
+/// let sha = "0123456789ABCDEF0123456789abcdef01234567";
+/// assert_eq!(Subject::commit(sha).unwrap().reference(), sha.to_ascii_lowercase());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subject {
-    pub kind: SubjectKind,
-    pub reference: String,
+    kind: SubjectKind,
+    reference: String,
 }
 
 impl Subject {
-    pub fn issue(number: u64) -> Subject {
-        Subject {
-            kind: SubjectKind::Issue,
-            reference: number.to_string(),
-        }
+    pub fn issue(number: u64) -> Result<Subject, StoreError> {
+        Subject::from_parts(SubjectKind::Issue, &number.to_string())
     }
 
-    pub fn pr(number: u64) -> Subject {
-        Subject {
-            kind: SubjectKind::Pr,
-            reference: number.to_string(),
-        }
+    pub fn pr(number: u64) -> Result<Subject, StoreError> {
+        Subject::from_parts(SubjectKind::Pr, &number.to_string())
     }
 
     pub fn commit(sha: &str) -> Result<Subject, StoreError> {
-        let valid = (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
+        Subject::from_parts(SubjectKind::Commit, &sha.to_ascii_lowercase())
+    }
+
+    /// Builds a subject from its stored parts, accepting only the canonical
+    /// spelling.
+    pub fn from_parts(kind: SubjectKind, reference: &str) -> Result<Subject, StoreError> {
+        let valid = match kind {
+            SubjectKind::Issue | SubjectKind::Pr => {
+                reference.parse::<u64>().is_ok_and(|n| n >= 1)
+                    && reference.bytes().all(|b| b.is_ascii_digit())
+                    && !reference.starts_with('0')
+            }
+            SubjectKind::Commit => {
+                matches!(reference.len(), 40 | 64)
+                    && reference
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }
+        };
         if !valid {
             return Err(StoreError::InvalidSubject(format!(
-                "`{sha}` is not a 7 to 64 character hex commit id"
+                "`{reference}` is not a canonical {} reference",
+                kind.as_str()
             )));
         }
         Ok(Subject {
-            kind: SubjectKind::Commit,
-            reference: sha.to_ascii_lowercase(),
+            kind,
+            reference: reference.to_string(),
         })
     }
 
-    fn validate(&self) -> Result<(), StoreError> {
-        if self.reference.is_empty()
-            || self.reference.len() > MAX_REFERENCE_LEN
-            || self.reference.chars().any(char::is_control)
-        {
-            return Err(StoreError::InvalidSubject(format!(
-                "reference must be 1 to {MAX_REFERENCE_LEN} printable characters"
-            )));
-        }
-        Ok(())
+    pub fn kind(&self) -> SubjectKind {
+        self.kind
+    }
+
+    pub fn reference(&self) -> &str {
+        &self.reference
     }
 }
 
@@ -329,10 +344,11 @@ fn run_from_row(row: &Row<'_>) -> Result<Run, StoreError> {
     Ok(Run {
         id: row.get("id")?,
         repo: row.get("repo")?,
-        subject: Subject {
-            kind: SubjectKind::parse(&kind)?,
-            reference: row.get("subject_ref")?,
-        },
+        subject: Subject::from_parts(
+            SubjectKind::parse(&kind)?,
+            &row.get::<_, String>("subject_ref")?,
+        )
+        .map_err(|err| StoreError::Corrupt(err.to_string()))?,
         flow: row.get("flow")?,
         state: state.parse().map_err(corrupt("run state"))?,
         created_at: row.get("created_at")?,
@@ -422,8 +438,9 @@ impl Store {
     /// use inchworm::store::{Store, Subject};
     ///
     /// let store = Store::open_in_memory().unwrap();
-    /// let id = store.enqueue_run("o/r", &Subject::issue(7), "issue", 100).unwrap().unwrap();
-    /// assert!(store.enqueue_run("o/r", &Subject::issue(7), "issue", 101).unwrap().is_none());
+    /// let subject = Subject::issue(7).unwrap();
+    /// let id = store.enqueue_run("o/r", &subject, "issue", 100).unwrap().unwrap();
+    /// assert!(store.enqueue_run("o/r", &subject, "issue", 101).unwrap().is_none());
     /// store.set_run_state(id, RunState::Running, 102).unwrap();
     /// assert_eq!(store.run(id).unwrap().state, RunState::Running);
     /// ```
@@ -495,15 +512,14 @@ impl Store {
         flow: &str,
         now: i64,
     ) -> Result<Option<RunId>, StoreError> {
-        subject.validate()?;
         let tx = self.immediate()?;
         let inserted = tx.execute(
             "INSERT INTO runs (repo, subject_kind, subject_ref, flow, state, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![
                 repo,
-                subject.kind.as_str(),
-                subject.reference,
+                subject.kind().as_str(),
+                subject.reference(),
                 flow,
                 RunState::Queued.as_str(),
                 now
@@ -681,7 +697,8 @@ impl Store {
     /// let dir = tempfile::tempdir().unwrap();
     /// let db = dir.path().join("state.db");
     /// let store = Store::open(&db).unwrap();
-    /// let run = store.enqueue_run("o/r", &Subject::issue(1), "issue", 0).unwrap().unwrap();
+    /// let subject = Subject::issue(1).unwrap();
+    /// let run = store.enqueue_run("o/r", &subject, "issue", 0).unwrap().unwrap();
     /// store.set_run_state(run, RunState::Running, 1).unwrap();
     /// let attempt = store.start_attempt(run, 2).unwrap();
     ///
@@ -804,8 +821,11 @@ mod tests {
         (RunState::Judging, RunState::Escalated),
     ];
 
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn issue(n: u64) -> Subject {
-        Subject::issue(n)
+        Subject::issue(n).unwrap()
     }
 
     fn store_with_run() -> (Store, RunId) {
@@ -910,7 +930,7 @@ mod tests {
                     let store = Store::open(&path).unwrap();
                     barrier.wait();
                     for n in 0..60 {
-                        let subject = issue(worker * 1000 + n);
+                        let subject = issue(worker * 1000 + n + 1);
                         let id = store
                             .enqueue_run("o/r", &subject, "issue", 1)
                             .expect("enqueue must not fail under contention")
@@ -1094,11 +1114,11 @@ mod tests {
         );
         assert!(
             store
-                .enqueue_run("o/r", &Subject::pr(1), "issue", 11)
+                .enqueue_run("o/r", &Subject::pr(1).unwrap(), "issue", 11)
                 .unwrap()
                 .is_some()
         );
-        let commit = Subject::commit("0123abc").unwrap();
+        let commit = Subject::commit(SHA1).unwrap();
         assert!(
             store
                 .enqueue_run("o/r", &commit, "issue", 11)
@@ -1129,55 +1149,130 @@ mod tests {
     }
 
     #[test]
-    fn a_subject_is_validated_before_anything_is_written() {
-        let store = Store::open_in_memory().unwrap();
-        for reference in ["", "a\nb", "tab\there"] {
-            let subject = Subject {
-                kind: SubjectKind::Issue,
-                reference: reference.to_string(),
-            };
-            assert!(
-                matches!(
-                    store.enqueue_run("o/r", &subject, "issue", 1),
-                    Err(StoreError::InvalidSubject(_))
-                ),
-                "{reference:?}"
-            );
-        }
-        let long = Subject {
-            kind: SubjectKind::Issue,
-            reference: "9".repeat(MAX_REFERENCE_LEN + 1),
-        };
+    fn issue_and_pr_subjects_need_a_positive_number_and_have_one_spelling() {
         assert!(matches!(
-            store.enqueue_run("o/r", &long, "issue", 1),
+            Subject::issue(0),
             Err(StoreError::InvalidSubject(_))
         ));
-        let longest = Subject {
-            kind: SubjectKind::Issue,
-            reference: "9".repeat(MAX_REFERENCE_LEN),
-        };
-        assert!(
-            store
-                .enqueue_run("o/r", &longest, "issue", 1)
-                .unwrap()
-                .is_some()
+        assert!(matches!(Subject::pr(0), Err(StoreError::InvalidSubject(_))));
+        let seven = Subject::issue(7).unwrap();
+        assert_eq!(seven.kind(), SubjectKind::Issue);
+        assert_eq!(seven.reference(), "7");
+        assert_eq!(Subject::pr(7).unwrap().kind(), SubjectKind::Pr);
+        let largest = Subject::issue(u64::MAX).unwrap();
+        assert_eq!(largest.reference(), "18446744073709551615");
+        assert_eq!(
+            Subject::from_parts(SubjectKind::Issue, largest.reference()).unwrap(),
+            largest
         );
-        let rows: i64 = store
-            .raw()
-            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
     }
 
     #[test]
-    fn commit_subjects_must_be_hex_of_a_sensible_length() {
-        assert!(Subject::commit("abcdef").is_err());
-        assert!(Subject::commit("abcdefg").is_err());
-        assert!(Subject::commit(&"a".repeat(65)).is_err());
-        assert!(Subject::commit("").is_err());
-        assert_eq!(Subject::commit("ABCDEF1").unwrap().reference, "abcdef1");
-        assert!(Subject::commit(&"f".repeat(64)).is_ok());
-        assert!(Subject::commit(&"f".repeat(7)).is_ok());
+    fn non_canonical_numbers_are_rejected_when_built_from_parts() {
+        for bad in [
+            "",
+            "0",
+            "00",
+            "07",
+            "+7",
+            "-1",
+            " 7",
+            "7 ",
+            "7\n",
+            "not a number",
+            "1.5",
+            "0x7",
+            "\u{663}",
+            "18446744073709551616",
+            "99999999999999999999999",
+        ] {
+            for kind in [SubjectKind::Issue, SubjectKind::Pr] {
+                assert!(
+                    matches!(
+                        Subject::from_parts(kind, bad),
+                        Err(StoreError::InvalidSubject(_))
+                    ),
+                    "{kind:?} {bad:?}"
+                );
+            }
+        }
+        for good in ["1", "7", "10", "123456789"] {
+            assert!(
+                Subject::from_parts(SubjectKind::Issue, good).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_subjects_must_be_a_full_sha1_or_sha256_in_lowercase_hex() {
+        for bad in [
+            "",
+            "ZZZ",
+            "abcdef",
+            "0123abc",
+            &SHA1[..39],
+            &SHA1[..7],
+            &SHA256[..41],
+            &SHA256[..63],
+        ] {
+            assert!(Subject::commit(bad).is_err(), "{bad:?}");
+        }
+        let too_long = format!("{SHA256}0");
+        assert!(Subject::commit(&too_long).is_err());
+        let not_hex = format!("g{}", &SHA1[1..]);
+        assert!(Subject::commit(&not_hex).is_err());
+        assert!(Subject::commit(SHA1).is_ok());
+        assert!(Subject::commit(SHA256).is_ok());
+        assert_eq!(
+            Subject::commit(&SHA1.to_ascii_uppercase())
+                .unwrap()
+                .reference(),
+            SHA1
+        );
+    }
+
+    #[test]
+    fn from_parts_only_accepts_the_canonical_spelling() {
+        let upper = SHA1.to_ascii_uppercase();
+        assert!(Subject::from_parts(SubjectKind::Commit, &upper).is_err());
+        assert!(Subject::from_parts(SubjectKind::Commit, SHA1).is_ok());
+        assert!(Subject::from_parts(SubjectKind::Commit, "7").is_err());
+        assert!(Subject::from_parts(SubjectKind::Issue, SHA1).is_err());
+    }
+
+    #[test]
+    fn one_subject_cannot_be_opened_twice_under_two_spellings() {
+        let store = Store::open_in_memory().unwrap();
+        let first = Subject::issue(7).unwrap();
+        let again = Subject::from_parts(SubjectKind::Issue, "7").unwrap();
+        assert!(
+            store
+                .enqueue_run("o/r", &first, "issue", 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &again, "issue", 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(Subject::from_parts(SubjectKind::Issue, "07").is_err());
+        let lower = Subject::commit(SHA1).unwrap();
+        let upper = Subject::commit(&SHA1.to_ascii_uppercase()).unwrap();
+        assert!(
+            store
+                .enqueue_run("o/r", &lower, "issue", 3)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &upper, "issue", 4)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1876,6 +1971,11 @@ mod tests {
             .unwrap();
         let cases = [
             "UPDATE runs SET subject_kind = 'weird'",
+            "UPDATE runs SET subject_ref = '07'",
+            "UPDATE runs SET subject_ref = '0'",
+            "UPDATE runs SET subject_ref = 'not a number'",
+            "UPDATE runs SET subject_kind = 'commit', subject_ref = 'abc1234'",
+            "UPDATE runs SET subject_kind = 'commit', subject_ref = '0123456789ABCDEF0123456789ABCDEF01234567'",
             "UPDATE attempts SET state = 'weird'",
             "UPDATE attempts SET n = -1",
             "UPDATE attempts SET pr_number = -5",
@@ -1900,7 +2000,7 @@ mod tests {
             store
                 .raw()
                 .execute_batch(
-                    "UPDATE runs SET subject_kind = 'issue';
+                    "UPDATE runs SET subject_kind = 'issue', subject_ref = '1';
                      UPDATE attempts SET state = 'dispatched', n = 1, pr_number = NULL, failure_class = NULL;",
                 )
                 .unwrap();
@@ -1946,14 +2046,38 @@ mod tests {
         }
 
         #[test]
-        fn hex_commit_ids_are_accepted_and_lowercased(sha in "[0-9a-fA-F]{7,64}") {
+        fn full_hex_commit_ids_are_accepted_and_lowercased(sha in "[0-9a-fA-F]{40}|[0-9a-fA-F]{64}") {
             let subject = Subject::commit(&sha).unwrap();
-            prop_assert_eq!(subject.reference, sha.to_ascii_lowercase());
+            prop_assert_eq!(subject.reference(), sha.to_ascii_lowercase());
         }
 
         #[test]
-        fn non_hex_commit_ids_are_rejected(sha in "[0-9a-f]{3,20}[g-z][0-9a-f]{3,20}") {
+        fn commit_ids_of_any_other_length_or_alphabet_are_rejected(
+            sha in "[0-9a-f]{0,39}|[0-9a-f]{41,63}|[0-9a-f]{65,70}|[0-9a-f]{10,30}[g-z][0-9a-f]{10,30}",
+        ) {
             prop_assert!(Subject::commit(&sha).is_err());
+        }
+
+        #[test]
+        fn canonical_numbers_round_trip_and_leading_zeros_are_rejected(
+            number in 1u64..,
+            zeros in "0{1,3}",
+        ) {
+            let subject = Subject::issue(number).unwrap();
+            prop_assert_eq!(subject.reference(), number.to_string());
+            prop_assert_eq!(Subject::from_parts(SubjectKind::Issue, subject.reference()).unwrap(), subject);
+            let padded = format!("{zeros}{number}");
+            prop_assert!(Subject::from_parts(SubjectKind::Issue, &padded).is_err());
+        }
+
+        #[test]
+        fn arbitrary_text_never_builds_a_non_canonical_subject(text in ".{0,70}") {
+            for kind in [SubjectKind::Issue, SubjectKind::Pr, SubjectKind::Commit] {
+                if let Ok(subject) = Subject::from_parts(kind, &text) {
+                    prop_assert_eq!(subject.reference(), text.as_str());
+                    prop_assert_eq!(subject.kind(), kind);
+                }
+            }
         }
     }
 }
