@@ -549,6 +549,7 @@ mode = "draft_pr"
             RunState::AwaitingCi
         );
         assert_eq!(github.issue("o/r", 5).unwrap().labels, ["inchworm:running"]);
+        assert_eq!(github.comments().len(), 1, "{:?}", github.comments());
         assert!(github.comments()[0].2.contains("pull/77"));
         assert_eq!(fake.assigned().len(), 2);
     }
@@ -696,7 +697,10 @@ mode = "draft_pr"
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_issue(&ctx(&store, &github), &flow(2, ""), 5, &mut Panics)
         }));
-        assert!(result.is_err());
+        let payload = result.unwrap_err();
+        assert!(
+            payload.downcast_ref::<&str>().is_some() || payload.downcast_ref::<String>().is_some()
+        );
 
         let run = store.run(1).unwrap();
         assert_eq!(run.state, RunState::Failed);

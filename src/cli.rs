@@ -437,7 +437,8 @@ mod tests {
         assert!(err.to_string().contains("HOME is not set"));
         let env = env();
         let cli = Cli::parse_from(["inchworm", "validate"]);
-        assert!(execute(cli, &env.tools).is_err());
+        let err = execute(cli, &env.tools).unwrap_err();
+        assert!(err.to_string().contains("cannot read"), "{err}");
         let xdg = Tools {
             xdg_config_home: Some(env.dir.path().to_path_buf()),
             ..env.tools.clone()

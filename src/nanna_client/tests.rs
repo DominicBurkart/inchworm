@@ -556,8 +556,15 @@ fn rpc_errors_on_other_methods_surface_with_code_and_kind() {
         matches!(err, ClientError::Rpc { code: -32602, .. }),
         "{err:?}"
     );
-    assert!(client.cancel("nope").is_err());
-    assert!(client.result("nope", TaskState::Failed).is_err());
+    for err in [
+        client.cancel("nope").unwrap_err(),
+        client.result("nope", TaskState::Failed).unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, ClientError::Rpc { code: -32602, .. }),
+            "{err:?}"
+        );
+    }
 }
 
 #[test]
@@ -892,7 +899,10 @@ fn a_stale_queue_file_with_the_same_name_is_removed_before_spawning() {
     let options = SpawnOptions::new("/definitely/not/nanna", &state);
     let env = spawn_env(&options, "fixed", &lookup_from(&[("HOME", "/h")])).unwrap();
     std::fs::write(&env.queue_file, "stale").unwrap();
-    assert!(NannaClient::spawn_with_lookup(&options, &|_| Some("/h".into())).is_err());
+    let err = NannaClient::spawn_with_lookup(&options, &|_| Some("/h".into()))
+        .err()
+        .expect("spawning a missing binary must fail");
+    assert!(matches!(err, ClientError::Io(_)), "{err:?}");
     assert!(state.exists());
 }
 
@@ -1100,6 +1110,120 @@ fn a_budget_store_that_nanna_cannot_use_is_an_error_not_noise() {
     assert_eq!(client.noise_lines(), 0);
 }
 
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+#[test]
+fn a_diagnostics_block_is_found_behind_earlier_blocks_that_are_not_json() {
+    let text = "head\n\n{not json}\n\nmore text\n\n{\"error_type\":\"X\"}";
+    let (message, diagnostics) = split_diagnostics(text);
+    assert_eq!(message, "head\n\n{not json}\n\nmore text");
+    assert_eq!(diagnostics.unwrap()["error_type"], "X");
+    let (message, diagnostics) = split_diagnostics("a\n\n{\"x\":1}\n\ntrailing words");
+    assert_eq!(message, "a\n\n{\"x\":1}\n\ntrailing words");
+    assert!(diagnostics.is_none());
+}
+
+#[test]
+fn two_spawns_with_the_same_options_get_different_queue_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "echo \"$NANNA_QUEUE_PATH\" > \"{}/queue-$$\"\n{HANDSHAKE}exec cat >/dev/null\n",
+        dir.path().display()
+    );
+    let options = script_options(dir.path(), &body);
+    let mut first = spawn_script(&options, dir.path());
+    let mut second = spawn_script(&options, dir.path());
+    first.initialize().unwrap();
+    second.initialize().unwrap();
+    let mut queues: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()?
+                .to_str()?
+                .starts_with("queue-")
+                .then(|| std::fs::read_to_string(&path).unwrap().trim().to_string())
+        })
+        .collect();
+    queues.sort();
+    assert_eq!(queues.len(), 2, "{queues:?}");
+    assert_ne!(queues[0], queues[1]);
+}
+
+#[test]
+fn a_task_that_finished_but_whose_result_cannot_be_read_is_still_a_timeout() {
+    let replies = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"cannot cancel"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"result":{"taskId":"t","status":"completed"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"no result"}}"#,
+        "\n",
+    );
+    let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), io::sink());
+    let outcome = client.run_task(&request("x"), Duration::ZERO).unwrap();
+    assert!(matches!(outcome, TaskOutcome::TimedOut), "{outcome:?}");
+}
+
+#[test]
+fn a_finished_task_is_never_cancelled_on_drop() {
+    let replies = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"result":{"taskId":"t","status":"completed"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"result":{"isError":false,"content":[{"type":"text","text":"{\"result_summary\":\"done\"}"}]}}"#,
+        "\n",
+    );
+    let sent = Capture::default();
+    let mut client = NannaClient::new(BufReader::new(replies.as_bytes()), sent.clone());
+    let outcome = client.run_task(&request("x"), WAIT).unwrap();
+    assert!(matches!(outcome, TaskOutcome::Completed(_)), "{outcome:?}");
+    drop(client);
+    assert!(!sent.text().contains("tasks/cancel"), "{}", sent.text());
+}
+
+#[test]
+fn dropping_a_client_with_a_running_task_cancels_it_but_never_waits_long() {
+    let accepted = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"working"}}}"#,
+        "\n"
+    );
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(accepted.as_bytes()).unwrap();
+    let sent = Capture::default();
+    let mut client = NannaClient::new(BufReader::new(reader), sent.clone());
+    client.assign_task(&request("x")).unwrap();
+    let started = Instant::now();
+    drop(client);
+    assert!(sent.text().contains("tasks/cancel"), "{}", sent.text());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(writer);
+}
+
 #[test]
 fn a_hung_server_fails_run_task_instead_of_blocking_forever() {
     let (silent, _keep_open) = std::io::pipe().unwrap();
@@ -1143,14 +1267,14 @@ fn garbage_then_end_of_stream_is_a_closed_connection_not_a_json_error() {
 
 #[test]
 fn a_flood_of_noise_without_an_answer_is_a_protocol_error() {
-    let flood = "log line\n".repeat(MAX_NOISE_LINES_PER_EXCHANGE as usize + 5);
+    let flood = "log line\n".repeat(1005);
     let mut client = NannaClient::new(BufReader::new(std::io::Cursor::new(flood)), io::sink());
     let err = client.initialize().unwrap_err();
     assert!(
         matches!(err, ClientError::Protocol(ref m) if m.contains("non-JSON")),
         "{err:?}"
     );
-    assert_eq!(client.noise_lines(), MAX_NOISE_LINES_PER_EXCHANGE + 1);
+    assert_eq!(client.noise_lines(), 1001);
 }
 
 #[test]

@@ -862,7 +862,10 @@ mod tests {
             identity: "i".into(),
             branch: "main".into(),
         };
-        assert!(client.dispatch(&request, Duration::from_secs(1)).is_err());
+        let err = client
+            .dispatch(&request, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(matches!(err, ClientError::Eof), "{err:?}");
         assert!(!Dispatcher::is_usable(&client));
         let scripted = Scripted(VecDeque::new());
         assert!(scripted.is_usable());
@@ -953,6 +956,30 @@ mod tests {
         assert!(touches_protected("\\056inchworm/flows.toml"));
         assert!(touches_protected("\"\\056inchworm\\057x\""));
         assert!(touches_protected("src/\\056\\056/\\056inchworm/x"));
+    }
+
+    #[test]
+    fn every_step_prompt_forbids_touching_the_protected_directory() {
+        let flow = FlowFile::parse(
+            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        )
+        .unwrap()
+        .flow
+        .remove(0);
+        let input = FlowInput {
+            repo_path: Path::new("/repo"),
+            issue_number: 5,
+            issue_title: "t",
+            issue_body: "b",
+            attempt: 1,
+            branch: "inchworm/5-a1",
+            previous_failure: None,
+        };
+        let text = describe_step(&flow, 0, &input, None);
+        assert!(
+            text.contains("Never modify anything under .inchworm/."),
+            "{text}"
+        );
     }
 
     #[test]

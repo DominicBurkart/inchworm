@@ -374,7 +374,8 @@ mod tests {
             ["-c", "head -c 600 /dev/zero; head -c 600 /dev/zero >&2"],
         )
         .with_max_output(1000);
-        assert!(SystemRunner.run(&spec).is_err());
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert!(err.to_string().contains("more than 1000 bytes"), "{err}");
         let spec = CmdSpec::new(
             "sh",
             ["-c", "head -c 400 /dev/zero; head -c 400 /dev/zero >&2"],
@@ -439,7 +440,8 @@ mod tests {
         let spec = CmdSpec::new("sh", ["-c", script.as_str()])
             .with_max_output(10_000)
             .with_timeout(Duration::from_secs(30));
-        assert!(SystemRunner.run(&spec).is_err());
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert!(err.to_string().contains("more than 10000 bytes"), "{err}");
         let pid = std::fs::read_to_string(&pidfile)
             .unwrap()
             .trim()
@@ -518,6 +520,7 @@ mod tests {
     #[test]
     fn system_runner_reports_a_missing_program() {
         let spec = CmdSpec::new("/definitely/not/a/program", [] as [&str; 0]);
-        assert!(SystemRunner.run(&spec).is_err());
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     }
 }

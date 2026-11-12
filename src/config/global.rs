@@ -179,7 +179,7 @@ state_db = "~/.local/state/inchworm/state.db"
 
 [[repo]]
 slug = "DominicBurkart/marigold"
-path = "/home/dominic/code/marigold"
+path = "/home/user/code/marigold"
 
 [[repo]]
 slug = "DominicBurkart/nanna-coder"
@@ -216,7 +216,7 @@ path = "~/code/nanna-coder"
     fn unknown_keys_are_rejected() {
         assert!(GlobalConfig::parse(&format!("surprise = 1\n{FULL}")).is_err());
         let in_repo = FULL.replacen(
-            "path = \"/home/dominic/code/marigold\"",
+            "path = \"/home/user/code/marigold\"",
             "path = \"/x\"\nsurprise = 1",
             1,
         );
@@ -271,7 +271,7 @@ path = "~/code/nanna-coder"
         );
         assert_eq!(
             config.repo[0].path,
-            PathBuf::from("/home/dominic/code/marigold")
+            PathBuf::from("/home/user/code/marigold")
         );
         assert_eq!(
             config.repo[1].path,
