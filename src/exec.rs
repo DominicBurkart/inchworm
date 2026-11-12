@@ -110,6 +110,32 @@ fn pump(mut source: impl Read + Send + 'static, is_stderr: bool, tx: Sender<(boo
     });
 }
 
+const BUSY_RETRIES: u32 = 40;
+const BUSY_PAUSE: Duration = Duration::from_millis(25);
+
+/// ```
+/// use std::process::Command;
+/// use inchworm::exec::spawn_retrying;
+///
+/// let mut child = spawn_retrying(&mut Command::new("true")).unwrap();
+/// assert!(child.wait().unwrap().success());
+/// assert!(spawn_retrying(&mut Command::new("/no/such/program")).is_err());
+/// ```
+pub fn spawn_retrying(command: &mut Command) -> io::Result<Child> {
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Err(err) if err.raw_os_error() == Some(ETXTBSY) && attempts < BUSY_RETRIES => {
+                attempts += 1;
+                thread::sleep(BUSY_PAUSE);
+            }
+            other => return other,
+        }
+    }
+}
+
+const ETXTBSY: i32 = 26;
+
 fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -141,7 +167,7 @@ impl Runner for SystemRunner {
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
-        let mut child = command.spawn()?;
+        let mut child = spawn_retrying(&mut command)?;
         let (tx, rx) = mpsc::channel();
         if let Some(stdout) = child.stdout.take() {
             pump(stdout, false, tx.clone());
@@ -429,6 +455,29 @@ mod tests {
             started.elapsed() < Duration::from_secs(20),
             "cat waited for stdin"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_still_open_for_writing_is_retried_until_it_can_run() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let busy = Command::new(&path).spawn().unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(ETXTBSY), "{busy}");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(writer);
+        });
+        let out = SystemRunner
+            .run(&CmdSpec::new(path.to_str().unwrap(), [] as [&str; 0]))
+            .unwrap();
+        closer.join().unwrap();
+        assert_eq!(out.stdout.trim(), "ran");
     }
 
     #[cfg(unix)]

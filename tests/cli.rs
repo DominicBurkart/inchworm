@@ -45,6 +45,8 @@ fn validate_exits_zero_for_a_complete_repo() {
     let config = config(dir.path(), &repo);
     Command::cargo_bin("inchworm")
         .unwrap()
+        .env("HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .args(["validate", "--config"])
         .arg(&config)
         .assert()
@@ -61,6 +63,8 @@ fn validate_exits_one_when_a_repo_has_errors() {
     let config = config(dir.path(), &repo);
     Command::cargo_bin("inchworm")
         .unwrap()
+        .env("HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .args(["validate", "--config"])
         .arg(&config)
         .assert()
@@ -73,6 +77,8 @@ fn validate_exits_two_when_the_config_is_unreadable() {
     let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("inchworm")
         .unwrap()
+        .env("HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .args(["validate", "--config"])
         .arg(dir.path().join("missing.toml"))
         .assert()
@@ -84,6 +90,7 @@ fn validate_exits_two_when_the_config_is_unreadable() {
 fn unknown_subcommands_are_rejected() {
     Command::cargo_bin("inchworm")
         .unwrap()
+        .env("HOME", "/nonexistent-home")
         .arg("bogus")
         .assert()
         .failure();
@@ -156,6 +163,8 @@ fn inchworm(fakes: &Fakes) -> Command {
         std::env::var("PATH").unwrap()
     );
     command.env("PATH", path);
+    command.env("HOME", fakes.dir.path().join("home"));
+    command.env_remove("XDG_CONFIG_HOME");
     command
 }
 
@@ -329,6 +338,8 @@ fn run_and_signal(signal: &str) -> (Option<i32>, String, Fakes) {
     let fakes = fakes();
     fakes.set("state", "task_working");
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("inchworm"))
+        .env("HOME", fakes.dir.path().join("home"))
+        .env_remove("XDG_CONFIG_HOME")
         .env(
             "PATH",
             format!(
@@ -449,4 +460,8 @@ fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
         .assert()
         .code(2)
         .stderr(predicates_contains("does not carry the `inchworm` label"));
+    assert!(
+        !fakes.dir.path().join("state/nanna").exists(),
+        "a refused run must not start nanna or leave its state files"
+    );
 }

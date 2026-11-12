@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -133,7 +134,8 @@ pub fn connect(scenarios: Vec<Scenario>) -> (NannaClient, FakeNanna) {
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&requests);
     let handle = std::thread::spawn(move || serve(server_in, server_out, scenarios, log));
-    let client = NannaClient::new(BufReader::new(client_in), client_out);
+    let mut client = NannaClient::new(BufReader::new(client_in), client_out);
+    client.set_poll_cap(Duration::from_millis(5));
     (
         client,
         FakeNanna {

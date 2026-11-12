@@ -282,12 +282,7 @@ fn protected_pr_files(
 /// let summary = run_issue(&ctx, &file.flow[0], 1, &mut Cancels).unwrap();
 /// assert_eq!(summary.state, inchworm::model::RunState::Failed);
 /// ```
-pub fn run_issue(
-    ctx: &RunContext<'_>,
-    flow: &Flow,
-    issue_number: u64,
-    dispatcher: &mut dyn Dispatcher,
-) -> Result<RunSummary, RunError> {
+pub fn preflight(ctx: &RunContext<'_>, flow: &Flow, issue_number: u64) -> Result<(), RunError> {
     let issue = ctx.github.issue(ctx.slug, issue_number)?;
     if ctx
         .store
@@ -300,7 +295,17 @@ pub fn run_issue(
             flow: flow.name.clone(),
         });
     }
-    check_runnable(ctx, flow, &issue, issue_number)?;
+    check_runnable(ctx, flow, &issue, issue_number)
+}
+
+pub fn run_issue(
+    ctx: &RunContext<'_>,
+    flow: &Flow,
+    issue_number: u64,
+    dispatcher: &mut dyn Dispatcher,
+) -> Result<RunSummary, RunError> {
+    preflight(ctx, flow, issue_number)?;
+    let issue = ctx.github.issue(ctx.slug, issue_number)?;
     let run_id = ctx
         .store
         .enqueue_run(ctx.slug, issue_number, &flow.name, (ctx.now)())?

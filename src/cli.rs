@@ -11,7 +11,7 @@ use crate::github::GhCli;
 use crate::model::RunState;
 use crate::nanna_client::{NannaClient, SpawnOptions, state_dir_for};
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
-use crate::run::{RunContext, run_issue};
+use crate::run::{RunContext, preflight, run_issue};
 use crate::store::Store;
 use crate::validate::validate;
 
@@ -56,11 +56,15 @@ pub struct Tools {
 
 impl Tools {
     pub fn from_env() -> Result<Tools> {
+        Tools::from_lookup(&|key| std::env::var_os(key))
+    }
+
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Tools> {
         Ok(Tools {
             gh: "gh".to_string(),
             nix: "nix".to_string(),
-            home: PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?),
-            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            home: PathBuf::from(lookup("HOME").context("HOME is not set")?),
+            xdg_config_home: lookup("XDG_CONFIG_HOME").map(PathBuf::from),
         })
     }
 }
@@ -149,13 +153,6 @@ fn run_command(
     }
     let store = Store::open(&config.state_db)?;
     let github = GhCli::with_program(tools.gh.as_str());
-    let spawn_options =
-        SpawnOptions::new(config.nanna_bin.clone(), state_dir_for(&config.state_db));
-    let mut client = NannaClient::spawn(&spawn_options)
-        .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
-    client.set_interrupt(install_interrupt()?);
-    client.initialize()?;
-
     let clock = now;
     let ctx = RunContext {
         store: &store,
@@ -164,6 +161,15 @@ fn run_command(
         repo_path: &repo.path,
         now: &clock,
     };
+    preflight(&ctx, selected, issue)?;
+    let spawn_options =
+        SpawnOptions::new(config.nanna_bin.clone(), state_dir_for(&config.state_db))
+            .with_home(&tools.home);
+    let mut client = NannaClient::spawn(&spawn_options)
+        .with_context(|| format!("cannot start `{} mcp-serve`", config.nanna_bin.display()))?;
+    client.set_interrupt(install_interrupt()?);
+    client.initialize()?;
+
     let summary = run_issue(&ctx, selected, issue, &mut client)?;
     println!(
         "run {} for {}#{issue}: {} after {} attempt(s)",
@@ -417,9 +423,18 @@ mod tests {
 
     #[test]
     fn tools_come_from_the_environment_and_the_default_config_path_is_used() {
-        let tools = Tools::from_env().unwrap();
+        let tools = Tools::from_lookup(&|key| match key {
+            "HOME" => Some("/h".into()),
+            "XDG_CONFIG_HOME" => Some("/x".into()),
+            _ => None,
+        })
+        .unwrap();
         assert_eq!(tools.gh, "gh");
         assert_eq!(tools.nix, "nix");
+        assert_eq!(tools.home, Path::new("/h"));
+        assert_eq!(tools.xdg_config_home.as_deref(), Some(Path::new("/x")));
+        let err = Tools::from_lookup(&|_| None).unwrap_err();
+        assert!(err.to_string().contains("HOME is not set"));
         let env = env();
         let cli = Cli::parse_from(["inchworm", "validate"]);
         assert!(execute(cli, &env.tools).is_err());

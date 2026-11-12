@@ -209,6 +209,7 @@ pub struct SpawnOptions {
     pub bin: PathBuf,
     pub state_dir: PathBuf,
     pub config_dir: Option<PathBuf>,
+    pub home: Option<PathBuf>,
 }
 
 impl SpawnOptions {
@@ -217,7 +218,13 @@ impl SpawnOptions {
             bin: bin.into(),
             state_dir: state_dir.into(),
             config_dir: None,
+            home: None,
         }
+    }
+
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> SpawnOptions {
+        self.home = Some(home.into());
+        self
     }
 }
 
@@ -347,6 +354,7 @@ pub struct NannaClient {
     active_task: Option<String>,
     shutdown_grace: Duration,
     interrupt: Option<Arc<AtomicBool>>,
+    poll_cap: Option<Duration>,
 }
 
 impl NannaClient {
@@ -363,7 +371,12 @@ impl NannaClient {
             active_task: None,
             shutdown_grace: SHUTDOWN_GRACE,
             interrupt: None,
+            poll_cap: None,
         }
+    }
+
+    pub fn set_poll_cap(&mut self, cap: Duration) {
+        self.poll_cap = Some(cap);
     }
 
     pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
@@ -427,7 +440,10 @@ impl NannaClient {
     }
 
     pub fn spawn(options: &SpawnOptions) -> Result<NannaClient, ClientError> {
-        NannaClient::spawn_with_lookup(options, &|key| std::env::var_os(key))
+        NannaClient::spawn_with_lookup(options, &|key| match (key, &options.home) {
+            ("HOME", Some(home)) => Some(home.clone().into_os_string()),
+            _ => std::env::var_os(key),
+        })
     }
 
     pub fn spawn_with_lookup(
@@ -437,7 +453,7 @@ impl NannaClient {
         let env = spawn_env(options, &unique_suffix(), lookup)?;
         std::fs::create_dir_all(&options.state_dir)?;
         let _ = std::fs::remove_file(&env.queue_file);
-        let mut child = build_command(options, &env).spawn()?;
+        let mut child = crate::exec::spawn_retrying(&mut build_command(options, &env))?;
         let stdin = child
             .stdin
             .take()
@@ -670,7 +686,11 @@ impl NannaClient {
             if now >= deadline {
                 return self.cancel_or_collect(&current.task_id);
             }
-            self.pause(Duration::from_millis(current.poll_interval_ms).min(deadline - now));
+            let mut wait = Duration::from_millis(current.poll_interval_ms);
+            if let Some(cap) = self.poll_cap {
+                wait = wait.min(cap);
+            }
+            self.pause(wait.min(deadline - now));
             current = self.get(&current.task_id)?;
         }
         self.result(&current.task_id, current.state)
