@@ -1060,6 +1060,96 @@ mode = "draft_pr"
         assert_eq!(symlink_component(&f.root, Path::new(".nope/a/b")), None);
     }
 
+    fn padded_to(text: &str, bytes: usize) -> String {
+        assert!(text.len() <= bytes);
+        format!("{text}{}", " ".repeat(bytes - text.len()))
+    }
+
+    #[test]
+    fn the_protected_toml_cap_is_exactly_64_kib() {
+        let f = fixture();
+        let base = "extra = [\".inchworm/**\"]\n";
+        write(&f.root, ".nanna/protected.toml", &padded_to(base, 65_536));
+        assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
+        write(&f.root, ".nanna/protected.toml", &padded_to(base, 65_537));
+        let over = run(&f);
+        assert!(
+            has(&over, "larger than 65536 bytes"),
+            "{:?}",
+            messages(&over)
+        );
+    }
+
+    #[test]
+    fn the_flows_cap_is_exactly_256_kib() {
+        let f = fixture();
+        write(&f.root, ".inchworm/flows.toml", &padded_to(FLOWS, 262_144));
+        assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
+        write(&f.root, ".inchworm/flows.toml", &padded_to(FLOWS, 262_145));
+        let over = run(&f);
+        assert!(
+            has(&over, "larger than 262144 bytes"),
+            "{:?}",
+            messages(&over)
+        );
+    }
+
+    #[test]
+    fn the_gitfile_cap_is_exactly_4096_bytes() {
+        let f = fixture();
+        let real = f.root.join("real-gitdir");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::remove_dir_all(f.root.join(".git")).unwrap();
+        let line = "gitdir: real-gitdir\n";
+        write(&f.root, ".git", &padded_to(line, 4096));
+        assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
+        write(&f.root, ".git", &padded_to(line, 4097));
+        assert!(has(&run(&f), "readable gitdir file"));
+    }
+
+    #[test]
+    fn only_the_exact_inchworm_entry_counts_as_protecting_inchworm() {
+        let f = fixture();
+        for lookalike in [
+            ".inchworm/foo",
+            ".inchworm",
+            ".inchworm/",
+            ".inchwormX/**",
+            ".inchworm/**/x",
+            "x/.inchworm/**",
+            "inchworm/**",
+        ] {
+            write(
+                &f.root,
+                ".nanna/protected.toml",
+                &format!("extra = [\"{lookalike}\"]\n"),
+            );
+            let report = run(&f);
+            assert!(
+                has(&report, "must contain \".inchworm/**\""),
+                "{lookalike}: {:?}",
+                messages(&report)
+            );
+        }
+        write(
+            &f.root,
+            ".nanna/protected.toml",
+            "extra = [\"x\", \".inchworm/**\"]\n",
+        );
+        assert!(run(&f).is_ok());
+    }
+
+    #[test]
+    fn problems_with_the_global_config_are_rendered_under_the_config_scope() {
+        let f = fixture();
+        let config = config_for(&f.root, &f.root.join("no-such-nanna"));
+        let rendered = validate(&config, None).render();
+        assert!(
+            rendered.starts_with("error: [config] nanna_bin"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn every_repo_is_reported_separately() {
         let f = fixture();

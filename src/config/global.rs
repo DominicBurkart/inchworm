@@ -855,6 +855,35 @@ path = "~/code/nanna-coder"
     }
 
     #[test]
+    fn the_config_cap_is_exactly_256_kib() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = "nanna_bin = \"/bin/nanna\"\n[[repo]]\nslug = \"a/b\"\npath = \"/x\"\n";
+        let padded = |bytes: usize| format!("{base}{}", " ".repeat(bytes - base.len()));
+        std::fs::write(&path, padded(262_144)).unwrap();
+        assert!(GlobalConfig::load(&path, None).is_ok());
+        std::fs::write(&path, padded(262_145)).unwrap();
+        let err = GlobalConfig::load(&path, None).unwrap_err().to_string();
+        assert!(err.contains("larger than 262144 bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_state_database_path_needs_an_absolute_home() {
+        let config = base();
+        for home in [Some(Path::new("relative")), Some(Path::new("")), None] {
+            let err = config.state_db_path(home).unwrap_err().to_string();
+            assert!(err.contains("HOME"), "{home:?}: {err}");
+        }
+        let explicit = GlobalConfig {
+            state_db: Some("~/s.db".into()),
+            ..base()
+        };
+        for home in [Some(Path::new("relative")), None] {
+            assert!(explicit.state_db_path(home).is_err());
+        }
+    }
+
+    #[test]
     fn load_revalidates_after_expansion() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
