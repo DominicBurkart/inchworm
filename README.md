@@ -87,6 +87,12 @@ required_checks = ["Tests"]
 
 `mode = "merge_when"` additionally requires at least one judge and a non-empty `required_checks`. Unknown keys are rejected everywhere.
 
+### How steps hand work to each other
+
+Each step is its own nanna task, and nanna creates a fresh worktree from `base` for every task. A later step therefore does not see an earlier step's files. It receives the earlier step's summary, file list and patch as text in its description. The patch is handed over whole or not at all: if a step other than the last produces a patch larger than 100,000 bytes, the flow stops with `patch_apply_failed` and says so; nothing is truncated.
+
+Inchworm itself never applies, commits or pushes anything. The publish step (for example `pr-shepherd`) has to apply the patch it was given and push `inchworm/<issue>-a<attempt>` with nanna's own tools, and inchworm then looks that branch up with `gh`. **That hand-over has not been run end to end against a real nanna, a model and a container**; what is verified is the wire protocol with the real binary (see `tests/real_nanna.rs`) and the flow logic against a fake nanna. Treat the first real run as an experiment.
+
 ## Development
 
 The pre-commit hook (installed by `cargo-husky` on `cargo test`, or copy `.cargo-husky/hooks/pre-commit` into the git hooks directory when working in a worktree) runs fmt, clippy, tests, doctests, audit, deny, docs, a security review of the staged diff and a coverage no-regression check against `main`.

@@ -217,17 +217,6 @@ pub fn protected_paths_in(files: &[String], patches: &[Option<&str>]) -> Vec<Str
     found
 }
 
-fn truncate_to_boundary(text: &str, max: usize) -> (&str, bool) {
-    if text.len() <= max {
-        return (text, false);
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&text[..end], true)
-}
-
 fn describe_step(
     flow: &Flow,
     index: usize,
@@ -263,11 +252,7 @@ fn describe_step(
             ));
         }
         if let Some(patch) = patch {
-            let (kept, cut) = truncate_to_boundary(patch, MAX_FORWARDED_PATCH_BYTES);
-            text.push_str(&format!("\nPatch:\n{kept}"));
-            if cut {
-                text.push_str("\n[patch truncated]");
-            }
+            text.push_str(&format!("\nPatch:\n{patch}"));
         }
     }
     text
@@ -403,6 +388,21 @@ pub fn run_flow(
             .changes_patch
             .clone()
             .or_else(|| done.format_patch.clone());
+        if let Some(patch) = forwarded_patch.as_deref()
+            && !is_final
+            && patch.len() > MAX_FORWARDED_PATCH_BYTES
+        {
+            return failed(
+                records,
+                &step.name,
+                FailureClass::PatchApplyFailed,
+                format!(
+                    "the output of step `{}` is {} bytes, over the {MAX_FORWARDED_PATCH_BYTES}-byte limit for handing changes to the next step; it was not truncated and the flow stopped",
+                    step.name,
+                    patch.len()
+                ),
+            );
+        }
         last = Some(done);
     }
 
@@ -660,27 +660,71 @@ mod tests {
     }
 
     #[test]
-    fn oversized_patches_are_truncated_at_a_char_boundary() {
+    fn a_patch_too_large_to_hand_to_the_next_step_stops_the_flow_instead_of_being_cut() {
         let big = "é".repeat(MAX_FORWARDED_PATCH_BYTES);
         let (mut client, fake) = connect(vec![
             Scenario::success_with_patch(&big, &["a.rs"]),
             Scenario::success(),
         ]);
         client.initialize().unwrap();
-        run_flow(&two_steps(), &input(None), &mut client);
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        let FlowOutcome::Failed {
+            step,
+            class,
+            raw_error,
+            steps,
+        } = outcome
+        else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(class, FailureClass::PatchApplyFailed);
+        assert_eq!(step, "implement");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "implement");
+        assert!(raw_error.contains("200000 bytes"), "{raw_error}");
+        assert!(raw_error.contains("100000-byte limit"), "{raw_error}");
+        assert!(raw_error.contains("not truncated"), "{raw_error}");
+        assert_eq!(
+            fake.assigned().len(),
+            1,
+            "the next step must not be dispatched"
+        );
+    }
+
+    #[test]
+    fn a_patch_exactly_at_the_limit_is_handed_over_whole() {
+        let exact = "a".repeat(MAX_FORWARDED_PATCH_BYTES);
+        let (mut client, fake) = connect(vec![
+            Scenario::success_with_patch(&exact, &["a.rs"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
         let text = fake.assigned()[1]["description"]
             .as_str()
             .unwrap()
             .to_string();
-        assert!(text.ends_with("[patch truncated]"));
-        assert!(text.len() < MAX_FORWARDED_PATCH_BYTES + 2_000);
+        assert!(text.contains(&exact));
+        assert!(!text.contains("truncated"));
     }
 
     #[test]
-    fn short_patches_are_not_marked_truncated() {
-        assert_eq!(truncate_to_boundary("abc", 10), ("abc", false));
-        assert_eq!(truncate_to_boundary("abcdef", 3), ("abc", true));
-        assert_eq!(truncate_to_boundary("aé", 2), ("a", true));
+    fn a_large_patch_from_the_final_step_is_not_a_handoff_problem() {
+        let big = "a".repeat(MAX_FORWARDED_PATCH_BYTES * 2);
+        let (mut client, _fake) = connect(vec![
+            Scenario::success_with_patch("small", &["a.rs"]),
+            Scenario::success_with_patch(&big, &["b.rs"]),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
     }
 
     struct Scripted(VecDeque<Result<TaskOutcome, ClientError>>);
