@@ -20,17 +20,24 @@ if ! git -C "$root" rev-parse --verify --quiet "${base}^{commit}" >/dev/null; th
 fi
 
 coverage() {
-    local output
+    local output value
     output="$(cd "$1" && cargo tarpaulin --skip-clean --ignore-tests 2>&1)" || {
         printf '%s\n' "$output" >&2
+        echo "cargo tarpaulin failed in $1." >&2
         return 1
     }
-    printf '%s\n' "$output" | grep -oP '\d+\.\d+(?=% coverage)' | tail -1
+    value="$(printf '%s\n' "$output" | grep -oP '\d+\.\d+(?=% coverage)' | tail -1 || true)"
+    if [ -z "$value" ]; then
+        printf '%s\n' "$output" | tail -n 5 >&2
+        echo "No coverage line in the tarpaulin output for $1." >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
 }
 
 new="$(coverage "$root")"
 tmp="$(mktemp -d)"
-trap 'git -C "$root" worktree remove --force "$tmp/base" 2>/dev/null || true; rm -rf "$tmp"; git -C "$root" worktree prune' EXIT
+trap 'rm -rf "$tmp"; git -C "$root" worktree prune' EXIT
 git -C "$root" worktree add --detach -q "$tmp/base" "$base"
 old="$(coverage "$tmp/base")"
 

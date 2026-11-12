@@ -53,6 +53,57 @@ fn anything_else_on_the_first_line_blocks() {
 }
 
 #[test]
+fn ordinary_lowercase_prose_about_unsafe_code_is_not_a_verdict() {
+    let text: &[u8] =
+        b"VERDICT: SAFE\n\nThe change adds no unsafe code and no unsafe blocks.\nTests check unsafe inputs.\n";
+    assert_eq!(verdict(text).0, 0);
+}
+
+#[test]
+fn the_unsafe_token_is_matched_as_a_word_and_not_inside_longer_words() {
+    for text in [
+        &b"VERDICT: SAFE\nREUNSAFED\n"[..],
+        &b"VERDICT: SAFE\nUNSAFELY\n"[..],
+        &b"VERDICT: SAFE\nXUNSAFE and UNSAFEY\n"[..],
+    ] {
+        assert_eq!(verdict(text).0, 0, "{:?}", String::from_utf8_lossy(text));
+    }
+}
+
+#[test]
+fn any_later_unsafe_verdict_blocks_whatever_its_markup() {
+    let blocked: &[&[u8]] = &[
+        b"VERDICT: SAFE\nVERDICT: UNSAFE: leaked a token\n",
+        b"VERDICT: SAFE\n  VERDICT: UNSAFE\n",
+        b"VERDICT: SAFE\n**VERDICT: UNSAFE**\n",
+        b"VERDICT: SAFE\n- VERDICT: UNSAFE\n",
+        b"VERDICT: SAFE\n> Verdict: unsafe\n",
+        b"VERDICT: SAFE\nverdict - unsafe\n",
+        b"VERDICT: SAFE\nThis commit is UNSAFE to push.\n",
+        b"VERDICT: SAFE\nUNSAFE\n",
+        b"VERDICT: SAFE\n(UNSAFE)\n",
+    ];
+    for output in blocked {
+        let (code, message) = verdict(output);
+        assert_eq!(code, 1, "{:?}", String::from_utf8_lossy(output));
+        assert!(message.contains("UNSAFE"), "{message}");
+    }
+}
+
+#[test]
+fn a_nul_byte_anywhere_blocks() {
+    for output in [
+        &b"VERDICT: SAFE\0\n"[..],
+        &b"VERDICT: SAFE\nfine\0 text\n"[..],
+        &b"VERDICT: SAFE\n\0"[..],
+    ] {
+        let (code, message) = verdict(output);
+        assert_eq!(code, 1, "{output:?}");
+        assert!(message.contains("NUL"), "{message}");
+    }
+}
+
+#[test]
 fn a_later_unsafe_line_blocks_even_after_a_safe_first_line() {
     let (code, message) = verdict(b"VERDICT: SAFE\nVERDICT: UNSAFE\nactually a secret\n");
     assert_eq!(code, 1);
@@ -67,6 +118,7 @@ fn a_missing_file_blocks() {
         .output()
         .unwrap();
     assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("does not exist"));
 }
 
 #[test]
