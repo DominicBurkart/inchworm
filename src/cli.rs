@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn run_rejects_a_pr_touching_inchworm() {
         let env = env();
-        env.set("files", "src/lib.rs\n.inchworm/flows.toml");
+        env.set("files", "F src/lib.rs\nF .inchworm/flows.toml");
         assert!(!env.exec(&["run", "o/r", "5"]).unwrap());
     }
 

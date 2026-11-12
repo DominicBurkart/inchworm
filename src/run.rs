@@ -160,6 +160,40 @@ fn trigger_label(flow: &Flow) -> &str {
     label
 }
 
+pub const MAX_PUBLIC_TEXT_CHARS: usize = 2000;
+
+/// ```
+/// use inchworm::run::public_text;
+///
+/// assert_eq!(public_text("ping @octocat\u{1b}[31m"), "ping \u{ff20}octocat[31m");
+/// assert!(public_text(&"x".repeat(100_000)).chars().count() < 2200);
+/// ```
+pub fn public_text(raw: &str) -> String {
+    let mut shown = String::new();
+    let mut count = 0usize;
+    let mut cut = 0usize;
+    for c in raw.chars() {
+        let c = match c {
+            '@' => '\u{ff20}',
+            '\n' | '\t' => c,
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if count < MAX_PUBLIC_TEXT_CHARS {
+            shown.push(c);
+            count += 1;
+        } else {
+            cut += 1;
+        }
+    }
+    if cut > 0 {
+        shown.push_str(&format!(
+            "\n[{cut} more characters left out; the full text is in inchworm's store]"
+        ));
+    }
+    shown
+}
+
 fn describe_failure(class: FailureClass, raw: &str, attempt: u32) -> String {
     format!("attempt {attempt} failed with `{class}`: {raw}")
 }
@@ -197,8 +231,9 @@ fn protected_pr_files(
         Err((
             FailureClass::ProtectedPathViolation,
             format!(
-                "pull request #{} touches protected {}/** or {}: {}",
+                "pull request #{} ({}) touches protected {}/** or {}: {}",
                 pr.number,
+                pr.url,
                 PROTECTED_DIR,
                 PROTECTED_FILE,
                 violations.join(", ")
@@ -305,17 +340,25 @@ pub fn run_issue(
             branch: &branch,
             previous_failure: previous_failure.as_deref(),
         };
+        let mut leftover: Option<PullRequest> = None;
         let outcome = match run_flow(flow, &input, dispatcher) {
             FlowOutcome::Completed { .. } => match ctx.github.pr_for_branch(ctx.slug, &branch) {
-                Ok(Some(pr)) if !pr.is_draft => (
-                    FailureClass::AgentFailed,
-                    format!(
-                        "pull request #{} is not a draft; inchworm only accepts draft pull requests",
-                        pr.number
-                    ),
-                ),
+                Ok(Some(pr)) if !pr.is_draft => {
+                    let failure = (
+                        FailureClass::AgentFailed,
+                        format!(
+                            "pull request #{} ({}) is not a draft; inchworm only accepts draft pull requests",
+                            pr.number, pr.url
+                        ),
+                    );
+                    leftover = Some(pr);
+                    failure
+                }
                 Ok(Some(pr)) => match protected_pr_files(ctx, &pr) {
-                    Err(failure) => failure,
+                    Err(failure) => {
+                        leftover = Some(pr);
+                        failure
+                    }
                     Ok(()) => {
                         ctx.store
                             .record_pr(attempt.id, &branch, &pr.head_sha, pr.number)?;
@@ -354,13 +397,19 @@ pub fn run_issue(
                 class,
                 raw_error,
                 ..
-            } => (class, format!("step `{step}`: {raw_error}")),
+            } => {
+                if let Ok(Some(pr)) = ctx.github.pr_for_branch(ctx.slug, &branch) {
+                    leftover = Some(pr);
+                }
+                (class, format!("step `{step}`: {raw_error}"))
+            }
         };
         let (class, raw) = outcome;
         ctx.store
             .finish_attempt_failed(attempt.id, class, &raw, (ctx.now)())?;
         guard.attempt = None;
-        let retry = flow.retry_on.contains(&class)
+        let retry = leftover.is_none()
+            && flow.retry_on.contains(&class)
             && attempts < flow.max_attempts
             && dispatcher.is_usable();
         if retry {
@@ -381,8 +430,15 @@ pub fn run_issue(
             ctx,
             issue_number,
             &format!(
-                "inchworm gave up after {attempts} attempt(s): {}",
-                describe_failure(class, &raw, attempt.n)
+                "inchworm gave up after {attempts} attempt(s): {}{}",
+                public_text(&describe_failure(class, &raw, attempt.n)),
+                match &leftover {
+                    Some(pr) => format!(
+                        "\n\nPull request {} was left open and was not retried; inchworm does not close pull requests, so close it before running this issue again.",
+                        pr.url
+                    ),
+                    None => String::new(),
+                }
             ),
             &mut warnings,
         );
@@ -737,6 +793,75 @@ mode = "draft_pr"
         assert_eq!(attempt.pr_number, None);
         assert_eq!(attempt.head_sha, None);
         assert_eq!(attempt.failure_class, Some(FailureClass::AgentFailed));
+    }
+
+    #[test]
+    fn a_rejected_pr_is_not_retried_and_its_url_is_in_the_one_comment() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let mut ready = pr("deadbeef");
+        ready.is_draft = false;
+        github.add_pr("o/r", "inchworm/5-a1", ready);
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = run_issue(
+            &ctx(&store, &github),
+            &flow(3, "\"agent_failed\""),
+            5,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(summary.attempts, 1);
+        assert_eq!(summary.state, RunState::Failed);
+        let comments = github.comments();
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert!(comments[0].2.contains("pull/77"), "{}", comments[0].2);
+        assert!(comments[0].2.contains("left open"), "{}", comments[0].2);
+    }
+
+    #[test]
+    fn a_pr_left_behind_by_a_failed_step_is_reported_and_stops_retries() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let (mut client, _fake) = connect(vec![Scenario::failed_with_message("boom")]);
+        client.initialize().unwrap();
+        let summary = run_issue(
+            &ctx(&store, &github),
+            &flow(3, "\"agent_failed\", \"model_error\", \"tests_failed\""),
+            5,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(summary.attempts, 1);
+        assert_eq!(github.comments().len(), 1);
+        assert!(github.comments()[0].2.contains("pull/77"));
+    }
+
+    #[test]
+    fn public_text_defuses_mentions_controls_and_length() {
+        assert_eq!(public_text("hi @octocat"), "hi \u{ff20}octocat");
+        assert_eq!(public_text("a\u{1b}[0m\u{7}b\nc\td"), "a[0mb\nc\td");
+        let long = "x".repeat(MAX_PUBLIC_TEXT_CHARS + 5);
+        let shown = public_text(&long);
+        assert!(shown.starts_with(&"x".repeat(MAX_PUBLIC_TEXT_CHARS)));
+        assert!(shown.contains("5 more characters"), "{shown}");
+        assert_eq!(
+            public_text(&"x".repeat(MAX_PUBLIC_TEXT_CHARS)).len(),
+            MAX_PUBLIC_TEXT_CHARS
+        );
+    }
+
+    #[test]
+    fn a_given_up_run_posts_exactly_one_comment_with_defused_text() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        let (mut client, _fake) = connect(vec![Scenario::failed_with_message("ping @someone")]);
+        client.initialize().unwrap();
+        run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        let comments = github.comments();
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert!(!comments[0].2.contains("@someone"), "{}", comments[0].2);
     }
 
     #[test]

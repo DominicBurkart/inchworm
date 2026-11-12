@@ -196,6 +196,8 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub const MAX_NOISE_LINES_PER_EXCHANGE: u64 = 1000;
 
+const BUDGET_UNAVAILABLE_MARKER: &str = "durable budget unavailable";
+
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 const INTERRUPT_SLICE: Duration = Duration::from_millis(100);
@@ -480,8 +482,13 @@ impl NannaClient {
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let mut noise_in_exchange = 0u64;
+        let deadline = Instant::now() + self.read_timeout;
         loop {
-            let line = self.lines.recv_timeout(self.read_timeout).map_err(|err| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::ReadTimeout(self.read_timeout));
+            }
+            let line = self.lines.recv_timeout(remaining).map_err(|err| {
                 if err == RecvTimeoutError::Timeout {
                     ClientError::ReadTimeout(self.read_timeout)
                 } else {
@@ -496,6 +503,11 @@ impl NannaClient {
                 continue;
             }
             let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+                if trimmed.contains(BUDGET_UNAVAILABLE_MARKER) {
+                    return Err(ClientError::Protocol(format!(
+                        "nanna cannot use its budget store, so it would deny every budgeted action; another nanna process (a concurrent `inchworm run` or an interactive `nanna mcp-serve`) probably holds the shared budget file: {trimmed}"
+                    )));
+                }
                 self.noise_lines += 1;
                 noise_in_exchange += 1;
                 if noise_in_exchange > MAX_NOISE_LINES_PER_EXCHANGE {

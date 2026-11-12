@@ -249,7 +249,7 @@ fn run_dispatches_the_flow_and_records_the_pr() {
 #[test]
 fn run_rejects_a_pr_that_touches_inchworm_files() {
     let fakes = fakes();
-    fakes.set("files", "src/lib.rs\n.inchworm/flows.toml");
+    fakes.set("files", "F src/lib.rs\nF .inchworm/flows.toml");
     inchworm(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)

@@ -78,6 +78,14 @@ impl Scenario {
         }
     }
 
+    pub fn failed_with_message(message: &str) -> Scenario {
+        let mut result = fixture("result_failed_legacy");
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        let diagnostics = text.split_once("\n\n").unwrap().1.to_string();
+        result["content"][0]["text"] = json!(format!("{message}\n\n{diagnostics}"));
+        Scenario::Failed { result }
+    }
+
     pub fn refused(fixture_name: &str) -> Scenario {
         Scenario::Refused {
             error: fixture(fixture_name),

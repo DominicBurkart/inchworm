@@ -43,6 +43,8 @@ pub struct PullRequest {
     pub url: String,
 }
 
+pub const PR_FILES_LIMIT: usize = 3000;
+
 pub trait GitHub {
     fn open_issues_with_label(&self, repo: &str, label: &str) -> Result<Vec<Issue>, GitHubError>;
     fn issue(&self, repo: &str, number: u64) -> Result<Issue, GitHubError>;
@@ -300,14 +302,27 @@ impl<R: Runner> GitHub for GhCli<R> {
     fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
         let endpoint = format!("repos/{repo}/pulls/{number}/files");
         #[rustfmt::skip]
-        let args = ["api", "--paginate", &endpoint, "--jq", ".[] | .filename, (.previous_filename // empty)"];
+        let args = ["api", "--paginate", &endpoint, "--jq", r#".[] | ("F " + .filename), (if .previous_filename then "P " + .previous_filename else empty end)"#];
         let out = self.run(&args)?;
-        Ok(out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect())
+        let mut files = Vec::new();
+        let mut listed = 0usize;
+        for line in out.lines() {
+            if let Some(name) = line.strip_prefix("F ") {
+                listed += 1;
+                files.push(name.trim().to_string());
+            } else if let Some(name) = line.strip_prefix("P ") {
+                files.push(name.trim().to_string());
+            }
+        }
+        if listed >= PR_FILES_LIMIT {
+            return Err(GitHubError::Command {
+                command: format!("gh api {endpoint}"),
+                detail: format!(
+                    "the pull request lists {listed} files, which is GitHub's limit for this endpoint; the list may be truncated, so it cannot be checked"
+                ),
+            });
+        }
+        Ok(files)
     }
 }
 
@@ -642,6 +657,7 @@ mod tests {
             "inchworm/5-abc",
             "inchworm/5-a1x",
             "inchworm/5-a-1",
+            "inchworm/5-a+3",
             "inchworm/6-a1",
             "inchworm/50-a1",
             "inchworm/5-a99999999999",
@@ -675,18 +691,32 @@ mod tests {
     #[test]
     fn gh_lists_every_file_of_a_pr_including_rename_sources() {
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(
-            "src/a.rs\n.inchworm/old.toml\n\nsrc/b.rs\n",
+            "F src/a.rs\nP .inchworm/old.toml\nF src/new.toml\n\nF src/b.rs\nnoise\n",
         )]));
         assert_eq!(
             gh.pr_files("o/r", 9).unwrap(),
-            ["src/a.rs", ".inchworm/old.toml", "src/b.rs"]
+            ["src/a.rs", ".inchworm/old.toml", "src/new.toml", "src/b.rs"]
         );
-        assert_eq!(
-            gh.runner.calls(),
-            [
-                "gh api --paginate repos/o/r/pulls/9/files --jq .[] | .filename, (.previous_filename // empty)"
-            ]
-        );
+        assert_eq!(gh.runner.calls().len(), 1);
+        assert!(gh.runner.calls()[0].starts_with("gh api --paginate repos/o/r/pulls/9/files --jq"));
+    }
+
+    #[test]
+    fn a_listing_at_githubs_cap_fails_closed_and_one_below_it_does_not() {
+        let listing = |n: usize| {
+            (0..n)
+                .map(|i| format!("F src/f{i}.rs\n"))
+                .collect::<String>()
+        };
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&listing(
+            PR_FILES_LIMIT,
+        ))]));
+        let err = gh.pr_files("o/r", 9).unwrap_err().to_string();
+        assert!(err.contains("cannot be checked"), "{err}");
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&listing(
+            PR_FILES_LIMIT - 1,
+        ))]));
+        assert_eq!(gh.pr_files("o/r", 9).unwrap().len(), PR_FILES_LIMIT - 1);
     }
 
     #[test]

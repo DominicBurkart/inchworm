@@ -3,6 +3,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -172,10 +173,22 @@ impl Runner for SystemRunner {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    if status.is_none() {
-                        status = Some(child.wait()?);
+                    if status.is_some() {
+                        break;
                     }
-                    break;
+                    if let Some(done) = child.try_wait()? {
+                        status = Some(done);
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        kill(&mut child);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("`{}` timed out after {timeout:?}", spec.display()),
+                        ));
+                    }
+                    thread::sleep(POLL);
+                    continue;
                 }
             }
             if status.is_some() {
@@ -360,6 +373,70 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_closes_its_pipes_and_keeps_running_still_hits_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; exec >&- 2>&-; exec sleep 60",
+            pidfile.display()
+        );
+        let spec =
+            CmdSpec::new("sh", ["-c", script.as_str()]).with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!pid_alive(&pid), "the timed-out process is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_kills_the_process_and_stdin_is_not_left_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; head -c 5000000 /dev/zero; exec sleep 60",
+            pidfile.display()
+        );
+        let spec = CmdSpec::new("sh", ["-c", script.as_str()])
+            .with_max_output(10_000)
+            .with_timeout(Duration::from_secs(30));
+        assert!(SystemRunner.run(&spec).is_err());
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!pid_alive(&pid), "the capped process is still running");
+
+        let started = Instant::now();
+        let out = SystemRunner
+            .run(&CmdSpec::new("cat", [] as [&str; 0]).with_timeout(Duration::from_secs(30)))
+            .unwrap();
+        assert!(out.success() && out.stdout.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cat waited for stdin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_written_just_after_exit_is_still_captured() {
+        let spec = CmdSpec::new("sh", ["-c", "(sleep 0.1; echo late) & exit 0"]);
+        let out = SystemRunner.run(&spec).unwrap();
+        assert_eq!(out.stdout.trim(), "late");
     }
 
     #[cfg(unix)]

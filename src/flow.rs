@@ -172,6 +172,8 @@ fn header_paths(patch: &str) -> impl Iterator<Item = &str> {
         .filter(|line| {
             [
                 "diff --git ",
+                "diff --cc ",
+                "diff --combined ",
                 "--- ",
                 "+++ ",
                 "rename ",
@@ -951,6 +953,20 @@ mod tests {
         assert!(touches_protected("\\056inchworm/flows.toml"));
         assert!(touches_protected("\"\\056inchworm\\057x\""));
         assert!(touches_protected("src/\\056\\056/\\056inchworm/x"));
+    }
+
+    #[test]
+    fn combined_diff_headers_are_scanned_for_protected_paths() {
+        for header in ["diff --cc", "diff --combined"] {
+            let patch = format!("{header} .inchworm/flows.toml\nindex 1,2..3\n");
+            assert_eq!(
+                protected_paths_in(&[], &[Some(patch.as_str())]),
+                vec![".inchworm/flows.toml".to_string()],
+                "{header}"
+            );
+            let clean = format!("{header} src/lib.rs\n");
+            assert!(protected_paths_in(&[], &[Some(clean.as_str())]).is_empty());
+        }
     }
 
     #[test]

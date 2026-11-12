@@ -1053,6 +1053,54 @@ fn a_silent_server_times_out_each_read_and_marks_the_client_dead() {
 }
 
 #[test]
+fn endless_unrelated_messages_cannot_keep_a_request_alive() {
+    for chatter in [
+        r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#,
+        "42",
+        r#"{"jsonrpc":"2.0","id":9999,"result":{}}"#,
+    ] {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let line = format!("{chatter}\n");
+        let talker = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if writer.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut client = NannaClient::new(BufReader::new(reader), io::sink());
+        client.set_read_timeout(Duration::from_millis(300));
+        let err = client.initialize().unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(client);
+        talker.join().unwrap();
+        assert!(
+            matches!(err, ClientError::ReadTimeout(_)),
+            "{chatter}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_budget_store_that_nanna_cannot_use_is_an_error_not_noise() {
+    let line = "2026-11-12T08:00:00Z ERROR durable budget unavailable, denying budgeted actions: budget store /x/budget.json is in use by another process\n";
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(line.as_bytes()).unwrap();
+    let mut client = NannaClient::new(BufReader::new(reader), io::sink());
+    let err = client.initialize().unwrap_err();
+    let shown = err.to_string();
+    assert!(matches!(err, ClientError::Protocol(_)), "{shown}");
+    assert!(
+        shown.contains("budget file") && shown.contains("in use by another process"),
+        "{shown}"
+    );
+    assert_eq!(client.noise_lines(), 0);
+}
+
+#[test]
 fn a_hung_server_fails_run_task_instead_of_blocking_forever() {
     let (silent, _keep_open) = std::io::pipe().unwrap();
     let mut client = NannaClient::new(BufReader::new(silent), io::sink());

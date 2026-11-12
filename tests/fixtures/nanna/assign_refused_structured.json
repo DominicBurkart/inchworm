@@ -1,4 +1,5 @@
 {
+  "_provenance": "RECONSTRUCTED, not captured: data.failure_kind refusal as defined by nanna-coder #1030 (draft; no released nanna emits it).",
   "code": -32602,
   "message": "spawn refused: block: unknown_identity: no identity `nonexistent` in the catalog",
   "data": {

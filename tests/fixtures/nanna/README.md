@@ -1,5 +1,9 @@
 # Fixture provenance
 
+Every JSON file here carries a top-level `_provenance` string saying whether it was
+captured or reconstructed; the lists below say the same. `pollInterval` is 2000
+ms, which is what nanna sends.
+
 These JSON files stand in for nanna's answers in tests. They differ in how much
 they can be trusted, and the tests that use them should be read with that in
 mind.
