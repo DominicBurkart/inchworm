@@ -195,9 +195,11 @@ fn settle_resumed(
         }
     }
     if attempt.state == AttemptState::Published {
-        ctx.store.finish_attempt_ok(attempt.id, ctx.clock.now())?;
+        ctx.store
+            .settle_attempt(attempt.id, run_id, target, ctx.clock.now())?;
+    } else {
+        ctx.store.set_run_state(run_id, target, ctx.clock.now())?;
     }
-    ctx.store.set_run_state(run_id, target, ctx.clock.now())?;
     relabel(
         ctx,
         issue,

@@ -7,8 +7,8 @@ case "$1 $2" in
   "issue edit") if [ -f "$D/fail_edit" ]; then echo "label edit denied" >&2; exit 1; fi ;;
   "issue comment") ;;
   "label list") cfg labels '[{"name":"inchworm"},{"name":"inchworm:running"},{"name":"inchworm:failed"},{"name":"inchworm:done"}]'; echo ;;
-  "pr list") cfg prs '[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]'; echo ;;
-  "pr view") cfg prview '{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}'; echo ;;
+  "pr list") cfg prs '[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9","baseRefName":"main","isCrossRepository":false}]'; echo ;;
+  "pr view") cfg prview '{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9","baseRefName":"main","isCrossRepository":false}'; echo ;;
   "pr diff") cfg patch 'diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs

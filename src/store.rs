@@ -596,6 +596,24 @@ impl Store {
         self.finish(id, AttemptState::Succeeded, None, None, now)
     }
 
+    pub fn settle_attempt(
+        &self,
+        attempt: AttemptId,
+        run: RunId,
+        to: RunState,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.run(run)?.state.transition(to)?;
+        self.finish(attempt, AttemptState::Succeeded, None, None, now)?;
+        self.conn.execute(
+            "UPDATE runs SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![to.as_str(), now, run],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn finish_attempt_failed(
         &self,
         id: AttemptId,
@@ -904,6 +922,61 @@ mod tests {
         assert_eq!(lost.failure_class, Some(FailureClass::OrchestratorLost));
         assert_eq!(lost.ended_at, Some(20));
         assert_eq!(store.recover_after_crash(21).unwrap(), 0);
+    }
+
+    #[test]
+    fn settle_attempt_closes_the_attempt_and_the_run_in_one_transaction() {
+        let (store, run) = store_with_run();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        store.record_pr(attempt.id, "b", "sha", 7).unwrap();
+        store.mark_published(attempt.id, 0, Some(true)).unwrap();
+        store.set_run_state(run, RunState::AwaitingCi, 4).unwrap();
+        store.set_run_state(run, RunState::Judging, 5).unwrap();
+        store
+            .settle_attempt(attempt.id, run, RunState::PrOpen, 6)
+            .unwrap();
+        assert_eq!(store.run(run).unwrap().state, RunState::PrOpen);
+        let done = store.attempt(attempt.id).unwrap();
+        assert_eq!(done.state, AttemptState::Succeeded);
+        assert_eq!(done.ended_at, Some(6));
+    }
+
+    #[test]
+    fn settle_attempt_changes_nothing_when_the_run_transition_is_illegal() {
+        let (store, run) = store_with_run();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        store.mark_published(attempt.id, 0, Some(true)).unwrap();
+        assert!(
+            store
+                .settle_attempt(attempt.id, run, RunState::PrOpen, 6)
+                .is_err()
+        );
+        assert_eq!(store.run(run).unwrap().state, RunState::Running);
+        assert_eq!(
+            store.attempt(attempt.id).unwrap().state,
+            AttemptState::Published
+        );
+    }
+
+    #[test]
+    fn settle_attempt_rolls_the_run_back_when_the_attempt_cannot_finish() {
+        let (store, run) = store_with_run();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        store.mark_published(attempt.id, 0, Some(true)).unwrap();
+        store.set_run_state(run, RunState::AwaitingCi, 4).unwrap();
+        store.set_run_state(run, RunState::Judging, 5).unwrap();
+        store
+            .finish_attempt_failed(attempt.id, FailureClass::CiRed, "x", 5)
+            .unwrap();
+        assert!(
+            store
+                .settle_attempt(attempt.id, run, RunState::PrOpen, 6)
+                .is_err()
+        );
+        assert_eq!(store.run(run).unwrap().state, RunState::Judging);
     }
 
     #[test]

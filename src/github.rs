@@ -51,6 +51,8 @@ pub struct PullRequest {
     pub is_draft: bool,
     pub state: PrState,
     pub url: String,
+    pub base_ref: String,
+    pub is_cross_repository: bool,
 }
 
 pub trait GitHub {
@@ -130,6 +132,8 @@ struct WirePr {
     is_draft: bool,
     state: String,
     url: String,
+    base_ref_name: String,
+    is_cross_repository: bool,
 }
 
 impl From<WireIssue> for Issue {
@@ -259,7 +263,7 @@ impl<R: Runner> GitHub for GhCli<R> {
 
     fn pr_for_branch(&self, repo: &str, branch: &str) -> Result<Option<PullRequest>, GitHubError> {
         #[rustfmt::skip]
-        let args = ["pr", "list", "-R", repo, "--head", branch, "--state", "open", "--limit", "1", "--json", "number,headRefOid,isDraft,state,url"];
+        let args = ["pr", "list", "-R", repo, "--head", branch, "--state", "open", "--limit", "1", "--json", "number,headRefOid,isDraft,state,url,baseRefName,isCrossRepository"];
         let prs: Vec<WirePr> = self.json(&args)?;
         Ok(prs.into_iter().next().map(|pr| PullRequest {
             number: pr.number,
@@ -267,6 +271,8 @@ impl<R: Runner> GitHub for GhCli<R> {
             is_draft: pr.is_draft,
             state: parse_pr_state(&pr.state),
             url: pr.url,
+            base_ref: pr.base_ref_name,
+            is_cross_repository: pr.is_cross_repository,
         }))
     }
 
@@ -286,7 +292,7 @@ impl<R: Runner> GitHub for GhCli<R> {
     fn pr(&self, repo: &str, number: u64) -> Result<PullRequest, GitHubError> {
         let number = number.to_string();
         #[rustfmt::skip]
-        let args = ["pr", "view", &number, "-R", repo, "--json", "number,headRefOid,isDraft,state,url"];
+        let args = ["pr", "view", &number, "-R", repo, "--json", "number,headRefOid,isDraft,state,url,baseRefName,isCrossRepository"];
         let pr: WirePr = self.json(&args)?;
         Ok(PullRequest {
             number: pr.number,
@@ -294,6 +300,8 @@ impl<R: Runner> GitHub for GhCli<R> {
             is_draft: pr.is_draft,
             state: parse_pr_state(&pr.state),
             url: pr.url,
+            base_ref: pr.base_ref_name,
+            is_cross_repository: pr.is_cross_repository,
         })
     }
 
@@ -849,7 +857,7 @@ mod tests {
 
     #[test]
     fn gh_finds_the_pr_for_a_branch_or_none() {
-        let pr = r#"[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]"#;
+        let pr = r#"[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9","baseRefName":"main","isCrossRepository":false}]"#;
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![
             ScriptedRunner::ok(pr),
             ScriptedRunner::ok("[]"),
@@ -862,7 +870,7 @@ mod tests {
         assert_eq!(gh.pr_for_branch("o/r", "none").unwrap(), None);
         assert_eq!(
             gh.runner.calls()[0],
-            "gh pr list -R o/r --head inchworm/7-a1 --state open --limit 1 --json number,headRefOid,isDraft,state,url"
+            "gh pr list -R o/r --head inchworm/7-a1 --state open --limit 1 --json number,headRefOid,isDraft,state,url,baseRefName,isCrossRepository"
         );
     }
 
@@ -885,7 +893,7 @@ mod tests {
 
     #[test]
     fn gh_views_one_pr_and_reads_its_patch() {
-        let pr = r#"{"number":9,"headRefOid":"abc123","isDraft":false,"state":"MERGED","url":"u"}"#;
+        let pr = r#"{"number":9,"headRefOid":"abc123","isDraft":false,"state":"MERGED","url":"u","baseRefName":"main","isCrossRepository":false}"#;
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![
             ScriptedRunner::ok(pr),
             ScriptedRunner::ok("diff --git a/x b/x\n"),
@@ -899,7 +907,7 @@ mod tests {
         assert_eq!(
             gh.runner.calls(),
             [
-                "gh pr view 9 -R o/r --json number,headRefOid,isDraft,state,url",
+                "gh pr view 9 -R o/r --json number,headRefOid,isDraft,state,url,baseRefName,isCrossRepository",
                 "gh pr diff 9 -R o/r"
             ]
         );
@@ -1002,6 +1010,8 @@ mod tests {
             is_draft: true,
             state: PrState::Open,
             url: "u".into(),
+            base_ref: "main".into(),
+            is_cross_repository: false,
         };
         fake.add_pr("o/r", "b", pr);
         assert!(fake.pr("o/r", 4).is_err());
@@ -1149,6 +1159,8 @@ mod tests {
             is_draft: true,
             state: PrState::Open,
             url: "u".into(),
+            base_ref: "main".into(),
+            is_cross_repository: false,
         };
         fake.add_pr("o/r", "b", pr.clone());
         assert_eq!(fake.pr_for_branch("o/r", "b").unwrap(), Some(pr));

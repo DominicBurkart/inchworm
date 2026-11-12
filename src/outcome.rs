@@ -5,8 +5,9 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::clock::Clock;
+use crate::config::OutcomeMode;
 use crate::config::{Flow, Judge};
-use crate::github::{GitHub, PullRequest};
+use crate::github::{GitHub, PrState, PullRequest};
 use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
 use crate::policy::{CheckConclusion, CheckRun, Decision, HumanGate, PolicyInput, decide};
@@ -238,6 +239,96 @@ fn warn_label_comment(
     }
 }
 
+enum Live {
+    Open(PullRequest),
+    AlreadyMerged,
+    Rejected(FailureClass, String),
+}
+
+fn inspect_live(
+    ctx: &ConcludeContext<'_>,
+    flow: &Flow,
+    published: &Published<'_>,
+    sha: &str,
+) -> Live {
+    let live = match ctx.github.pr(ctx.slug, published.pr.number) {
+        Ok(live) => live,
+        Err(err) => {
+            return Live::Rejected(
+                FailureClass::MergeBlocked,
+                format!("cannot read the live pull request: {err}"),
+            );
+        }
+    };
+    match live.state {
+        PrState::Merged => return Live::AlreadyMerged,
+        PrState::Closed => {
+            return Live::Rejected(
+                FailureClass::MergeBlocked,
+                format!("pull request {} was closed without merging", live.url),
+            );
+        }
+        PrState::Open => {}
+    }
+    if live.is_cross_repository {
+        return Live::Rejected(
+            FailureClass::MergeBlocked,
+            format!("pull request {} comes from a fork", live.url),
+        );
+    }
+    if live.base_ref != flow.base {
+        return Live::Rejected(
+            FailureClass::MergeBlocked,
+            format!(
+                "pull request {} targets `{}` but the flow base is `{}`",
+                live.url, live.base_ref, flow.base
+            ),
+        );
+    }
+    if !live.head_sha.eq_ignore_ascii_case(sha) {
+        return Live::Rejected(
+            FailureClass::MergeBlocked,
+            format!(
+                "head moved from {sha} to {} after the attempt was published",
+                live.head_sha
+            ),
+        );
+    }
+    Live::Open(live)
+}
+
+fn settle_merged(
+    ctx: &ConcludeContext<'_>,
+    flow: &Flow,
+    published: &Published<'_>,
+    sha: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Concluded, StoreError> {
+    if ctx.store.run(published.run_id)?.state == RunState::AwaitingCi {
+        ctx.store
+            .set_run_state(published.run_id, RunState::Judging, ctx.clock.now())?;
+    }
+    ctx.store.settle_attempt(
+        published.attempt_id,
+        published.run_id,
+        RunState::Merged,
+        ctx.clock.now(),
+    )?;
+    warn_label_comment(
+        ctx,
+        &[DONE_LABEL],
+        &[RUNNING_LABEL, trigger_label(flow)],
+        &format!(
+            "inchworm found {} already merged after attempt {} (judged head `{sha}`).",
+            published.pr.url, published.attempt_n
+        ),
+        warnings,
+    );
+    Ok(Concluded::Accepted {
+        state: RunState::Merged,
+    })
+}
+
 pub async fn conclude(
     ctx: &ConcludeContext<'_>,
     env: &OutcomeEnv<'_>,
@@ -246,37 +337,32 @@ pub async fn conclude(
     warnings: &mut Vec<String>,
 ) -> Result<Concluded, StoreError> {
     let sha = published.judged_sha;
+    match inspect_live(ctx, flow, published, sha) {
+        Live::AlreadyMerged => return settle_merged(ctx, flow, published, sha, warnings),
+        Live::Rejected(class, raw) => return reject(ctx, flow, published, class, raw),
+        Live::Open(_) => {}
+    }
     let run = ctx.store.run(published.run_id)?;
-    let ci = if run.state == RunState::AwaitingCi {
-        let ci = wait_for_ci(
-            ctx.github,
-            ctx.clock,
-            ctx.slug,
-            sha,
-            &flow.outcome.required_checks,
-            &env.ci,
-        )
-        .await;
+    let ci = wait_for_ci(
+        ctx.github,
+        ctx.clock,
+        ctx.slug,
+        sha,
+        &flow.outcome.required_checks,
+        &env.ci,
+    )
+    .await;
+    if run.state == RunState::AwaitingCi {
         ctx.store
             .set_run_state(published.run_id, RunState::Judging, ctx.clock.now())?;
-        ci
-    } else {
-        let runs = ctx.github.check_runs(ctx.slug, sha).unwrap_or_default();
-        match evaluate_required(&flow.outcome.required_checks, &runs, sha) {
-            CiStatus::Green => CiResult::Green(runs),
-            CiStatus::Red(name) => CiResult::Red(name),
-            CiStatus::Waiting(pending) => CiResult::TimedOut {
-                pending,
-                last_error: None,
-            },
-        }
-    };
+    }
 
     let checks = match ci {
         CiResult::Green(runs) => runs,
         CiResult::Red(name) => {
             return reject(
                 ctx,
+                flow,
                 published,
                 FailureClass::CiRed,
                 format!("required check `{name}` failed on {sha}"),
@@ -294,38 +380,22 @@ pub async fn conclude(
             if let Some(err) = last_error {
                 raw.push_str(&format!(" (last github error: {err})"));
             }
-            return reject(ctx, published, FailureClass::Timeout, raw);
+            return reject(ctx, flow, published, FailureClass::Timeout, raw);
         }
     };
 
-    let live = match ctx.github.pr(ctx.slug, published.pr.number) {
-        Ok(live) => live,
-        Err(err) => {
-            return reject(
-                ctx,
-                published,
-                FailureClass::MergeBlocked,
-                format!("cannot read the live pull request: {err}"),
-            );
-        }
+    let live = match inspect_live(ctx, flow, published, sha) {
+        Live::Open(live) => live,
+        Live::AlreadyMerged => return settle_merged(ctx, flow, published, sha, warnings),
+        Live::Rejected(class, raw) => return reject(ctx, flow, published, class, raw),
     };
-    if !live.head_sha.eq_ignore_ascii_case(sha) {
-        return reject(
-            ctx,
-            published,
-            FailureClass::MergeBlocked,
-            format!(
-                "head moved from {sha} to {} after the attempt was published",
-                live.head_sha
-            ),
-        );
-    }
 
     let patch = match ctx.github.pr_patch(ctx.slug, published.pr.number) {
         Ok(patch) => patch,
         Err(err) => {
             return reject(
                 ctx,
+                flow,
                 published,
                 FailureClass::JudgeRejected,
                 format!("cannot read the pull request patch: {err}"),
@@ -364,10 +434,12 @@ pub async fn conclude(
 
     match decision {
         Decision::DraftPr => {
-            ctx.store
-                .finish_attempt_ok(published.attempt_id, ctx.clock.now())?;
-            ctx.store
-                .set_run_state(published.run_id, RunState::PrOpen, ctx.clock.now())?;
+            ctx.store.settle_attempt(
+                published.attempt_id,
+                published.run_id,
+                RunState::PrOpen,
+                ctx.clock.now(),
+            )?;
             warn_label_comment(
                 ctx,
                 &[DONE_LABEL],
@@ -394,10 +466,12 @@ pub async fn conclude(
                 });
             match merged {
                 Ok(()) => {
-                    ctx.store
-                        .finish_attempt_ok(published.attempt_id, ctx.clock.now())?;
-                    ctx.store
-                        .set_run_state(published.run_id, RunState::Merged, ctx.clock.now())?;
+                    ctx.store.settle_attempt(
+                        published.attempt_id,
+                        published.run_id,
+                        RunState::Merged,
+                        ctx.clock.now(),
+                    )?;
                     warn_label_comment(
                         ctx,
                         &[DONE_LABEL],
@@ -414,16 +488,13 @@ pub async fn conclude(
                         state: RunState::Merged,
                     })
                 }
-                Err(err) => {
-                    let restored = ctx.github.mark_draft(ctx.slug, published.pr.number);
-                    let raw = match restored {
-                        Ok(()) => format!("merge was refused: {err}"),
-                        Err(undo) => format!(
-                            "merge was refused: {err}; restoring draft status also failed: {undo}"
-                        ),
-                    };
-                    reject(ctx, published, FailureClass::MergeBlocked, raw)
-                }
+                Err(err) => reject(
+                    ctx,
+                    flow,
+                    published,
+                    FailureClass::MergeBlocked,
+                    format!("merge was refused: {err}"),
+                ),
             }
         }
         other => {
@@ -436,17 +507,39 @@ pub async fn conclude(
             } else {
                 format!("policy refused the outcome for {sha}")
             };
-            reject(ctx, published, class, raw)
+            reject(ctx, flow, published, class, raw)
         }
+    }
+}
+
+fn restore_draft(
+    ctx: &ConcludeContext<'_>,
+    flow: &Flow,
+    published: &Published<'_>,
+) -> Option<String> {
+    if flow.outcome.mode != OutcomeMode::MergeWhen {
+        return None;
+    }
+    match ctx.github.pr(ctx.slug, published.pr.number) {
+        Ok(live) if live.state == PrState::Open && !live.is_draft => ctx
+            .github
+            .mark_draft(ctx.slug, published.pr.number)
+            .err()
+            .map(|err| err.to_string()),
+        _ => None,
     }
 }
 
 fn reject(
     ctx: &ConcludeContext<'_>,
+    flow: &Flow,
     published: &Published<'_>,
     class: FailureClass,
-    raw: String,
+    mut raw: String,
 ) -> Result<Concluded, StoreError> {
+    if let Some(undo) = restore_draft(ctx, flow, published) {
+        raw.push_str(&format!("; restoring draft status also failed: {undo}"));
+    }
     ctx.store
         .finish_attempt_failed(published.attempt_id, class, &raw, ctx.clock.now())?;
     Ok(Concluded::Rejected { class, raw })
@@ -966,6 +1059,158 @@ mod tests {
         assert!(rig.github.ready_calls().is_empty());
         assert!(rig.github.merge_calls().is_empty());
         assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
+    }
+
+    fn live_pr(edit: impl FnOnce(&mut PullRequest)) -> Rig {
+        let rig = rig();
+        let mut live = pr_at(77, SHA);
+        edit(&mut live);
+        rig.github.add_pr("o/r", "inchworm/5-a1", live);
+        rig.github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![check("build", SHA, CheckConclusion::Success)],
+        );
+        rig.github.set_pr_patch("o/r", 77, &patch(2));
+        rig
+    }
+
+    #[tokio::test]
+    async fn a_merged_pr_found_while_judging_ends_the_run_merged_without_merging_again() {
+        let rig = live_pr(|pr| {
+            pr.state = PrState::Merged;
+            pr.is_draft = false;
+        });
+        let (concluded, _) = conclude_for(&rig, &merge_flow(), &pr_at(77, SHA), SHA, 5).await;
+        assert_eq!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::Merged
+            }
+        );
+        assert!(rig.github.merge_calls().is_empty());
+        assert!(rig.github.ready_calls().is_empty());
+        assert_eq!(
+            rig.github.issue_labels("o/r", 5),
+            ["inchworm:done".to_string()]
+        );
+        let run = rig.store.active_run("o/r").unwrap();
+        assert!(run.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_closed_pr_is_never_accepted_as_pr_open() {
+        for flow in [merge_flow(), flow_with(1, "", DRAFT_OUTCOME)] {
+            let rig = live_pr(|pr| pr.state = PrState::Closed);
+            let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
+            assert!(
+                matches!(
+                    &concluded,
+                    Concluded::Rejected { class: FailureClass::MergeBlocked, raw } if raw.contains("closed")
+                ),
+                "{concluded:?}"
+            );
+            assert!(rig.github.merge_calls().is_empty());
+            assert!(rig.github.ready_calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fork_pr_is_rejected_in_both_modes() {
+        for flow in [merge_flow(), flow_with(1, "", DRAFT_OUTCOME)] {
+            let rig = live_pr(|pr| pr.is_cross_repository = true);
+            let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
+            assert!(
+                matches!(
+                    &concluded,
+                    Concluded::Rejected { class: FailureClass::MergeBlocked, raw } if raw.contains("fork")
+                ),
+                "{concluded:?}"
+            );
+            assert!(rig.github.merge_calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pr_targeting_another_base_is_rejected_in_both_modes() {
+        for flow in [merge_flow(), flow_with(1, "", DRAFT_OUTCOME)] {
+            let rig = live_pr(|pr| pr.base_ref = "release".into());
+            let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
+            assert!(
+                matches!(
+                    &concluded,
+                    Concluded::Rejected { class: FailureClass::MergeBlocked, raw } if raw.contains("release") && raw.contains("main")
+                ),
+                "{concluded:?}"
+            );
+            assert!(rig.github.merge_calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_same_repo_pr_on_the_flow_base_is_accepted() {
+        let rig = live_pr(|_| {});
+        let concluded =
+            conclude_with(&rig, &flow_with(1, "", DRAFT_OUTCOME), &pr_at(77, SHA), SHA).await;
+        assert!(
+            matches!(concluded, Concluded::Accepted { .. }),
+            "{concluded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pr_left_ready_by_a_death_between_ready_and_merge_is_made_a_draft_again() {
+        let rig = live_pr(|pr| pr.is_draft = false);
+        rig.github.fail_merges_with("not mergeable");
+        let mut flow = merge_flow();
+        flow.outcome.required_checks = names(&["build"]);
+        let mut env = env(&rig.scorer);
+        env.human_gate = HumanGate::Absent;
+        let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), "b".repeat(40).as_str()).await;
+        assert!(
+            matches!(concluded, Concluded::Rejected { .. }),
+            "{concluded:?}"
+        );
+        assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
+        assert_eq!(rig.github.draft_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_draft_pr_flow_never_touches_a_pr_a_human_marked_ready() {
+        let rig = live_pr(|pr| pr.is_draft = false);
+        let mut judged = flow_with(1, "", DRAFT_OUTCOME);
+        judged.outcome.required_checks = names(&["other"]);
+        let concluded = conclude_with(&rig, &judged, &pr_at(77, SHA), SHA).await;
+        assert!(
+            matches!(concluded, Concluded::Rejected { .. }),
+            "{concluded:?}"
+        );
+        assert!(rig.github.draft_calls().is_empty());
+        assert!(!rig.github.pr("o/r", 77).unwrap().is_draft);
+    }
+
+    #[tokio::test]
+    async fn a_transient_check_run_error_on_resume_is_waited_out_and_reported_honestly() {
+        let rig = rig();
+        rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        rig.github.fail_check_runs_with("HTTP 502");
+        let run = published_run(&rig, RunState::Judging);
+        let extra = outcome_toml("draft_pr", &["build"]);
+        let before = rig.clock.now();
+        let summary = execute_run(
+            &rig.ctx(),
+            &env(&rig.scorer),
+            &flow_with(1, "", &extra),
+            run,
+            &mut MustNotDispatch,
+            None,
+        )
+        .await
+        .unwrap();
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::Timeout);
+        assert!(raw.contains("HTTP 502"), "{raw}");
+        assert!(rig.clock.now() > before);
     }
 
     #[tokio::test]

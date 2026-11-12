@@ -101,5 +101,7 @@ pub fn pr_at(number: u64, sha: &str) -> PullRequest {
         is_draft: true,
         state: PrState::Open,
         url: format!("https://github.com/o/r/pull/{number}"),
+        base_ref: "main".into(),
+        is_cross_repository: false,
     }
 }
