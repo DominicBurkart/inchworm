@@ -56,6 +56,52 @@ CREATE TABLE attempts (
 );
 "];
 
+const FROZEN_OBJECTS: &[(&str, &str, &str)] = &[
+    (
+        "table",
+        "runs",
+        "CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('issue', 'pr', 'commit')),
+    subject_ref TEXT NOT NULL CHECK (length(subject_ref) > 0),
+    flow TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'awaiting_ci', 'judging', 'merged', 'pr_open', 'failed', 'escalated')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)",
+    ),
+    (
+        "index",
+        "runs_one_open_per_subject",
+        "CREATE UNIQUE INDEX runs_one_open_per_subject
+    ON runs (repo, subject_kind, subject_ref, flow)
+    WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+    ),
+    (
+        "table",
+        "attempts",
+        "CREATE TABLE attempts (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('dispatched', 'succeeded', 'failed')),
+    branch TEXT,
+    head_sha TEXT,
+    pr_number INTEGER,
+    failure_class TEXT,
+    raw_error TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    UNIQUE (run_id, n)
+)",
+    ),
+];
+
+fn normalise_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 const EXPECTED_RUN_COLUMNS: &[&str] = &[
     "id",
     "repo",
@@ -676,6 +722,21 @@ impl Store {
                 "the index `runs_one_open_per_subject` covers {indexed:?}, expected {EXPECTED_INDEX_COLUMNS:?}"
             ));
         }
+        for (kind, name, expected) in FROZEN_OBJECTS {
+            let stored: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    [kind, name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if stored.as_deref().map(normalise_sql) != Some(normalise_sql(expected)) {
+                return mismatch(format!(
+                    "the definition of the {kind} `{name}` differs from migration 1"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1137,6 +1198,74 @@ CREATE TABLE attempts (
             let message = mismatch(Store::open(&path));
             assert!(message.contains("delete"), "{name}: {message}");
         }
+    }
+
+    fn database_made_from(migration: &str, dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("variant.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(migration).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        path
+    }
+
+    fn altered(from: &str, to: &str) -> String {
+        assert_eq!(MIGRATIONS[0].matches(from).count(), 1, "{from}");
+        MIGRATIONS[0].replace(from, to)
+    }
+
+    #[test]
+    fn a_schema_with_the_same_columns_but_different_constraints_or_predicate_is_refused() {
+        let variants = [
+            (
+                "index predicate narrowed",
+                altered(
+                    "WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+                    "WHERE state IN ('queued')",
+                ),
+            ),
+            (
+                "runs state check without escalated",
+                altered("'failed', 'escalated')", "'failed')"),
+            ),
+            (
+                "subject_ref check removed",
+                altered(" CHECK (length(subject_ref) > 0)", ""),
+            ),
+            (
+                "subject_kind check removed",
+                altered(" CHECK (subject_kind IN ('issue', 'pr', 'commit'))", ""),
+            ),
+            (
+                "attempts state check removed",
+                altered(
+                    " CHECK (state IN ('dispatched', 'succeeded', 'failed'))",
+                    "",
+                ),
+            ),
+            (
+                "unique run_id and n removed",
+                altered(",\n    UNIQUE (run_id, n)", ""),
+            ),
+            ("foreign key removed", altered(" REFERENCES runs(id)", "")),
+        ];
+        for (name, migration) in variants {
+            let dir = tempfile::tempdir().unwrap();
+            let path = database_made_from(&migration, &dir);
+            let message = mismatch(Store::open(&path));
+            assert!(message.contains("delete"), "{name}: {message}");
+            assert!(message.contains("definition"), "{name}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_schema_that_differs_only_in_whitespace_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = MIGRATIONS[0].replace("    ", "\t").replace(", ", ",\n  ");
+        let path = database_made_from(&spaced, &dir);
+        assert_eq!(
+            Store::open(&path).unwrap().schema_version().unwrap(),
+            MIGRATIONS.len()
+        );
     }
 
     #[test]
