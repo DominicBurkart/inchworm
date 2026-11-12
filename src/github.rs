@@ -317,6 +317,7 @@ struct FakeState {
     repo_labels: BTreeMap<String, BTreeSet<String>>,
     prs: BTreeMap<(String, String), PullRequest>,
     pr_files: BTreeMap<(String, u64), Vec<String>>,
+    pr_files_error: Option<String>,
     comments: Vec<(String, u64, String)>,
 }
 
@@ -354,6 +355,10 @@ impl FakeGitHub {
             .unwrap()
             .prs
             .insert((repo.to_string(), branch.to_string()), pr);
+    }
+
+    pub fn fail_pr_files(&self, message: &str) {
+        self.state.lock().unwrap().pr_files_error = Some(message.to_string());
     }
 
     pub fn set_pr_files(&self, repo: &str, number: u64, files: &[&str]) {
@@ -461,10 +466,14 @@ impl GitHub for FakeGitHub {
     }
 
     fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        if let Some(message) = &state.pr_files_error {
+            return Err(GitHubError::Command {
+                command: format!("gh api repos/{repo}/pulls/{number}/files"),
+                detail: message.clone(),
+            });
+        }
+        Ok(state
             .pr_files
             .get(&(repo.to_string(), number))
             .cloned()

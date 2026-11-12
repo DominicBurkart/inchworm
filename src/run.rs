@@ -737,6 +737,26 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn a_pr_whose_file_list_cannot_be_read_is_never_accepted_unchecked() {
+        let store = Store::open_in_memory().unwrap();
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        github.set_pr_files("o/r", 77, &["src/lib.rs"]);
+        github.fail_pr_files("API rate limit exceeded");
+        let (mut client, _fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = run_issue(&ctx(&store, &github), &flow(1, ""), 5, &mut client).unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        let (class, raw) = summary.failure.unwrap();
+        assert_eq!(class, FailureClass::AgentFailed);
+        assert!(raw.contains("API rate limit exceeded"), "{raw}");
+        assert!(summary.pr.is_none());
+        let attempt = &store.attempts(summary.run_id).unwrap()[0];
+        assert_eq!(attempt.pr_number, None);
+        assert_eq!(attempt.head_sha, None);
+    }
+
+    #[test]
     fn a_pr_touching_inchworm_is_rejected_even_when_nanna_reported_clean_output() {
         let store = Store::open_in_memory().unwrap();
         let github = github();
