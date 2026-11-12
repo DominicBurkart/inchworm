@@ -3,7 +3,7 @@ D=$(dirname "$0")
 cfg() { if [ -f "$D/$1" ]; then cat "$D/$1"; else printf '%s' "$2"; fi; }
 if [ "$1" = agents ]; then
   printf 'NAME LOOP MODEL MAX_EFFECT\n'
-  for name in $(cfg identities rust-implementer); do printf '%s inner m workspace\n' "$name"; done
+  for name in $(cfg identities "auditor rust-implementer"); do printf '%s inner m workspace\n' "$name"; done
   exit 0
 fi
 [ "$1" = mcp-serve ] || exit 9

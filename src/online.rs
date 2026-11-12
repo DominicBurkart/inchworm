@@ -163,8 +163,27 @@ pub struct Online<'a> {
 /// let online = Online { catalog: &Empty, github: &github, builder: None };
 /// assert!(!validate_online(&config, &online).is_ok());
 /// ```
+pub const AUDITOR_IDENTITY: &str = "auditor";
+
+const NANNA_OLLAMA_ADDRESSES: [&str; 3] = [
+    "http://localhost:11434",
+    "http://127.0.0.1:11434",
+    "http://[::1]:11434",
+];
+
 pub fn validate_online(config: &GlobalConfig, online: &Online<'_>) -> Report {
     let mut report = validate(config);
+    let configured = config.ollama_url.trim().trim_end_matches('/');
+    if !NANNA_OLLAMA_ADDRESSES.contains(&configured) {
+        report.push(
+            None,
+            Severity::Warning,
+            format!(
+                "ollama_url is {} but `nanna mcp-serve` always talks to Ollama at http://localhost:11434; the setting applies only to inchworm's own calls",
+                config.ollama_url
+            ),
+        );
+    }
     for repo in &config.repo {
         check_repo_online(repo, online, &mut report);
     }
@@ -191,6 +210,16 @@ fn check_repo_online(repo: &RepoEntry, online: &Online<'_>, report: &mut Report)
 
     match online.catalog.identities(&repo.path) {
         Ok(known) => {
+            if !known.contains(AUDITOR_IDENTITY) {
+                report.push(
+                    slug,
+                    Severity::Error,
+                    format!(
+                        "nanna has no `{AUDITOR_IDENTITY}` identity here and `nanna mcp-serve` refuses to start without one; add an auditor card to the global catalog (known: {})",
+                        known.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                );
+            }
             for flow in &file.flow {
                 for step in &flow.step {
                     if !known.contains(&step.identity) {
@@ -363,7 +392,12 @@ mode = "draft_pr"
     fn a_fully_resolvable_repo_is_clean() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd", "reviewer"]));
+        let catalog = Catalog(Ok(vec![
+            "auditor",
+            "rust-implementer",
+            "pr-shepherd",
+            "reviewer",
+        ]));
         let github = github_with_labels(ALL_LABELS);
         let online = Online {
             catalog: &catalog,
@@ -378,7 +412,7 @@ mode = "draft_pr"
     fn unresolvable_identities_are_errors_naming_the_step() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer"]));
         let github = github_with_labels(ALL_LABELS);
         let online = Online {
             catalog: &catalog,
@@ -392,7 +426,10 @@ mode = "draft_pr"
             message.contains("step `publish`") && message.contains("`pr-shepherd`"),
             "{message}"
         );
-        assert!(message.contains("known: rust-implementer"));
+        assert!(
+            message.contains("known: auditor, rust-implementer"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -415,10 +452,75 @@ mode = "draft_pr"
     }
 
     #[test]
-    fn every_status_label_is_required_and_named_in_its_own_error() {
+    fn a_catalog_without_an_auditor_card_is_an_error_because_nanna_will_not_start() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
         let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(ALL_LABELS);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            builder: None,
+        };
+        let report = validate_online(&config, &online);
+        let found = messages(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("`auditor`") && found[0].contains("refuses to start"),
+            "{found:?}"
+        );
+        assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn an_ollama_url_that_is_not_nannas_address_is_only_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = repo(dir.path());
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(ALL_LABELS);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            builder: None,
+        };
+        for same in [
+            "http://localhost:11434",
+            "http://localhost:11434/",
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434/",
+        ] {
+            config.ollama_url = same.to_string();
+            let report = validate_online(&config, &online);
+            assert!(report.findings.is_empty(), "{same}: {:?}", report.findings);
+        }
+        for different in [
+            "http://gpu-box:11434",
+            "http://localhost:8080",
+            "https://localhost:11434",
+        ] {
+            config.ollama_url = different.to_string();
+            let report = validate_online(&config, &online);
+            assert!(report.is_ok(), "{different}");
+            assert_eq!(
+                report.warning_count(),
+                1,
+                "{different}: {:?}",
+                report.findings
+            );
+            let message = &report.findings[0].message;
+            assert!(
+                message.contains(different) && message.contains("localhost:11434"),
+                "{message}"
+            );
+            assert_eq!(report.findings[0].repo, None);
+        }
+    }
+
+    #[test]
+    fn every_status_label_is_required_and_named_in_its_own_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let github = github_with_labels(&["inchworm"]);
         let online = Online {
             catalog: &catalog,
@@ -445,7 +547,7 @@ mode = "draft_pr"
             flows.replace("label = \"inchworm\"", "label = \"queue-me\""),
         )
         .unwrap();
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let github = github_with_labels(&[
             "inchworm",
             "inchworm:running",
@@ -469,7 +571,7 @@ mode = "draft_pr"
     fn missing_labels_are_errors_with_the_fix() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let github = github_with_labels(&["inchworm", "inchworm:done"]);
         let online = Online {
             catalog: &catalog,
@@ -488,7 +590,7 @@ mode = "draft_pr"
     fn a_failing_label_listing_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let online = Online {
             catalog: &catalog,
             github: &BrokenGitHub,
@@ -502,7 +604,7 @@ mode = "draft_pr"
     fn images_are_built_only_when_asked_and_failures_are_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let github = github_with_labels(ALL_LABELS);
 
         let ok = Builder {
