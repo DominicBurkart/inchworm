@@ -365,6 +365,7 @@ dependencies = [
  "assert_cmd",
  "cargo-husky",
  "clap",
+ "libc",
  "predicates",
  "proptest",
  "rusqlite",
