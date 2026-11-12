@@ -1176,6 +1176,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_merge_when_rejection_leaves_an_already_draft_pr_alone() {
+        let rig = live_pr(|_| {});
+        let mut flow = merge_flow();
+        flow.outcome.required_checks = names(&["other"]);
+        let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
+        assert!(
+            matches!(concluded, Concluded::Rejected { .. }),
+            "{concluded:?}"
+        );
+        assert!(rig.github.draft_calls().is_empty());
+        assert!(rig.github.pr("o/r", 77).unwrap().is_draft);
+    }
+
+    #[tokio::test]
     async fn a_draft_pr_flow_never_touches_a_pr_a_human_marked_ready() {
         let rig = live_pr(|pr| pr.is_draft = false);
         let mut judged = flow_with(1, "", DRAFT_OUTCOME);

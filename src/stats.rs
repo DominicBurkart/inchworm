@@ -231,6 +231,20 @@ mod tests {
     }
 
     #[test]
+    fn window_lengths_are_exact_seconds() {
+        let seconds: Vec<(&str, Option<i64>)> = WINDOWS.to_vec();
+        assert_eq!(
+            seconds,
+            [
+                ("24h", Some(86_400)),
+                ("7d", Some(604_800)),
+                ("30d", Some(2_592_000)),
+                ("all", None)
+            ]
+        );
+    }
+
+    #[test]
     fn status_lists_recent_runs_with_their_state() {
         let store = Store::open_in_memory().unwrap();
         finished(&store, "o/r", 7, RunState::PrOpen, 5);
