@@ -954,6 +954,19 @@ mod tests {
     }
 
     #[test]
+    fn git_named_escapes_decode_to_their_control_characters() {
+        assert_eq!(
+            decode_git_quotes("\\a\\b\\t\\n\\v\\f\\r\\\\\\\""),
+            "\u{7}\u{8}\t\n\u{b}\u{c}\r\\\""
+        );
+        assert_eq!(decode_git_quotes("a\\"), "a\\");
+        assert_eq!(decode_git_quotes("\\9"), "\\9");
+        assert_eq!(decode_git_quotes("\\1"), "\u{1}");
+        assert_eq!(decode_git_quotes("\\1234"), "S4");
+        assert_eq!(decode_git_quotes("\\400"), "\u{0}");
+    }
+
+    #[test]
     fn a_windows_separator_is_still_a_separator_even_when_it_spells_an_escape() {
         for bad in [
             ".inchworm\\temp\\x",

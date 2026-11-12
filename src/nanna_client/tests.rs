@@ -116,6 +116,54 @@ fn a_multi_paragraph_failure_message_keeps_all_paragraphs_and_recovers_the_error
 }
 
 #[test]
+fn a_trailing_block_that_is_not_json_is_part_of_the_message_not_diagnostics() {
+    let text = "went wrong\n\n{not json at all}";
+    let outcome = parse_result(TaskState::Failed, &failed_wire(text)).unwrap();
+    assert_eq!(
+        outcome,
+        TaskOutcome::Failed(NannaFailure {
+            failure_kind: None,
+            error_type: None,
+            message: text.into(),
+        })
+    );
+}
+
+#[test]
+fn a_task_accepted_already_finished_is_not_cancelled_on_drop() {
+    let replies = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"t","status":"completed"}}}"#,
+        "\n"
+    );
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(replies.as_bytes()).unwrap();
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut client = NannaClient::new(
+        BufReader::new(reader),
+        Capture(std::sync::Arc::clone(&written)),
+    );
+    let Submitted::Accepted(info) = client.assign_task(&request("x")).unwrap() else {
+        panic!("expected acceptance");
+    };
+    assert_eq!(info.state, TaskState::Completed);
+    drop(client);
+    drop(writer);
+    let sent = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+    assert!(!sent.contains("tasks/cancel"), "{sent}");
+    assert!(sent.contains("\"assign_task\""), "{sent}");
+}
+
+#[test]
 fn crlf_line_endings_before_the_diagnostics_block_do_not_hide_it() {
     let text = "went wrong\r\n\r\n{\r\n  \"error_type\": \"StateError\",\r\n  \"denials\": []\r\n}";
     let outcome = parse_result(TaskState::Failed, &failed_wire(text)).unwrap();

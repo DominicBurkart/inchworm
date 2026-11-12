@@ -634,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn only_digit_attempt_numbers_on_the_right_issue_count_as_an_issue_branch() {
+        assert_eq!(issue_branch_attempt("inchworm/5-a1", 5), Some(1));
+        assert_eq!(issue_branch_attempt("inchworm/5-a0", 5), Some(0));
+        for not in [
+            "inchworm/5-a",
+            "inchworm/5-abc",
+            "inchworm/5-a1x",
+            "inchworm/5-a-1",
+            "inchworm/6-a1",
+            "inchworm/50-a1",
+            "inchworm/5-a99999999999",
+            "other/5-a1",
+            "",
+        ] {
+            assert_eq!(issue_branch_attempt(not, 5), None, "{not}");
+            assert!(!is_issue_branch(not, 5), "{not}");
+        }
+    }
+
+    #[test]
     fn gh_finds_the_pr_for_a_branch_or_none() {
         let pr = r#"[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9"}]"#;
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![
