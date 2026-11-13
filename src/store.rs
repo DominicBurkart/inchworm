@@ -2206,6 +2206,40 @@ CREATE TABLE attempts (
     }
 
     #[test]
+    fn the_attempt_count_ignores_pull_request_subjects_with_the_same_number() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = store
+            .enqueue_run("o/r", &issue(5), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let pull = store
+            .enqueue_run("o/r", &Subject::pr(5).unwrap(), "issue", 1)
+            .unwrap()
+            .unwrap();
+        for run in [mine, pull, pull] {
+            store.set_run_state(run, RunState::Running, 2).ok();
+            store.start_attempt(run, 2).unwrap();
+        }
+        assert_eq!(store.issue_attempt_count("o/r", 5).unwrap(), 1);
+    }
+
+    #[test]
+    fn open_run_sees_every_open_state_including_judging() {
+        let (store, id) = store_with_run();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));
+        for state in [RunState::Running, RunState::AwaitingCi, RunState::Judging] {
+            store.set_run_state(id, state, 11).unwrap();
+            assert_eq!(
+                store.open_run("o/r", 1, "issue").unwrap(),
+                Some(id),
+                "{state:?}"
+            );
+        }
+        store.set_run_state(id, RunState::PrOpen, 12).unwrap();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), None);
+    }
+
+    #[test]
     fn the_attempt_count_is_scoped_to_one_repo_and_one_issue() {
         let store = Store::open_in_memory().unwrap();
         let mine = store

@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::{GlobalConfig, PROJECT_FILE, ProjectConfig, RepoEntry};
+use crate::config::{GlobalConfig, LEGACY_FLOWS_FILE, PROJECT_FILE, ProjectConfig, RepoEntry};
 use crate::github::GhCli;
 use crate::model::RunState;
 use crate::nanna_client::{NannaClient, SpawnOptions, state_dir_for};
@@ -99,7 +99,7 @@ pub struct RunArgs {
 pub enum Command {
     /// Check the global config and every registered repository.
     Validate(ValidateArgs),
-    /// Run one flow for one issue in the foreground.
+    /// Run one flow for one issue in the foreground. It dispatches the steps to nanna; it does not run an auditor, an offramp, a judge, CI waiting or the outcome policy.
     Run(RunArgs),
     /// List the registered directories (slug, then path, tab separated).
     List {
@@ -301,8 +301,20 @@ fn run_command(
 ) -> Result<bool> {
     let repo = find_repo(&config, selector)?;
     let flows_path = repo.path.join(PROJECT_FILE);
-    let text = std::fs::read_to_string(&flows_path)
-        .with_context(|| format!("cannot read {}", flows_path.display()))?;
+    let text = match std::fs::read_to_string(&flows_path) {
+        Ok(text) => text,
+        Err(error) => {
+            let legacy = repo.path.join(LEGACY_FLOWS_FILE);
+            let moved = error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.is_file());
+            if moved {
+                return Err(anyhow!(
+                    "{LEGACY_FLOWS_FILE} has moved to {PROJECT_FILE} at the repository root, together with the new [auditor] table; it is no longer read"
+                ));
+            }
+            return Err(error).with_context(|| format!("cannot read {}", flows_path.display()));
+        }
+    };
     let file = ProjectConfig::parse(&text)?;
     let selected = match flow {
         Some(name) => file.flow.iter().find(|f| f.name == name),
@@ -359,7 +371,7 @@ fn run_command(
     if summary.state == RunState::AwaitingCi {
         let _ = writeln!(
             out,
-            "CI, judges and the outcome policy are not run by this command yet"
+            "auditors, offramps, CI, judges and the outcome policy are not run by this command yet"
         );
     }
     Ok(summary.state != RunState::Failed)
@@ -836,6 +848,112 @@ mod tests {
         let (code, out, err) = f.args(&["run", "o/r", "5"]);
         assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
         assert!(err.contains("already has a run for flow `issue`"), "{err}");
+    }
+
+    #[test]
+    fn the_note_about_what_run_does_not_do_is_printed_only_when_awaiting_ci() {
+        let ok = fakes().args(&["run", "o/r", "5"]);
+        assert_eq!(ok.0, EXIT_VALID, "{ok:?}");
+        assert!(
+            ok.1.contains("auditors, offramps, CI, judges and the outcome policy are not run"),
+            "{}",
+            ok.1
+        );
+        let f = fakes();
+        f.set("state", "task_failed");
+        f.set("result", "result_failed_structured");
+        let failed = f.args(&["run", "o/r", "5"]);
+        assert_eq!(failed.0, EXIT_REPO_ERRORS, "{failed:?}");
+        assert!(
+            !failed.1.contains("are not run by this command"),
+            "{}",
+            failed.1
+        );
+    }
+
+    #[test]
+    fn run_help_says_what_the_command_does_not_run() {
+        let (code, out, _) = exec(&["inchworm", "run", "--help"], &Env::default());
+        assert_eq!(code, EXIT_VALID);
+        assert!(
+            out.contains("does not run an auditor, an offramp, a judge"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn run_says_the_flows_file_moved_when_only_the_old_layout_exists() {
+        let f = fakes();
+        let repo = &f.setup.repo;
+        let current = std::fs::read_to_string(repo.join("inchworm.toml")).unwrap();
+        std::fs::remove_file(repo.join("inchworm.toml")).unwrap();
+        std::fs::write(repo.join(".inchworm/flows.toml"), &current).unwrap();
+        let (code, out, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(
+            err.contains(".inchworm/flows.toml has moved to inchworm.toml"),
+            "{err}"
+        );
+        std::fs::remove_file(repo.join(".inchworm/flows.toml")).unwrap();
+        let (code, _, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!(code, EXIT_UNUSABLE);
+        assert!(
+            err.contains("cannot read") && !err.contains("has moved"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_does_not_call_an_unreadable_inchworm_toml_a_move() {
+        let f = fakes();
+        let repo = &f.setup.repo;
+        let current = std::fs::read_to_string(repo.join("inchworm.toml")).unwrap();
+        std::fs::remove_file(repo.join("inchworm.toml")).unwrap();
+        std::fs::create_dir(repo.join("inchworm.toml")).unwrap();
+        std::fs::write(repo.join(".inchworm/flows.toml"), current).unwrap();
+        let (code, _, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!(code, EXIT_UNUSABLE);
+        assert!(
+            err.contains("cannot read") && !err.contains("has moved"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_does_not_follow_a_symlinked_old_flows_file_into_a_move_message() {
+        let f = fakes();
+        let repo = &f.setup.repo;
+        let current = std::fs::read_to_string(repo.join("inchworm.toml")).unwrap();
+        std::fs::remove_file(repo.join("inchworm.toml")).unwrap();
+        std::fs::write(repo.join("elsewhere.toml"), current).unwrap();
+        std::os::unix::fs::symlink(
+            repo.join("elsewhere.toml"),
+            repo.join(".inchworm/flows.toml"),
+        )
+        .unwrap();
+        let (code, _, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!(code, EXIT_UNUSABLE);
+        assert!(
+            err.contains("cannot read") && !err.contains("has moved"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_without_a_flow_name_uses_the_first_flow() {
+        let f = fakes();
+        let path = f.setup.repo.join("inchworm.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("[[flow]]\nname = \"second\"\ntrigger = { kind = \"label\", label = \"second-label\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n");
+        std::fs::write(&path, text).unwrap();
+        let (code, out, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!(code, EXIT_VALID, "{out} {err}");
+        let g = fakes();
+        std::fs::copy(&path, g.setup.repo.join("inchworm.toml")).unwrap();
+        let (code, _, err) = g.args(&["run", "o/r", "5", "--flow", "second"]);
+        assert_eq!(code, EXIT_UNUSABLE, "{err}");
+        assert!(err.contains("second-label"), "{err}");
     }
 
     #[test]

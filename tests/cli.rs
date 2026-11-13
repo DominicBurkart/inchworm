@@ -548,3 +548,15 @@ fn list_to_a_full_device_exits_two() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot write the list"));
 }
+
+#[test]
+fn list_exits_two_when_the_config_is_unreadable_and_prints_nothing_to_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    inchworm()
+        .args(["list", "--config"])
+        .arg(dir.path().join("missing.toml"))
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("cannot read"));
+}
