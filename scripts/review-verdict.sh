@@ -23,8 +23,12 @@ if [ "$(tr -d '\000' < "$file" | wc -c)" != "$(wc -c < "$file")" ]; then
     exit 1
 fi
 
-if grep -qiE 'verdict[^[:alnum:]]*unsafe' "$file" || LC_ALL=C grep -qE '(^|[^A-Za-z])UNSAFE([^A-Za-z]|$)' "$file"; then
+if grep -qiE 'verdict.*unsafe|unsafe.*verdict' "$file" || LC_ALL=C grep -qE '(^|[^A-Za-z])UNSAFE([^A-Za-z]|$)' "$file"; then
     echo "The security review also contains an UNSAFE verdict." >&2
+    exit 1
+fi
+if grep -qiE '(^|[^[:alnum:]])not[[:space:]]+safe([^[:alnum:]]|$)' "$file"; then
+    echo "The security review says the change is not safe." >&2
     exit 1
 fi
 exit 0

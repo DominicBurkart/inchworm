@@ -91,6 +91,52 @@ fn any_later_unsafe_verdict_blocks_whatever_its_markup() {
 }
 
 #[test]
+fn a_line_that_pairs_verdict_with_unsafe_blocks_in_any_order_and_case() {
+    let blocked: &[&[u8]] = &[
+        b"VERDICT: SAFE\nVerdict: this change is unsafe to push\n",
+        b"VERDICT: SAFE\nThe unsafe verdict stands.\n",
+        b"VERDICT: SAFE\nmy verdict on this commit: unsafe\n",
+        b"VERDICT: SAFE\nunsafe, final verdict\n",
+        b"VERDICT: SAFE\nVeRdIcT => UnSaFe\n",
+    ];
+    for output in blocked {
+        let (code, message) = verdict(output);
+        assert_eq!(code, 1, "{:?}", String::from_utf8_lossy(output));
+        assert!(message.contains("UNSAFE"), "{message}");
+    }
+}
+
+#[test]
+fn saying_the_change_is_not_safe_blocks_but_similar_words_do_not() {
+    let blocked: &[&[u8]] = &[
+        b"VERDICT: SAFE\nThis change is not safe to push.\n",
+        b"VERDICT: SAFE\nNOT SAFE\n",
+        b"VERDICT: SAFE\nnot   safe\n",
+        b"VERDICT: SAFE\n(not safe)\n",
+        b"VERDICT: SAFE\nIt is Not Safe.\n",
+    ];
+    for output in blocked {
+        let (code, message) = verdict(output);
+        assert_eq!(code, 1, "{:?}", String::from_utf8_lossy(output));
+        assert!(message.contains("not safe"), "{message}");
+    }
+    let passing: &[&[u8]] = &[
+        b"VERDICT: SAFE\nThe handling is not safely wrapped but harmless.\n",
+        b"VERDICT: SAFE\nNothing here is a safe-guard issue.\n",
+        b"VERDICT: SAFE\nnot-safe-looking names are fine\n",
+        b"VERDICT: SAFE\nThe diff is safe, and the notes say nothing unsafe was found.\n",
+    ];
+    for output in passing {
+        assert_eq!(
+            verdict(output).0,
+            0,
+            "{:?}",
+            String::from_utf8_lossy(output)
+        );
+    }
+}
+
+#[test]
 fn a_nul_byte_anywhere_blocks() {
     for output in [
         &b"VERDICT: SAFE\0\n"[..],

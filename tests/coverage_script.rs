@@ -261,3 +261,75 @@ fn ambient_git_variables_cannot_reach_the_scratch_repository() {
     assert_eq!(std::fs::read(&decoy_index).unwrap(), b"decoy index bytes");
     assert_eq!(std::fs::read_dir(&decoy_dir).unwrap().count(), 0);
 }
+
+#[test]
+fn the_script_itself_ignores_ambient_git_variables_when_run_inside_a_hook() {
+    let s = setup();
+    let decoy = tempfile::tempdir().unwrap();
+    let decoy_dir = decoy.path().join("decoy-git-dir");
+    std::fs::create_dir_all(&decoy_dir).unwrap();
+    let decoy_index = decoy.path().join("decoy-index");
+    std::fs::write(&decoy_index, b"decoy index bytes").unwrap();
+    let before = worktrees(&s);
+
+    let output = run(
+        &s,
+        &s.base,
+        "80.00% coverage",
+        "80.00% coverage",
+        &[
+            ("GIT_DIR", decoy_dir.to_str().unwrap()),
+            ("GIT_INDEX_FILE", decoy_index.to_str().unwrap()),
+            ("GIT_WORK_TREE", decoy.path().to_str().unwrap()),
+            ("GIT_PREFIX", "decoy/"),
+        ],
+    );
+    let (code, message) = text(&output);
+    assert_eq!(code, 0, "{message}");
+    assert!(message.contains("Coverage: 80.00% >= 80.00%"), "{message}");
+    assert_eq!(std::fs::read(&decoy_index).unwrap(), b"decoy index bytes");
+    assert_eq!(std::fs::read_dir(&decoy_dir).unwrap().count(), 0);
+    assert_eq!(worktrees(&s), before);
+}
+
+#[test]
+fn only_an_all_zero_base_skips_the_comparison() {
+    let s = setup();
+    for zeros in ["0", "00", &"0".repeat(40)] {
+        let (code, message) = text(&run(&s, zeros, "1.00% coverage", "99.00% coverage", &[]));
+        assert_eq!(code, 0, "{zeros}: {message}");
+        assert!(message.contains("skipping"), "{zeros}: {message}");
+    }
+    for not_zeros in ["", "00a0", "0 ", "a0", "0x0", "00-0"] {
+        let (code, message) = text(&run(
+            &s,
+            not_zeros,
+            "80.00% coverage",
+            "80.00% coverage",
+            &[],
+        ));
+        assert_eq!(code, 2, "{not_zeros:?} must not skip the gate: {message}");
+        assert!(
+            message.contains("Cannot resolve"),
+            "{not_zeros:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn the_last_coverage_line_is_the_total() {
+    let s = setup();
+    let several_rising = "10.00% coverage, a\n50.00% coverage, b\n80.00% coverage, total";
+    let several_falling = "90.00% coverage, a\n50.00% coverage, b\n70.00% coverage, total";
+    let (code, message) = text(&run(&s, &s.base, several_rising, "80.00% coverage", &[]));
+    assert_eq!(code, 0, "{message}");
+    assert!(message.contains("80.00% >= 80.00%"), "{message}");
+    let (code, message) = text(&run(&s, &s.base, several_falling, "80.00% coverage", &[]));
+    assert_eq!(code, 1, "{message}");
+    assert!(message.contains("70.00% < 80.00%"), "{message}");
+    let (code, message) = text(&run(&s, &s.base, "80.00% coverage", several_rising, &[]));
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = text(&run(&s, &s.base, "80.00% coverage", several_falling, &[]));
+    assert_eq!(code, 0, "{message}");
+    assert!(message.contains("80.00% >= 70.00%"), "{message}");
+}
