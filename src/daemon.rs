@@ -1753,8 +1753,39 @@ required_checks = ["build"]
         poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
         assert_eq!(store.recent_runs(10).unwrap().len(), 1);
         assert_eq!(scheduler.queued_len("o/r"), 0);
-        clock.advance(i64::try_from(SETTLE_GRACE.as_secs()).unwrap() + 1);
+        let grace = i64::try_from(SETTLE_GRACE.as_secs()).unwrap();
+        clock.advance(grace - 11);
+        poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
+        assert_eq!(store.recent_runs(10).unwrap().len(), 1);
+        clock.advance(1);
         poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
         assert_eq!(store.recent_runs(10).unwrap().len(), 2);
+        assert!(unswapped.is_empty());
+    }
+
+    #[test]
+    fn an_issue_whose_label_swap_failed_is_remembered_so_it_is_not_queued_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
+        std::fs::write(repo.join(".inchworm/flows.toml"), FLOWS).unwrap();
+        let entry = RepoEntry {
+            slug: "o/r".into(),
+            path: repo,
+        };
+        let github = Arc::new(github_with_issue());
+        github.fail_labels_with("HTTP 502");
+        let store = Store::open_in_memory().unwrap();
+        let deps = DaemonDeps {
+            github: github.clone(),
+            clock: Arc::new(crate::clock::FakeClock::new(1_000)),
+            dispatchers: Arc::new(Factory(Mutex::new(vec![]))),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        let mut unswapped = Unswapped::new();
+        poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
+        assert_eq!(unswapped.len(), 1);
+        assert_eq!(scheduler.queued_len("o/r"), 1);
     }
 }
