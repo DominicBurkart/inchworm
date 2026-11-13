@@ -351,7 +351,9 @@ pub struct Attempt {
 /// lock that belongs to a different file.
 ///
 /// Names that SQLite treats as in-memory (`:memory:`, the empty name and
-/// `file:` URIs naming a memory database) have no file and are refused.
+/// `file:` URIs naming a memory database, however they are percent-encoded)
+/// have no file and are refused. Every other `file:` URI is refused too, because
+/// it is not resolved to a path: pass a plain path.
 ///
 /// The lock excludes only other processes that also take it: a process that
 /// dispatches attempts without calling [`DaemonLock::acquire`] is not stopped.
@@ -451,14 +453,47 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |index: usize| bytes.get(index).and_then(|b| (*b as char).to_digit(16));
+        match (bytes[at], hex(at + 1), hex(at + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push((high * 16 + low) as u8);
+                at += 3;
+            }
+            (byte, ..) => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn is_file_uri(path: &Path) -> bool {
+    path.to_str().is_some_and(|text| text.starts_with("file:"))
+}
+
 fn is_in_memory(path: &Path) -> bool {
     let Some(text) = path.to_str() else {
         return false;
     };
-    text.is_empty()
-        || text == ":memory:"
-        || (text.starts_with("file:")
-            && (text.contains(":memory:") || text.contains("mode=memory")))
+    if text.is_empty() || text == ":memory:" {
+        return true;
+    }
+    let Some(uri) = text.strip_prefix("file:") else {
+        return false;
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let (location, query) = uri.split_once('?').unwrap_or((uri, ""));
+    percent_decode(location).contains(":memory:")
+        || query.split('&').any(|parameter| {
+            let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            percent_decode(key) == "mode" && percent_decode(value) == "memory"
+        })
 }
 
 fn canonical_db_path(path: &Path) -> std::io::Result<PathBuf> {
@@ -485,6 +520,15 @@ impl DaemonLock {
     pub fn acquire(db_path: &Path) -> Result<DaemonLock, StoreError> {
         if is_in_memory(db_path) {
             return Err(StoreError::RecoveryNeedsFileStore);
+        }
+        if is_file_uri(db_path) {
+            return Err(StoreError::LockIo {
+                path: db_path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a file: URI cannot be resolved to one database file to lock; pass a plain path",
+                ),
+            });
         }
         let mut database = canonical_db_path(db_path).map_err(|source| StoreError::LockIo {
             path: db_path.to_path_buf(),
@@ -3064,6 +3108,62 @@ CREATE TABLE attempts (
             LOCK_ATTEMPTS
         );
         assert!(DaemonLock::acquire(&db).is_ok());
+    }
+
+    #[test]
+    fn every_spelling_of_an_in_memory_name_is_recognised() {
+        for name in [
+            ":memory:",
+            "",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:memdb1?mode=memory&cache=shared",
+            "file:x.db?mode=memory",
+            "file:x.db?cache=shared&mode=memory",
+            "file:%3Amemory%3A",
+            "file:%3amemory%3a",
+            "file:%3Amemory:",
+            "file::memory%3A",
+            "file:x?mode=%6Demory",
+            "file:x?mode=%6demory",
+            "file:x?%6Dode=memory",
+            "file:x?mode=mem%6Fry",
+            "file:///:memory:",
+            "file:%2F%2F%2F%3Amemory%3A",
+        ] {
+            assert!(is_in_memory(Path::new(name)), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_in_memory_are_not_recognised_as_such() {
+        for name in [
+            "state.db",
+            "/var/lib/inchworm/state.db",
+            "memory",
+            "my:memory:.db",
+            "FILE::memory:",
+            "file:x.db",
+            "file:x.db?cache=shared",
+            "file:x.db?mode=rwc",
+            "file:x.db?mode=Memory",
+            "file:x.db?vfs=:memory:",
+            "file:x.db?note=mode%3Dmemory",
+            "file:x.db?mode=memory2",
+            "file:x.db#mode=memory",
+            "file:100%.db",
+        ] {
+            assert!(!is_in_memory(Path::new(name)), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn percent_decoding_handles_both_hex_cases_and_malformed_escapes() {
+        assert_eq!(percent_decode("a%3Ab%3ac"), "a:b:c");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%C3%A9"), "\u{e9}");
+        assert_eq!(percent_decode("plain"), "plain");
     }
 
     #[test]
