@@ -1,4 +1,6 @@
+pub mod cli;
 pub mod config;
+pub mod fsutil;
 pub mod judges;
 pub mod model;
 pub mod policy;

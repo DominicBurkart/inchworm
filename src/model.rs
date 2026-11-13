@@ -127,6 +127,16 @@ impl RunState {
         }
     }
 
+    pub const OPEN: &'static [RunState] = &[
+        RunState::Queued,
+        RunState::Running,
+        RunState::AwaitingCi,
+        RunState::Judging,
+    ];
+
+    pub const ACTIVE: &'static [RunState] =
+        &[RunState::Running, RunState::AwaitingCi, RunState::Judging];
+
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -134,14 +144,25 @@ impl RunState {
         )
     }
 
+    pub const fn is_open(self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(
+            self,
+            RunState::Running | RunState::AwaitingCi | RunState::Judging
+        )
+    }
+
     pub const fn can_transition_to(self, to: RunState) -> bool {
         use RunState::*;
         matches!(
             (self, to),
-            (Queued, Running | Failed)
-                | (Running, AwaitingCi | Failed | Escalated)
-                | (AwaitingCi, Judging | Failed)
-                | (Judging, Merged | PrOpen | Failed)
+            (Queued, Running | Failed | Escalated)
+                | (Running, AwaitingCi | Failed | Escalated | Queued)
+                | (AwaitingCi, Judging | Failed | Escalated)
+                | (Judging, Merged | PrOpen | Failed | Escalated)
         )
     }
 
@@ -248,6 +269,59 @@ mod tests {
         }
         assert!(RunState::Judging.can_transition_to(RunState::PrOpen));
         assert!(RunState::Running.can_transition_to(RunState::Escalated));
+    }
+
+    const EXPECTED_EDGES: &[(RunState, RunState)] = &[
+        (RunState::Queued, RunState::Running),
+        (RunState::Queued, RunState::Failed),
+        (RunState::Queued, RunState::Escalated),
+        (RunState::Running, RunState::AwaitingCi),
+        (RunState::Running, RunState::Failed),
+        (RunState::Running, RunState::Escalated),
+        (RunState::Running, RunState::Queued),
+        (RunState::AwaitingCi, RunState::Judging),
+        (RunState::AwaitingCi, RunState::Failed),
+        (RunState::AwaitingCi, RunState::Escalated),
+        (RunState::Judging, RunState::Merged),
+        (RunState::Judging, RunState::PrOpen),
+        (RunState::Judging, RunState::Failed),
+        (RunState::Judging, RunState::Escalated),
+    ];
+
+    #[test]
+    fn the_edge_table_is_exactly_the_documented_one() {
+        for from in RunState::ALL {
+            for to in RunState::ALL {
+                let expected = EXPECTED_EDGES.contains(&(*from, *to));
+                assert_eq!(from.can_transition_to(*to), expected, "{from} -> {to}");
+            }
+        }
+    }
+
+    #[test]
+    fn open_active_and_terminal_are_one_consistent_partition() {
+        for state in RunState::ALL {
+            assert_eq!(state.is_open(), !state.is_terminal(), "{state}");
+            assert_eq!(RunState::OPEN.contains(state), state.is_open(), "{state}");
+            assert_eq!(
+                RunState::ACTIVE.contains(state),
+                state.is_active(),
+                "{state}"
+            );
+            if state.is_active() {
+                assert!(state.is_open(), "{state}");
+            }
+        }
+        assert!(!RunState::Queued.is_active());
+        assert!(RunState::Queued.is_open());
+    }
+
+    #[test]
+    fn every_open_state_can_escalate_and_fail() {
+        for state in RunState::OPEN {
+            assert!(state.can_transition_to(RunState::Escalated), "{state}");
+            assert!(state.can_transition_to(RunState::Failed), "{state}");
+        }
     }
 
     #[test]

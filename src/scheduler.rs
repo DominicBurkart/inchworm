@@ -35,10 +35,8 @@ impl<T> RepoQueues<T> {
     pub fn enqueue(&mut self, repo: &str, item: T) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.queues
-            .entry(repo.to_string())
-            .or_default()
-            .push_back((seq, item));
+        let queue = self.queues.entry(repo.to_string()).or_default();
+        queue.push_back((seq, item));
     }
 
     pub fn claim(&mut self) -> Option<(String, T)> {

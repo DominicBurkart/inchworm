@@ -636,6 +636,7 @@ dependencies = [
  "cargo-husky",
  "clap",
  "globset",
+ "libc",
  "predicates",
  "proptest",
  "reqwest",

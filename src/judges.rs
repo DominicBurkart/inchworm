@@ -588,16 +588,8 @@ pub async fn llm_judge<S: Scorer>(
     min_score: u8,
     patch: &str,
 ) -> Verdict {
-    llm_judge_timed(
-        scorer,
-        permit,
-        rubric,
-        model,
-        min_score,
-        patch,
-        JUDGE_TIMEOUT,
-    )
-    .await
+    let limit = JUDGE_TIMEOUT;
+    llm_judge_timed(scorer, permit, rubric, model, min_score, patch, limit).await
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -645,14 +637,9 @@ pub async fn llm_judge_timed<S: Scorer>(
             if reply.score >= min_score {
                 Verdict::pass(NAME, &reason).with_score(reply.score)
             } else {
-                Verdict::fail(
-                    NAME,
-                    &format!(
-                        "score {} below min_score {min_score}: {reason}",
-                        reply.score
-                    ),
-                )
-                .with_score(reply.score)
+                let score = reply.score;
+                let detail = format!("score {score} below min_score {min_score}: {reason}");
+                Verdict::fail(NAME, &detail).with_score(score)
             }
         }
     }
@@ -1682,6 +1669,8 @@ mod tests {
             "2.43.0-rc1",
             "2.39.5 (Apple Git-154)",
             "2.30.2+really2.30",
+            "2.11.0~rc1",
+            "2.54.0_beta",
         ] {
             let text = format!("{MBOX_BODY}-- \n{version}\n");
             assert!(diff_judge(&text, 100, &[]).passed, "{version}");
@@ -1697,6 +1686,9 @@ mod tests {
             "v2.54.0",
             "evil.sh",
             "-2.54.0",
+            "2.54.0\u{e9}",
+            "2.54.0\u{df}",
+            "2.54.0\u{661}",
         ] {
             let text = format!("{MBOX_BODY}-- \n{version}\n");
             assert!(!diff_judge(&text, 100, &[]).passed, "{version:?}");
