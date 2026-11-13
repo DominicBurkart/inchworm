@@ -878,7 +878,7 @@ mod tests {
         let verdict = judge(&scorer, 7).await;
         assert!(!verdict.passed);
         assert_eq!(verdict.score, Some(3));
-        assert!(verdict.detail.contains("messy"));
+        assert_eq!(verdict.detail, "score 3 below min_score 7: messy");
     }
 
     #[tokio::test]
