@@ -27,3 +27,6 @@ tempfile = "3.27.0"
 version = "1"
 default-features = false
 features = ["user-hooks"]
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod config;
 pub mod exec;
 pub mod flow;
+pub mod fsutil;
 pub mod github;
 pub mod model;
 pub mod nanna_client;

@@ -161,7 +161,7 @@ pub struct Online<'a> {
 /// let config = GlobalConfig::parse("nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"/gone\"\n").unwrap();
 /// let github = FakeGitHub::new();
 /// let online = Online { catalog: &Empty, github: &github, builder: None };
-/// assert!(!validate_online(&config, &online).is_ok());
+/// assert!(!validate_online(&config, &online, None).is_ok());
 /// ```
 pub const AUDITOR_IDENTITY: &str = "auditor";
 
@@ -171,8 +171,12 @@ const NANNA_OLLAMA_ADDRESSES: [&str; 3] = [
     "http://[::1]:11434",
 ];
 
-pub fn validate_online(config: &GlobalConfig, online: &Online<'_>) -> Report {
-    let mut report = validate(config);
+pub fn validate_online(
+    config: &GlobalConfig,
+    online: &Online<'_>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Report {
+    let mut report = validate(config, path_var);
     let configured = config.ollama_url.trim().trim_end_matches('/');
     if !NANNA_OLLAMA_ADDRESSES.contains(&configured) {
         report.push(
@@ -362,8 +366,15 @@ mode = "draft_pr"
         )
         .unwrap();
         std::fs::write(dir.join(".nanna/prompt.md"), "p").unwrap();
+        let nanna = dir.join("fake-nanna");
+        std::fs::write(&nanna, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&nanna, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         GlobalConfig::parse(&format!(
-            "nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
+            "nanna_bin = \"{}\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
+            nanna.display(),
             dir.display()
         ))
         .unwrap()
@@ -404,7 +415,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
@@ -419,7 +430,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert_eq!(report.error_count(), 1);
         let message = &messages(&report)[0];
         assert!(
@@ -443,7 +454,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert_eq!(report.error_count(), 1);
         assert!(
             messages(&report)[0].contains("cannot list identities")
@@ -462,7 +473,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         let found = messages(&report);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
@@ -490,7 +501,7 @@ mode = "draft_pr"
             "http://[::1]:11434/",
         ] {
             config.ollama_url = same.to_string();
-            let report = validate_online(&config, &online);
+            let report = validate_online(&config, &online, None);
             assert!(report.findings.is_empty(), "{same}: {:?}", report.findings);
         }
         for different in [
@@ -499,7 +510,7 @@ mode = "draft_pr"
             "https://localhost:11434",
         ] {
             config.ollama_url = different.to_string();
-            let report = validate_online(&config, &online);
+            let report = validate_online(&config, &online, None);
             assert!(report.is_ok(), "{different}");
             assert_eq!(
                 report.warning_count(),
@@ -527,7 +538,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let found = messages(&validate_online(&config, &online));
+        let found = messages(&validate_online(&config, &online, None));
         assert_eq!(found.len(), 3, "{found:?}");
         for label in ["inchworm:running", "inchworm:failed", "inchworm:done"] {
             assert!(
@@ -559,7 +570,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let found = messages(&validate_online(&config, &online));
+        let found = messages(&validate_online(&config, &online, None));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found[0].contains("`queue-me`") && found[0].contains("gh label create queue-me -R o/r"),
@@ -578,7 +589,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         let found = messages(&report);
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|m| m.contains("`inchworm:running`")
@@ -596,7 +607,7 @@ mode = "draft_pr"
             github: &BrokenGitHub,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(messages(&report)[0].contains("cannot list labels"));
     }
 
@@ -616,7 +627,7 @@ mode = "draft_pr"
             github: &github,
             builder: Some(&ok),
         };
-        assert!(validate_online(&config, &online).findings.is_empty());
+        assert!(validate_online(&config, &online, None).findings.is_empty());
         assert_eq!(ok.built.borrow().as_slice(), [dir.path().to_path_buf()]);
 
         let bad = Builder {
@@ -628,7 +639,7 @@ mode = "draft_pr"
             github: &github,
             builder: Some(&bad),
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(messages(&report)[0].contains("devContainerImage does not build: no such output"));
 
         let off = Online {
@@ -636,7 +647,7 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        validate_online(&config, &off);
+        validate_online(&config, &off, None);
         assert_eq!(bad.built.borrow().len(), 1);
     }
 
@@ -652,10 +663,10 @@ mode = "draft_pr"
             github: &github,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(messages(&report).iter().all(|m| !m.contains("never asked")));
         std::fs::remove_file(dir.path().join(".inchworm/flows.toml")).unwrap();
-        assert!(!validate_online(&config, &online).is_ok());
+        assert!(!validate_online(&config, &online, None).is_ok());
     }
 
     #[test]

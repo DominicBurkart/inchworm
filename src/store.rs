@@ -1,6 +1,11 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::fs::{File, Metadata, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 use thiserror::Error;
 
 use crate::model::{FailureClass, InvalidTransition, RunState};
@@ -8,24 +13,40 @@ use crate::model::{FailureClass, InvalidTransition, RunState};
 pub type RunId = i64;
 pub type AttemptId = i64;
 
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_BRANCH_BYTES: usize = 255;
+const MAX_HEAD_SHA_BYTES: usize = 64;
+
+fn states_sql(states: &[RunState]) -> String {
+    states
+        .iter()
+        .map(|state| format!("'{}'", state.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Migration 1 is frozen: it must never be edited once a database may have
+/// been created from it. A change to the schema or to the run states needs a
+/// new entry in this list that alters or rebuilds the tables.
 const MIGRATIONS: &[&str] = &["
 CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
     repo TEXT NOT NULL,
-    issue INTEGER NOT NULL,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('issue', 'pr', 'commit')),
+    subject_ref TEXT NOT NULL CHECK (length(subject_ref) > 0),
     flow TEXT NOT NULL,
-    state TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'awaiting_ci', 'judging', 'merged', 'pr_open', 'failed', 'escalated')),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX runs_one_open_per_issue
-    ON runs (repo, issue, flow)
+CREATE UNIQUE INDEX runs_one_open_per_subject
+    ON runs (repo, subject_kind, subject_ref, flow)
     WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging');
 CREATE TABLE attempts (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
     n INTEGER NOT NULL,
-    state TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('dispatched', 'succeeded', 'failed')),
     branch TEXT,
     head_sha TEXT,
     pr_number INTEGER,
@@ -37,6 +58,82 @@ CREATE TABLE attempts (
 );
 "];
 
+const FROZEN_OBJECTS: &[(&str, &str, &str, &str)] = &[
+    (
+        "table",
+        "runs",
+        "runs",
+        "CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('issue', 'pr', 'commit')),
+    subject_ref TEXT NOT NULL CHECK (length(subject_ref) > 0),
+    flow TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'awaiting_ci', 'judging', 'merged', 'pr_open', 'failed', 'escalated')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)",
+    ),
+    (
+        "index",
+        "runs_one_open_per_subject",
+        "runs",
+        "CREATE UNIQUE INDEX runs_one_open_per_subject
+    ON runs (repo, subject_kind, subject_ref, flow)
+    WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+    ),
+    (
+        "table",
+        "attempts",
+        "attempts",
+        "CREATE TABLE attempts (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('dispatched', 'succeeded', 'failed')),
+    branch TEXT,
+    head_sha TEXT,
+    pr_number INTEGER,
+    failure_class TEXT,
+    raw_error TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    UNIQUE (run_id, n)
+)",
+    ),
+];
+
+fn normalise_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const EXPECTED_RUN_COLUMNS: &[&str] = &[
+    "id",
+    "repo",
+    "subject_kind",
+    "subject_ref",
+    "flow",
+    "state",
+    "created_at",
+    "updated_at",
+];
+
+const EXPECTED_ATTEMPT_COLUMNS: &[&str] = &[
+    "id",
+    "run_id",
+    "n",
+    "state",
+    "branch",
+    "head_sha",
+    "pr_number",
+    "failure_class",
+    "raw_error",
+    "started_at",
+    "ended_at",
+];
+
+const EXPECTED_INDEX_COLUMNS: &[&str] = &["repo", "subject_kind", "subject_ref", "flow"];
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -45,12 +142,143 @@ pub enum StoreError {
     InvalidTransition(#[from] InvalidTransition),
     #[error("run {0} not found")]
     RunNotFound(RunId),
+    #[error("run {run} is {state}, not running, so it cannot start an attempt")]
+    RunNotRunning { run: RunId, state: RunState },
     #[error("attempt {0} not found")]
     AttemptNotFound(AttemptId),
     #[error("attempt {0} is not dispatched")]
     AttemptNotDispatched(AttemptId),
     #[error("stored value is corrupt: {0}")]
     Corrupt(String),
+    #[error("database schema version {found} is newer than this build supports ({supported})")]
+    SchemaTooNew { found: usize, supported: usize },
+    #[error(
+        "the database schema does not match this build ({0}); it was probably created by an unreleased development build: delete the file and start again"
+    )]
+    SchemaMismatch(String),
+    #[error("invalid subject: {0}")]
+    InvalidSubject(String),
+    #[error("invalid pull request record: {0}")]
+    InvalidPullRequest(String),
+    #[error("another inchworm daemon holds {0}")]
+    AlreadyRunning(PathBuf),
+    #[error("the daemon lock is for {lock}, not for the database {store}")]
+    LockForDifferentDatabase { lock: PathBuf, store: PathBuf },
+    #[error("only a database file can be recovered, not an in-memory store")]
+    RecoveryNeedsFileStore,
+    #[error(
+        "{0} no longer names the file the daemon lock was taken on: it was removed or replaced while the lock was held, so the lock does not protect it; restart the daemon"
+    )]
+    DatabaseMoved(PathBuf),
+    #[error(
+        "the database stayed in {0} journal mode instead of switching to wal; the file system may not support the shared memory wal needs"
+    )]
+    WalNotEnabled(String),
+    #[error("cannot use lock file {path}: {source}")]
+    LockIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectKind {
+    Issue,
+    Pr,
+    Commit,
+}
+
+impl SubjectKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SubjectKind::Issue => "issue",
+            SubjectKind::Pr => "pr",
+            SubjectKind::Commit => "commit",
+        }
+    }
+
+    fn parse(text: &str) -> Result<SubjectKind, StoreError> {
+        match text {
+            "issue" => Ok(SubjectKind::Issue),
+            "pr" => Ok(SubjectKind::Pr),
+            "commit" => Ok(SubjectKind::Commit),
+            other => Err(StoreError::Corrupt(format!("subject kind `{other}`"))),
+        }
+    }
+}
+
+/// What a run is about: an issue, a pull request or a commit.
+///
+/// A subject is valid by construction and has exactly one spelling: issue and
+/// pull request numbers are positive decimals without leading zeros, and a
+/// commit is a full SHA-1 or SHA-256 in lowercase hex. Two spellings of one
+/// subject therefore cannot both be opened.
+///
+/// ```
+/// use inchworm::store::{StoreError, Subject, SubjectKind};
+///
+/// let issue = Subject::issue(7).unwrap();
+/// assert_eq!(issue.kind(), SubjectKind::Issue);
+/// assert_eq!(issue.reference(), "7");
+/// assert!(matches!(Subject::issue(0), Err(StoreError::InvalidSubject(_))));
+/// assert!(matches!(Subject::commit("0123abc"), Err(StoreError::InvalidSubject(_))));
+/// let sha = "0123456789ABCDEF0123456789abcdef01234567";
+/// assert_eq!(Subject::commit(sha).unwrap().reference(), sha.to_ascii_lowercase());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
+    kind: SubjectKind,
+    reference: String,
+}
+
+impl Subject {
+    pub fn issue(number: u64) -> Result<Subject, StoreError> {
+        Subject::from_parts(SubjectKind::Issue, &number.to_string())
+    }
+
+    pub fn pr(number: u64) -> Result<Subject, StoreError> {
+        Subject::from_parts(SubjectKind::Pr, &number.to_string())
+    }
+
+    pub fn commit(sha: &str) -> Result<Subject, StoreError> {
+        Subject::from_parts(SubjectKind::Commit, &sha.to_ascii_lowercase())
+    }
+
+    /// Builds a subject from its stored parts, accepting only the canonical
+    /// spelling.
+    pub fn from_parts(kind: SubjectKind, reference: &str) -> Result<Subject, StoreError> {
+        let valid = match kind {
+            SubjectKind::Issue | SubjectKind::Pr => {
+                reference.parse::<u64>().is_ok()
+                    && reference.bytes().all(|b| b.is_ascii_digit())
+                    && !reference.starts_with('0')
+            }
+            SubjectKind::Commit => {
+                matches!(reference.len(), 40 | 64)
+                    && reference
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }
+        };
+        if !valid {
+            return Err(StoreError::InvalidSubject(format!(
+                "`{reference}` is not a canonical {} reference",
+                kind.as_str()
+            )));
+        }
+        Ok(Subject {
+            kind,
+            reference: reference.to_string(),
+        })
+    }
+
+    pub fn kind(&self) -> SubjectKind {
+        self.kind
+    }
+
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +311,7 @@ impl AttemptState {
 pub struct Run {
     pub id: RunId,
     pub repo: String,
-    pub issue: u64,
+    pub subject: Subject,
     pub flow: String,
     pub state: RunState,
     pub created_at: i64,
@@ -105,21 +333,343 @@ pub struct Attempt {
     pub ended_at: Option<i64>,
 }
 
+/// Proof that this process is the only daemon using one state database.
+///
+/// The lock is two exclusive `flock`s taken together. One is on a side file
+/// named `.<database file name>.inchworm-lock` next to the canonical path of
+/// the database; it keeps excluding a second daemon when the database file is
+/// unlinked or another file is renamed over it. On unix the other is on the
+/// database file itself, which is created empty when missing and identifies the
+/// lock by its device and inode: symlinks, hard links and a dangling symlink
+/// that is later filled in therefore all lead to one lock, and deleting the
+/// side file does not let a second daemon in. Elsewhere the lock is identified
+/// by the canonical path alone.
+///
+/// [`DaemonLock::acquire`] checks after locking that the path still names the
+/// file it locked and retries a few times if it was replaced meanwhile, then
+/// fails with [`StoreError::DatabaseMoved`]. A lock whose database path no
+/// longer names the locked file (the file was unlinked or replaced while the
+/// lock was held, for example by restoring a backup) no longer protects
+/// anything: [`Store::recover_after_crash`] refuses it with the same error and
+/// the daemon must be restarted. [`Store::recover_after_crash`] also refuses a
+/// lock that belongs to a different file.
+///
+/// Names that SQLite treats as in-memory (`:memory:`, the empty name and
+/// `file:` URIs naming a memory database, however they are percent-encoded)
+/// have no file and are refused. Every other `file:` URI is refused too, because
+/// it is not resolved to a path: pass a plain path.
+///
+/// The lock excludes only other processes that also take it: a process that
+/// dispatches attempts without calling [`DaemonLock::acquire`] is not stopped.
+/// Dropping the lock closes a descriptor on the database file, so drop it only
+/// when no store of the same process is in the middle of a transaction.
+///
+/// ```
+/// use inchworm::store::{DaemonLock, StoreError};
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let db = dir.path().join("state.db");
+/// let first = DaemonLock::acquire(&db).unwrap();
+/// assert!(matches!(DaemonLock::acquire(&db), Err(StoreError::AlreadyRunning(_))));
+/// assert!(first.database().ends_with("state.db"));
+/// drop(first);
+/// assert!(DaemonLock::acquire(&db).is_ok());
+/// ```
+#[derive(Debug)]
+pub struct DaemonLock {
+    _path_lock: File,
+    _inode_lock: Option<File>,
+    database: PathBuf,
+    identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &Metadata, _canonical: &Path) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &Metadata, canonical: &Path) -> FileIdentity {
+    FileIdentity {
+        path: canonical.to_path_buf(),
+    }
+}
+
+const LOCK_ATTEMPTS: usize = 3;
+
+fn sidecar_path(database: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(database.file_name().unwrap_or_default());
+    name.push(LOCK_SUFFIX);
+    database.with_file_name(name)
+}
+
+fn open_for_lock(path: &Path) -> Result<File, StoreError> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|source| StoreError::LockIo {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn lock_exclusive(file: &File, path: &Path, database: &Path) -> Result<(), StoreError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(StoreError::AlreadyRunning(database.to_path_buf())),
+        Err(TryLockError::Error(source)) => Err(StoreError::LockIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn path_names(database: &Path, identity: &FileIdentity) -> bool {
+    std::fs::metadata(database).is_ok_and(|meta| file_identity(&meta, database) == *identity)
+}
+
+#[cfg(not(unix))]
+fn path_names(_database: &Path, _identity: &FileIdentity) -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_VERIFY: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |index: usize| bytes.get(index).and_then(|b| (*b as char).to_digit(16));
+        match (bytes[at], hex(at + 1), hex(at + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push((high * 16 + low) as u8);
+                at += 3;
+            }
+            (byte, ..) => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
+fn is_file_uri(path: &Path) -> bool {
+    path_bytes(path).starts_with(b"file:")
+}
+
+const LOCK_SUFFIX: &str = ".inchworm-lock";
+const MAX_LOCKABLE_NAME: usize = 255 - 1 - LOCK_SUFFIX.len();
+
+fn unlockable_reason(path: &Path) -> Option<&'static str> {
+    if is_file_uri(path) {
+        return Some(
+            "a file: URI cannot be resolved to one database file to lock; pass a plain path",
+        );
+    }
+    let name = path
+        .file_name()
+        .map(|name| path_bytes(Path::new(name)).into_owned())
+        .unwrap_or_default();
+    if name.len() > MAX_LOCKABLE_NAME {
+        return Some(
+            "the database file name is longer than 240 bytes, so its lock file name would exceed the 255-byte file name limit",
+        );
+    }
+    if name.starts_with(b".") && name.ends_with(LOCK_SUFFIX.as_bytes()) {
+        return Some(
+            "a database file name that starts with '.' and ends with '.inchworm-lock' collides with the lock file of another database; rename it",
+        );
+    }
+    None
+}
+
+fn refuse_unlockable(path: &Path) -> Result<(), StoreError> {
+    match unlockable_reason(path) {
+        None => Ok(()),
+        Some(reason) => Err(StoreError::LockIo {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
+        }),
+    }
+}
+
+fn is_in_memory(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    if text.is_empty() || text == ":memory:" {
+        return true;
+    }
+    let Some(uri) = text.strip_prefix("file:") else {
+        return false;
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let (location, query) = uri.split_once('?').unwrap_or((uri, ""));
+    percent_decode(location).contains(":memory:")
+        || query.split('&').any(|parameter| {
+            let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            percent_decode(key) == "mode" && percent_decode(value) == "memory"
+        })
+}
+
+fn canonical_db_path(path: &Path) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the database path has no file name",
+                )
+            })?;
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+impl DaemonLock {
+    pub fn acquire(db_path: &Path) -> Result<DaemonLock, StoreError> {
+        if is_in_memory(db_path) {
+            return Err(StoreError::RecoveryNeedsFileStore);
+        }
+        refuse_unlockable(db_path)?;
+        let mut database = canonical_db_path(db_path).map_err(|source| StoreError::LockIo {
+            path: db_path.to_path_buf(),
+            source,
+        })?;
+        for _ in 0..LOCK_ATTEMPTS {
+            #[cfg(unix)]
+            let inode_lock = Some(open_for_lock(&database)?);
+            #[cfg(not(unix))]
+            let inode_lock: Option<File> = None;
+            database = canonical_db_path(&database).unwrap_or(database);
+            refuse_unlockable(&database)?;
+            let side = sidecar_path(&database);
+            let path_lock = open_for_lock(&side)?;
+            lock_exclusive(&path_lock, &side, &database)?;
+            if let Some(file) = &inode_lock {
+                lock_exclusive(file, &database, &database)?;
+            }
+            let identity = inode_lock
+                .as_ref()
+                .unwrap_or(&path_lock)
+                .metadata()
+                .map(|meta| file_identity(&meta, &database))
+                .map_err(|source| StoreError::LockIo {
+                    path: database.clone(),
+                    source,
+                })?;
+            #[cfg(test)]
+            BEFORE_LOCK_VERIFY.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
+            if path_names(&database, &identity) {
+                return Ok(DaemonLock {
+                    _path_lock: path_lock,
+                    _inode_lock: inode_lock,
+                    database,
+                    identity,
+                });
+            }
+        }
+        Err(StoreError::DatabaseMoved(database))
+    }
+
+    pub fn database(&self) -> &Path {
+        &self.database
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Recovery {
+    pub attempts_failed: usize,
+    pub runs_requeued: usize,
+    pub resumable: Vec<RunId>,
+}
+
+struct DatabaseFile {
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
 pub struct Store {
     conn: Connection,
+    file: Option<DatabaseFile>,
 }
 
 fn corrupt<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> StoreError + '_ {
     move |err| StoreError::Corrupt(format!("{what}: {err}"))
 }
 
+fn check_text(field: &str, value: &str, max_bytes: usize) -> Result<(), StoreError> {
+    let problem = if value.trim().is_empty() {
+        Some("must not be blank".to_string())
+    } else if value.len() > max_bytes {
+        Some(format!("must be at most {max_bytes} bytes"))
+    } else if value.chars().any(char::is_control) {
+        Some("must not contain control characters".to_string())
+    } else {
+        None
+    };
+    match problem {
+        Some(problem) => Err(StoreError::InvalidPullRequest(format!("{field} {problem}"))),
+        None => Ok(()),
+    }
+}
+
 fn run_from_row(row: &Row<'_>) -> Result<Run, StoreError> {
     let state: String = row.get("state")?;
-    let issue: i64 = row.get("issue")?;
+    let kind: String = row.get("subject_kind")?;
     Ok(Run {
         id: row.get("id")?,
         repo: row.get("repo")?,
-        issue: u64::try_from(issue).map_err(corrupt("issue"))?,
+        subject: Subject::from_parts(
+            SubjectKind::parse(&kind)?,
+            &row.get::<_, String>("subject_ref")?,
+        )
+        .map_err(|err| StoreError::Corrupt(err.to_string()))?,
         flow: row.get("flow")?,
         state: state.parse().map_err(corrupt("run state"))?,
         created_at: row.get("created_at")?,
@@ -153,50 +703,248 @@ fn attempt_from_row(row: &Row<'_>) -> Result<Attempt, StoreError> {
     })
 }
 
+fn run_in(conn: &Connection, id: RunId) -> Result<Run, StoreError> {
+    conn.query_row("SELECT * FROM runs WHERE id = ?1", [id], |row| {
+        Ok(run_from_row(row))
+    })
+    .optional()?
+    .ok_or(StoreError::RunNotFound(id))?
+}
+
+fn attempt_in(conn: &Connection, id: AttemptId) -> Result<Attempt, StoreError> {
+    conn.query_row("SELECT * FROM attempts WHERE id = ?1", [id], |row| {
+        Ok(attempt_from_row(row))
+    })
+    .optional()?
+    .ok_or(StoreError::AttemptNotFound(id))?
+}
+
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAL_TIMEOUT_SEEN: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn wal_mode_reached(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("wal")
+}
+
+fn enable_wal(conn: &Connection, timeout: Duration) -> Result<(), StoreError> {
+    #[cfg(test)]
+    WAL_TIMEOUT_SEEN.with(|seen| seen.set(Some(timeout)));
+    let deadline = Instant::now() + timeout;
+    let mut pause = Duration::from_millis(2);
+    loop {
+        let switched = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0));
+        match switched {
+            Ok(mode) if wal_mode_reached(&mode) => return Ok(()),
+            Ok(mode) => return Err(StoreError::WalNotEnabled(mode)),
+            Err(err) if is_busy(&err) && Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(100));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == ErrorCode::ConstraintViolation
+                && failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
 impl Store {
     /// ```
     /// use inchworm::model::RunState;
-    /// use inchworm::store::Store;
+    /// use inchworm::store::{Store, Subject};
     ///
     /// let store = Store::open_in_memory().unwrap();
-    /// let id = store.enqueue_run("o/r", 7, "issue", 100).unwrap().unwrap();
-    /// assert!(store.enqueue_run("o/r", 7, "issue", 101).unwrap().is_none());
+    /// let subject = Subject::issue(7).unwrap();
+    /// let id = store.enqueue_run("o/r", &subject, "issue", 100).unwrap().unwrap();
+    /// assert!(store.enqueue_run("o/r", &subject, "issue", 101).unwrap().is_none());
     /// store.set_run_state(id, RunState::Running, 102).unwrap();
     /// assert_eq!(store.run(id).unwrap().state, RunState::Running);
     /// ```
     pub fn open_in_memory() -> Result<Store, StoreError> {
-        Store::from_connection(Connection::open_in_memory()?)
+        Store::from_connection(Connection::open_in_memory()?, false, BUSY_TIMEOUT)
     }
 
     pub fn open(path: &Path) -> Result<Store, StoreError> {
-        Store::from_connection(Connection::open(path)?)
+        Store::open_with_busy_timeout(path, BUSY_TIMEOUT)
     }
 
-    fn from_connection(conn: Connection) -> Result<Store, StoreError> {
+    pub(crate) fn open_with_busy_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Store, StoreError> {
+        let in_memory = is_in_memory(path);
+        if !in_memory {
+            refuse_unlockable(path)?;
+        }
+        let conn = Connection::open(path)?;
+        let mut store = Store::from_connection(conn, !in_memory, timeout)?;
+        if !in_memory {
+            let canonical = canonical_db_path(path).unwrap_or_else(|_| path.to_path_buf());
+            let meta = std::fs::metadata(path).map_err(|source| StoreError::LockIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            store.file = Some(DatabaseFile {
+                identity: file_identity(&meta, &canonical),
+                path: canonical,
+            });
+        }
+        Ok(store)
+    }
+
+    fn from_connection(
+        conn: Connection,
+        use_wal: bool,
+        timeout: Duration,
+    ) -> Result<Store, StoreError> {
+        conn.busy_timeout(timeout)?;
+        if use_wal {
+            enable_wal(&conn, timeout)?;
+        }
         conn.pragma_update(None, "foreign_keys", true)?;
-        let store = Store { conn };
+        let mut store = Store { conn, file: None };
         store.migrate()?;
         Ok(store)
     }
 
+    fn immediate(&self) -> Result<Transaction<'_>, StoreError> {
+        Ok(Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
+    }
+
     pub fn schema_version(&self) -> Result<usize, StoreError> {
-        let version: i64 = self
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        Store::version_in(&self.conn)
+    }
+
+    fn version_in(conn: &Connection) -> Result<usize, StoreError> {
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         usize::try_from(version).map_err(corrupt("user_version"))
     }
 
-    fn migrate(&self) -> Result<(), StoreError> {
-        let current = self.schema_version()?;
+    fn migrate(&mut self) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Store::version_in(&tx)?;
+        if current > MIGRATIONS.len() {
+            return Err(StoreError::SchemaTooNew {
+                found: current,
+                supported: MIGRATIONS.len(),
+            });
+        }
         for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(sql)?;
             tx.pragma_update(
                 None,
                 "user_version",
                 i64::try_from(index + 1).unwrap_or(i64::MAX),
             )?;
-            tx.commit()?;
+        }
+        tx.commit()?;
+        self.verify_schema()
+    }
+
+    fn verify_schema(&self) -> Result<(), StoreError> {
+        let columns = |table: &str| -> Result<Vec<String>, StoreError> {
+            let mut statement = self
+                .conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+            let names = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(names)
+        };
+        let mismatch = |detail: String| Err(StoreError::SchemaMismatch(detail));
+        for (table, expected) in [
+            ("runs", EXPECTED_RUN_COLUMNS),
+            ("attempts", EXPECTED_ATTEMPT_COLUMNS),
+        ] {
+            let found = columns(table)?;
+            if found != expected {
+                return mismatch(format!(
+                    "table `{table}` has columns {found:?}, expected {expected:?}"
+                ));
+            }
+        }
+        let index: Option<(bool, bool)> = self
+            .conn
+            .query_row(
+                "SELECT \"unique\", partial FROM pragma_index_list('runs') WHERE name = 'runs_one_open_per_subject'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if index != Some((true, true)) {
+            return mismatch(
+                "the partial unique index `runs_one_open_per_subject` is missing or different"
+                    .into(),
+            );
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT name FROM pragma_index_info('runs_one_open_per_subject') ORDER BY seqno",
+        )?;
+        let indexed: Vec<String> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if indexed != EXPECTED_INDEX_COLUMNS {
+            return mismatch(format!(
+                "the index `runs_one_open_per_subject` covers {indexed:?}, expected {EXPECTED_INDEX_COLUMNS:?}"
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master
+             WHERE substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name",
+        )?;
+        let stored: Vec<(String, String, String, Option<String>)> = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (kind, name, table, expected) in FROZEN_OBJECTS {
+            let Some((_, _, found_table, sql)) = stored
+                .iter()
+                .find(|(found_kind, found_name, ..)| found_kind == kind && found_name == name)
+            else {
+                return mismatch(format!(
+                    "the {kind} `{name}` required by migration 1 is missing"
+                ));
+            };
+            if found_table != table
+                || sql.as_deref().map(normalise_sql) != Some(normalise_sql(expected))
+            {
+                return mismatch(format!(
+                    "the definition of the {kind} `{name}` differs from migration 1"
+                ));
+            }
+        }
+        for (kind, name, ..) in &stored {
+            if !FROZEN_OBJECTS
+                .iter()
+                .any(|(frozen_kind, frozen_name, ..)| frozen_kind == kind && frozen_name == name)
+            {
+                return mismatch(format!(
+                    "the database has an unexpected {kind} `{name}` that migration 1 does not define"
+                ));
+            }
         }
         Ok(())
     }
@@ -204,31 +952,41 @@ impl Store {
     pub fn enqueue_run(
         &self,
         repo: &str,
-        issue: u64,
+        subject: &Subject,
         flow: &str,
         now: i64,
     ) -> Result<Option<RunId>, StoreError> {
-        let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
-        let changed = self.conn.execute(
-            "INSERT OR IGNORE INTO runs (repo, issue, flow, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![repo, issue, flow, RunState::Queued.as_str(), now],
-        )?;
-        Ok((changed == 1).then(|| self.conn.last_insert_rowid()))
+        let tx = self.immediate()?;
+        let inserted = tx.execute(
+            "INSERT INTO runs (repo, subject_kind, subject_ref, flow, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                repo,
+                subject.kind().as_str(),
+                subject.reference(),
+                flow,
+                RunState::Queued.as_str(),
+                now
+            ],
+        );
+        match inserted {
+            Ok(_) => {
+                let id = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok(Some(id))
+            }
+            Err(err) if is_unique_violation(&err) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn run(&self, id: RunId) -> Result<Run, StoreError> {
-        self.conn
-            .query_row("SELECT * FROM runs WHERE id = ?1", [id], |row| {
-                Ok(run_from_row(row))
-            })
-            .optional()?
-            .ok_or(StoreError::RunNotFound(id))?
+        run_in(&self.conn, id)
     }
 
     pub fn set_run_state(&self, id: RunId, to: RunState, now: i64) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let current = self.run(id)?;
+        let tx = self.immediate()?;
+        let current = run_in(&tx, id)?;
         current.state.transition(to)?;
         tx.execute(
             "UPDATE runs SET state = ?1, updated_at = ?2 WHERE id = ?3",
@@ -241,8 +999,8 @@ impl Store {
     pub fn next_queued(&self, repo: &str) -> Result<Option<Run>, StoreError> {
         self.conn
             .query_row(
-                "SELECT * FROM runs WHERE repo = ?1 AND state = 'queued' ORDER BY id LIMIT 1",
-                [repo],
+                "SELECT * FROM runs WHERE repo = ?1 AND state = ?2 ORDER BY id LIMIT 1",
+                params![repo, RunState::Queued.as_str()],
                 |row| Ok(run_from_row(row)),
             )
             .optional()?
@@ -250,20 +1008,25 @@ impl Store {
     }
 
     pub fn active_run(&self, repo: &str) -> Result<Option<Run>, StoreError> {
+        let sql = format!(
+            "SELECT * FROM runs WHERE repo = ?1 AND state IN ({}) ORDER BY id LIMIT 1",
+            states_sql(RunState::ACTIVE)
+        );
         self.conn
-            .query_row(
-                "SELECT * FROM runs WHERE repo = ?1
-                 AND state IN ('running', 'awaiting_ci', 'judging') ORDER BY id LIMIT 1",
-                [repo],
-                |row| Ok(run_from_row(row)),
-            )
+            .query_row(&sql, [repo], |row| Ok(run_from_row(row)))
             .optional()?
             .transpose()
     }
 
     pub fn start_attempt(&self, run_id: RunId, now: i64) -> Result<Attempt, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        self.run(run_id)?;
+        let tx = self.immediate()?;
+        let run = run_in(&tx, run_id)?;
+        if run.state != RunState::Running {
+            return Err(StoreError::RunNotRunning {
+                run: run_id,
+                state: run.state,
+            });
+        }
         let n: i64 = tx.query_row(
             "SELECT COALESCE(MAX(n), 0) + 1 FROM attempts WHERE run_id = ?1",
             [run_id],
@@ -274,28 +1037,26 @@ impl Store {
             params![run_id, n, AttemptState::Dispatched.as_str(), now],
         )?;
         let id = tx.last_insert_rowid();
+        let attempt = attempt_in(&tx, id)?;
         tx.commit()?;
-        self.attempt(id)
+        Ok(attempt)
     }
 
     pub fn attempt(&self, id: AttemptId) -> Result<Attempt, StoreError> {
-        self.conn
-            .query_row("SELECT * FROM attempts WHERE id = ?1", [id], |row| {
-                Ok(attempt_from_row(row))
-            })
-            .optional()?
-            .ok_or(StoreError::AttemptNotFound(id))?
+        attempt_in(&self.conn, id)
     }
 
     /// ```
-    /// use inchworm::store::Store;
+    /// use inchworm::store::{Store, Subject};
     ///
     /// let store = Store::open_in_memory().unwrap();
-    /// let run = store.enqueue_run("o/r", 1, "issue", 0).unwrap().unwrap();
+    /// let run = store.enqueue_run("o/r", &Subject::issue(1).unwrap(), "issue", 0).unwrap().unwrap();
     /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 0);
+    /// store.set_run_state(run, inchworm::model::RunState::Running, 1).unwrap();
     /// store.start_attempt(run, 1).unwrap();
     /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 1);
     /// assert_eq!(store.issue_attempt_count("o/r", 2).unwrap(), 0);
+    /// assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(run));
     /// ```
     pub fn open_run(
         &self,
@@ -303,24 +1064,22 @@ impl Store {
         issue: u64,
         flow: &str,
     ) -> Result<Option<RunId>, StoreError> {
-        let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
         Ok(self
             .conn
             .query_row(
-                "SELECT id FROM runs WHERE repo = ?1 AND issue = ?2 AND flow = ?3
-                 AND state IN ('queued', 'running', 'awaiting_ci', 'judging') LIMIT 1",
-                params![repo, issue, flow],
+                "SELECT id FROM runs WHERE repo = ?1 AND subject_kind = 'issue' AND subject_ref = ?2
+                 AND flow = ?3 AND state IN ('queued', 'running', 'awaiting_ci', 'judging') LIMIT 1",
+                params![repo, issue.to_string(), flow],
                 |row| row.get(0),
             )
             .optional()?)
     }
 
     pub fn issue_attempt_count(&self, repo: &str, issue: u64) -> Result<u32, StoreError> {
-        let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM attempts a JOIN runs r ON r.id = a.run_id
-             WHERE r.repo = ?1 AND r.issue = ?2",
-            params![repo, issue],
+             WHERE r.repo = ?1 AND r.subject_kind = 'issue' AND r.subject_ref = ?2",
+            params![repo, issue.to_string()],
             |row| row.get(0),
         )?;
         u32::try_from(count).map_err(corrupt("attempt count"))
@@ -334,6 +1093,31 @@ impl Store {
         rows.map(|row| row?).collect()
     }
 
+    /// Records the branch, head commit and pull request an attempt produced.
+    ///
+    /// The recorded pull request number is what sends a `running` run to
+    /// `awaiting_ci` during recovery, so it is validated: `pr_number` must be
+    /// positive, `branch` must not be blank and at most 255 bytes, `head_sha`
+    /// must not be blank and at most 64 bytes, and neither text may contain a
+    /// control character. Anything else is [`StoreError::InvalidPullRequest`]
+    /// and nothing is written.
+    ///
+    /// ```
+    /// use inchworm::model::RunState;
+    /// use inchworm::store::{Store, StoreError, Subject};
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let subject = Subject::issue(1).unwrap();
+    /// let run = store.enqueue_run("o/r", &subject, "issue", 0).unwrap().unwrap();
+    /// store.set_run_state(run, RunState::Running, 1).unwrap();
+    /// let attempt = store.start_attempt(run, 2).unwrap();
+    /// assert!(matches!(
+    ///     store.record_pr(attempt.id, "feature", "abc123", 0),
+    ///     Err(StoreError::InvalidPullRequest(_))
+    /// ));
+    /// store.record_pr(attempt.id, "feature", "abc123", 7).unwrap();
+    /// assert_eq!(store.attempt(attempt.id).unwrap().pr_number, Some(7));
+    /// ```
     pub fn record_pr(
         &self,
         id: AttemptId,
@@ -341,15 +1125,29 @@ impl Store {
         head_sha: &str,
         pr_number: u64,
     ) -> Result<(), StoreError> {
-        let pr = i64::try_from(pr_number).map_err(corrupt("pr number"))?;
+        if pr_number == 0 {
+            return Err(StoreError::InvalidPullRequest(
+                "the pull request number must be positive".into(),
+            ));
+        }
+        check_text("branch", branch, MAX_BRANCH_BYTES)?;
+        check_text("head sha", head_sha, MAX_HEAD_SHA_BYTES)?;
+        let pr = i64::try_from(pr_number).map_err(|_| {
+            StoreError::InvalidPullRequest(format!(
+                "the pull request number must be at most {}",
+                i64::MAX
+            ))
+        })?;
         let changed = self.conn.execute(
-            "UPDATE attempts SET branch = ?1, head_sha = ?2, pr_number = ?3 WHERE id = ?4",
+            "UPDATE attempts SET branch = ?1, head_sha = ?2, pr_number = ?3
+             WHERE id = ?4 AND state = 'dispatched'",
             params![branch, head_sha, pr, id],
         )?;
-        if changed == 0 {
-            return Err(StoreError::AttemptNotFound(id));
+        if changed == 1 {
+            return Ok(());
         }
-        Ok(())
+        self.attempt(id)?;
+        Err(StoreError::AttemptNotDispatched(id))
     }
 
     pub fn finish_attempt_ok(&self, id: AttemptId, now: i64) -> Result<(), StoreError> {
@@ -392,21 +1190,72 @@ impl Store {
         Err(StoreError::AttemptNotDispatched(id))
     }
 
-    /// ```
-    /// use inchworm::model::FailureClass;
-    /// use inchworm::store::{AttemptState, Store};
+    /// Recovers the runs a dead daemon left in flight. Every run in `running`,
+    /// `awaiting_ci` or `judging` belonged to it, so recovery decides by run
+    /// state, never by whether the run still owns a dispatched attempt:
     ///
-    /// let store = Store::open_in_memory().unwrap();
-    /// let run = store.enqueue_run("o/r", 1, "issue", 0).unwrap().unwrap();
-    /// let attempt = store.start_attempt(run, 1).unwrap();
-    /// assert_eq!(store.recover_after_crash(2).unwrap(), 1);
-    /// let lost = store.attempt(attempt.id).unwrap();
-    /// assert_eq!(lost.state, AttemptState::Failed);
-    /// assert_eq!(lost.failure_class, Some(FailureClass::OrchestratorLost));
-    /// assert_eq!(store.recover_after_crash(3).unwrap(), 0);
+    /// - every dispatched attempt is failed as `orchestrator_lost`;
+    /// - a `running` run whose latest attempt already recorded a pull request
+    ///   (finished, or lost after `record_pr`) moves to `awaiting_ci`, because
+    ///   the work exists and must not be redone;
+    /// - any other `running` run goes back to `queued`, so its subject is not
+    ///   wedged behind an open run;
+    /// - `awaiting_ci` and `judging` runs keep their state and are listed in
+    ///   [`Recovery::resumable`] with the `awaiting_ci` ones recovered above,
+    ///   for the daemon to continue from the stored pull request and head SHA;
+    /// - `queued` and terminal runs are not touched.
+    ///
+    /// Calling it again changes nothing and reports the same resumable runs.
+    ///
+    /// The lock must be the one for this database file (see [`DaemonLock`]); an
+    /// in-memory store cannot be recovered.
+    ///
     /// ```
-    pub fn recover_after_crash(&self, now: i64) -> Result<usize, StoreError> {
-        Ok(self.conn.execute(
+    /// use inchworm::model::{FailureClass, RunState};
+    /// use inchworm::store::{DaemonLock, Store, Subject};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = dir.path().join("state.db");
+    /// let store = Store::open(&db).unwrap();
+    /// let subject = Subject::issue(1).unwrap();
+    /// let run = store.enqueue_run("o/r", &subject, "issue", 0).unwrap().unwrap();
+    /// store.set_run_state(run, RunState::Running, 1).unwrap();
+    /// let attempt = store.start_attempt(run, 2).unwrap();
+    ///
+    /// let lock = DaemonLock::acquire(&db).unwrap();
+    /// let report = store.recover_after_crash(&lock, 3).unwrap();
+    /// assert_eq!((report.attempts_failed, report.runs_requeued), (1, 1));
+    /// assert!(report.resumable.is_empty());
+    /// assert_eq!(store.run(run).unwrap().state, RunState::Queued);
+    /// let lost = store.attempt(attempt.id).unwrap();
+    /// assert_eq!(lost.failure_class, Some(FailureClass::OrchestratorLost));
+    /// ```
+    pub fn recover_after_crash(
+        &self,
+        daemon: &DaemonLock,
+        now: i64,
+    ) -> Result<Recovery, StoreError> {
+        let own = self
+            .file
+            .as_ref()
+            .ok_or(StoreError::RecoveryNeedsFileStore)?;
+        if daemon.identity != own.identity {
+            return Err(StoreError::LockForDifferentDatabase {
+                lock: daemon.database().to_path_buf(),
+                store: own.path.clone(),
+            });
+        }
+        if !path_names(daemon.database(), &daemon.identity) {
+            return Err(StoreError::DatabaseMoved(daemon.database().to_path_buf()));
+        }
+        let tx = self.immediate()?;
+        let mut statement = tx.prepare("SELECT id FROM attempts WHERE state = 'dispatched'")?;
+        let lost: HashSet<AttemptId> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+
+        let attempts_failed = tx.execute(
             "UPDATE attempts SET state = 'failed', failure_class = ?1, raw_error = ?2, ended_at = ?3
              WHERE state = 'dispatched'",
             params![
@@ -414,7 +1263,61 @@ impl Store {
                 "inchworm stopped while this attempt was dispatched",
                 now
             ],
-        )?)
+        )?;
+
+        let sql = format!(
+            "SELECT * FROM runs WHERE state IN ({}) ORDER BY id",
+            states_sql(RunState::ACTIVE)
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let runs: Vec<Run> = statement
+            .query_map([], |row| Ok(run_from_row(row)))?
+            .map(|row| row?)
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+
+        let mut recovery = Recovery {
+            attempts_failed,
+            ..Recovery::default()
+        };
+        for run in runs {
+            if run.state != RunState::Running {
+                recovery.resumable.push(run.id);
+                continue;
+            }
+            let latest = tx
+                .query_row(
+                    "SELECT * FROM attempts WHERE run_id = ?1 ORDER BY n DESC LIMIT 1",
+                    [run.id],
+                    |row| Ok(attempt_from_row(row)),
+                )
+                .optional()?
+                .transpose()?;
+            let published = latest.is_some_and(|attempt| {
+                attempt.pr_number.is_some()
+                    && (attempt.state == AttemptState::Succeeded || lost.contains(&attempt.id))
+            });
+            let to = if published {
+                recovery.resumable.push(run.id);
+                RunState::AwaitingCi
+            } else {
+                recovery.runs_requeued += 1;
+                RunState::Queued
+            };
+            tx.execute(
+                "UPDATE runs SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                params![to.as_str(), now, run.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(recovery)
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    fn raw(&self) -> &Connection {
+        &self.conn
     }
 }
 
@@ -422,11 +1325,63 @@ impl Store {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::{Arc, Barrier};
+
+    const EDGES: &[(RunState, RunState)] = &[
+        (RunState::Queued, RunState::Running),
+        (RunState::Queued, RunState::Failed),
+        (RunState::Queued, RunState::Escalated),
+        (RunState::Running, RunState::AwaitingCi),
+        (RunState::Running, RunState::Failed),
+        (RunState::Running, RunState::Escalated),
+        (RunState::Running, RunState::Queued),
+        (RunState::AwaitingCi, RunState::Judging),
+        (RunState::AwaitingCi, RunState::Failed),
+        (RunState::AwaitingCi, RunState::Escalated),
+        (RunState::Judging, RunState::Merged),
+        (RunState::Judging, RunState::PrOpen),
+        (RunState::Judging, RunState::Failed),
+        (RunState::Judging, RunState::Escalated),
+    ];
+
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn issue(n: u64) -> Subject {
+        Subject::issue(n).unwrap()
+    }
 
     fn store_with_run() -> (Store, RunId) {
         let store = Store::open_in_memory().unwrap();
-        let id = store.enqueue_run("o/r", 1, "issue", 10).unwrap().unwrap();
+        let id = store
+            .enqueue_run("o/r", &issue(1), "issue", 10)
+            .unwrap()
+            .unwrap();
         (store, id)
+    }
+
+    fn running_store() -> (Store, RunId) {
+        let (store, id) = store_with_run();
+        store.set_run_state(id, RunState::Running, 11).unwrap();
+        (store, id)
+    }
+
+    fn force_state(store: &Store, id: RunId, state: &str) {
+        store
+            .raw()
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        store
+            .raw()
+            .execute(
+                "UPDATE runs SET state = ?1 WHERE id = ?2",
+                params![state, id],
+            )
+            .unwrap();
+        store
+            .raw()
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .unwrap();
     }
 
     #[test]
@@ -435,62 +1390,817 @@ mod tests {
         let path = dir.path().join("state.db");
         let first = Store::open(&path).unwrap();
         assert_eq!(first.schema_version().unwrap(), MIGRATIONS.len());
-        let id = first.enqueue_run("o/r", 1, "issue", 1).unwrap().unwrap();
+        let id = first
+            .enqueue_run("o/r", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
         drop(first);
         let second = Store::open(&path).unwrap();
         assert_eq!(second.schema_version().unwrap(), MIGRATIONS.len());
         assert_eq!(second.run(id).unwrap().repo, "o/r");
     }
 
+    const UNRELEASED_130EFD6A_SCHEMA: &str = "
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
+    flow TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX runs_one_open_per_issue
+    ON runs (repo, issue, flow)
+    WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging');
+CREATE TABLE attempts (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    branch TEXT,
+    head_sha TEXT,
+    pr_number INTEGER,
+    failure_class TEXT,
+    raw_error TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    UNIQUE (run_id, n)
+);
+";
+
+    fn mismatch(result: Result<Store, StoreError>) -> String {
+        match result {
+            Err(error @ StoreError::SchemaMismatch(_)) => error.to_string(),
+            Err(other) => panic!("expected SchemaMismatch, got {other}"),
+            Ok(_) => panic!("a database with the wrong schema must not open"),
+        }
+    }
+
     #[test]
-    fn enqueue_deduplicates_on_repo_issue_flow() {
+    fn a_database_made_by_the_unreleased_130efd6a_build_is_refused_with_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(UNRELEASED_130EFD6A_SCHEMA).unwrap();
+        old.pragma_update(None, "user_version", 1).unwrap();
+        drop(old);
+
+        let message = mismatch(Store::open(&path));
+        assert!(message.contains("unreleased"), "{message}");
+        assert!(message.contains("delete"), "{message}");
+        assert!(message.contains("subject_kind"), "{message}");
+    }
+
+    #[test]
+    fn a_damaged_current_schema_is_refused_whichever_part_is_wrong() {
+        let damage = [
+            ("missing table", "DROP TABLE attempts"),
+            ("missing index", "DROP INDEX runs_one_open_per_subject"),
+            (
+                "index that is not partial",
+                "DROP INDEX runs_one_open_per_subject;
+                 CREATE UNIQUE INDEX runs_one_open_per_subject ON runs (repo, subject_kind, subject_ref, flow)",
+            ),
+            (
+                "index that is not unique",
+                "DROP INDEX runs_one_open_per_subject;
+                 CREATE INDEX runs_one_open_per_subject ON runs (repo, subject_kind, subject_ref, flow)
+                 WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+            ),
+            (
+                "index on other columns",
+                "DROP INDEX runs_one_open_per_subject;
+                 CREATE UNIQUE INDEX runs_one_open_per_subject ON runs (repo, flow)
+                 WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+            ),
+            ("missing column", "ALTER TABLE attempts DROP COLUMN raw_error"),
+            ("extra column", "ALTER TABLE runs ADD COLUMN extra TEXT"),
+        ];
+        for (name, sql) in damage {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("damaged.db");
+            let store = Store::open(&path).unwrap();
+            store.raw().execute_batch(sql).unwrap();
+            drop(store);
+            let message = mismatch(Store::open(&path));
+            assert!(message.contains("delete"), "{name}: {message}");
+        }
+    }
+
+    fn database_made_from(migration: &str, dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("variant.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(migration).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        path
+    }
+
+    fn altered(from: &str, to: &str) -> String {
+        assert_eq!(MIGRATIONS[0].matches(from).count(), 1, "{from}");
+        MIGRATIONS[0].replace(from, to)
+    }
+
+    #[test]
+    fn a_schema_with_the_same_columns_but_different_constraints_or_predicate_is_refused() {
+        let variants = [
+            (
+                "index predicate narrowed",
+                altered(
+                    "WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
+                    "WHERE state IN ('queued')",
+                ),
+            ),
+            (
+                "runs state check without escalated",
+                altered("'failed', 'escalated')", "'failed')"),
+            ),
+            (
+                "subject_ref check removed",
+                altered(" CHECK (length(subject_ref) > 0)", ""),
+            ),
+            (
+                "subject_kind check removed",
+                altered(" CHECK (subject_kind IN ('issue', 'pr', 'commit'))", ""),
+            ),
+            (
+                "attempts state check removed",
+                altered(
+                    " CHECK (state IN ('dispatched', 'succeeded', 'failed'))",
+                    "",
+                ),
+            ),
+            (
+                "unique run_id and n removed",
+                altered(",\n    UNIQUE (run_id, n)", ""),
+            ),
+            ("foreign key removed", altered(" REFERENCES runs(id)", "")),
+        ];
+        for (name, migration) in variants {
+            let dir = tempfile::tempdir().unwrap();
+            let path = database_made_from(&migration, &dir);
+            let message = mismatch(Store::open(&path));
+            assert!(message.contains("delete"), "{name}: {message}");
+            assert!(message.contains("definition"), "{name}: {message}");
+        }
+    }
+
+    fn open_with_extra(extra: &str) -> Result<Store, StoreError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database_made_from(MIGRATIONS[0], &dir);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(extra)
+            .unwrap();
+        Store::open(&path)
+    }
+
+    #[test]
+    fn any_object_beyond_the_frozen_set_is_refused() {
+        let extras = [
+            (
+                "unique index",
+                "CREATE UNIQUE INDEX evil ON attempts(branch);",
+            ),
+            ("plain index", "CREATE INDEX meh ON runs(repo);"),
+            (
+                "index on a new table",
+                "CREATE TABLE other(x); CREATE INDEX other_x ON other(x);",
+            ),
+            (
+                "trigger",
+                "CREATE TRIGGER t BEFORE UPDATE ON runs BEGIN SELECT RAISE(IGNORE); END;",
+            ),
+            ("view", "CREATE VIEW v AS SELECT * FROM runs;"),
+            ("table", "CREATE TABLE other(x);"),
+            (
+                "table named like an internal one",
+                "CREATE TABLE sqliteevil(x);",
+            ),
+        ];
+        for (name, extra) in extras {
+            let detail = mismatch(open_with_extra(extra));
+            assert!(detail.contains("unexpected"), "{name}: {detail}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_renamed_object_is_refused() {
+        let detail = mismatch(open_with_extra("DROP INDEX runs_one_open_per_subject;"));
+        assert!(detail.contains("runs_one_open_per_subject"), "{detail}");
+        let renamed = MIGRATIONS[0].replace("runs_one_open_per_subject", "renamed_index");
+        let dir = tempfile::tempdir().unwrap();
+        let path = database_made_from(&renamed, &dir);
+        assert!(!mismatch(Store::open(&path)).is_empty());
+        let detail = mismatch(open_with_extra("DROP TABLE attempts;"));
+        assert!(detail.contains("attempts"), "{detail}");
+    }
+
+    #[test]
+    fn sqlites_own_internal_objects_are_not_extra() {
+        let store = open_with_extra("ANALYZE;").unwrap();
+        let internal: i64 = store
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(internal >= 2);
+    }
+
+    #[test]
+    fn a_schema_that_differs_only_in_whitespace_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = MIGRATIONS[0].replace("    ", "\t").replace(", ", ",\n  ");
+        let path = database_made_from(&spaced, &dir);
+        assert_eq!(
+            Store::open(&path).unwrap().schema_version().unwrap(),
+            MIGRATIONS.len()
+        );
+    }
+
+    #[test]
+    fn a_healthy_database_reopens_after_the_schema_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fine.db");
+        drop(Store::open(&path).unwrap());
+        assert!(Store::open(&path).is_ok());
+    }
+
+    fn state_names_after(sql: &str, marker: &str) -> std::collections::BTreeSet<String> {
+        let start = sql.find(marker).expect("marker present") + marker.len();
+        let list = &sql[start..sql[start..].find(')').unwrap() + start];
+        list.split(',')
+            .map(|name| name.trim().trim_matches('\'').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn migration_1_is_frozen_and_must_agree_with_the_current_run_states() {
+        let sql = MIGRATIONS[0];
+        let all: std::collections::BTreeSet<String> = RunState::ALL
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let open: std::collections::BTreeSet<String> = RunState::OPEN
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        assert_eq!(
+            state_names_after(sql, "CHECK (state IN ("),
+            all,
+            "RunState changed: add a NEW migration that rebuilds the table, do not edit migration 1"
+        );
+        assert_eq!(
+            state_names_after(sql, "WHERE state IN ("),
+            open,
+            "RunState::OPEN changed: add a NEW migration that rebuilds the index, do not edit migration 1"
+        );
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        drop(conn);
+        match Store::open(&path) {
+            Err(StoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!(found, 99);
+                assert_eq!(supported, MIGRATIONS.len());
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a newer schema must not open"),
+        }
+    }
+
+    #[test]
+    fn concurrent_first_opens_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(|store| store.schema_version().unwrap())
+                })
+            })
+            .collect();
+        for handle in handles {
+            let version = handle.join().unwrap().expect("open must not fail");
+            assert_eq!(version, MIGRATIONS.len());
+        }
+    }
+
+    #[test]
+    fn two_handles_on_one_file_never_report_a_locked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2u64)
+            .map(|worker| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let store = Store::open(&path).unwrap();
+                    barrier.wait();
+                    for n in 0..60 {
+                        let subject = issue(worker * 1000 + n + 1);
+                        let id = store
+                            .enqueue_run("o/r", &subject, "issue", 1)
+                            .expect("enqueue must not fail under contention")
+                            .unwrap();
+                        store.set_run_state(id, RunState::Running, 2).unwrap();
+                        store.start_attempt(id, 3).unwrap();
+                        store.set_run_state(id, RunState::Failed, 4).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows: i64 = store
+            .raw()
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 120);
+    }
+
+    #[test]
+    fn file_databases_use_wal_and_a_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let mode: String = store
+            .raw()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let timeout: i64 = store
+            .raw()
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, BUSY_TIMEOUT.as_millis() as i64);
+        let foreign_keys: i64 = store
+            .raw()
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    fn hold_exclusive_lock(path: &Path) -> Connection {
+        let holder = Connection::open(path).unwrap();
+        holder.execute_batch(MIGRATIONS[0]).unwrap();
+        holder.pragma_update(None, "user_version", 1).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        holder
+    }
+
+    #[test]
+    fn switching_to_wal_retries_while_the_database_is_busy_and_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let holder = hold_exclusive_lock(&path);
+        let waiter = Connection::open(&path).unwrap();
+        waiter.busy_timeout(Duration::ZERO).unwrap();
+
+        let started = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(enable_wal(&waiter, Duration::from_millis(150)));
+        });
+        let err = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("enable_wal ignored its deadline")
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Sqlite(inner) if is_busy(inner)),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "gave up too early"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "ignored the deadline"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn switching_to_wal_succeeds_once_the_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released.db");
+        let holder = hold_exclusive_lock(&path);
+        let started = Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let waiter = Connection::open(&path).unwrap();
+        waiter.busy_timeout(Duration::ZERO).unwrap();
+        enable_wal(&waiter, Duration::from_secs(5)).expect("must retry until the lock is gone");
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "returned after {:?}, before the lock was released",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        let mode: String = waiter
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn only_the_wal_answer_counts_as_having_switched_to_wal() {
+        for mode in ["wal", "WAL", "Wal"] {
+            assert!(wal_mode_reached(mode), "{mode}");
+        }
+        for mode in [
+            "memory", "delete", "truncate", "persist", "off", "", "wal2", " wal",
+        ] {
+            assert!(!wal_mode_reached(mode), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn switching_to_wal_fails_when_sqlite_answers_with_another_mode() {
+        let conn = Connection::open_in_memory().unwrap();
+        match enable_wal(&conn, Duration::from_millis(50)) {
+            Err(StoreError::WalNotEnabled(mode)) => assert_eq!(mode, "memory"),
+            other => panic!("expected WalNotEnabled, got {other:?}"),
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("wal.db")).unwrap();
+        enable_wal(&conn, Duration::from_millis(50)).unwrap();
+    }
+
+    #[test]
+    fn switching_to_wal_reports_a_non_busy_error_at_once_without_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.db");
+        drop(hold_exclusive_lock(&path));
+        let readonly = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let err = enable_wal(&readonly, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Sqlite(inner) if !is_busy(inner)),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "retried a non-busy error"
+        );
+    }
+
+    #[test]
+    fn busy_and_locked_are_retryable_and_other_errors_are_not() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(is_busy(&busy) && is_busy(&locked));
+        assert!(!is_busy(&constraint));
+        assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    fn within_ten_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the call hung")
+    }
+
+    #[test]
+    fn a_database_one_version_beyond_the_supported_one_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("next.db");
+        drop(Store::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        drop(conn);
+        match Store::open(&path) {
+            Err(StoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!((found, supported), (MIGRATIONS.len() + 1, MIGRATIONS.len()));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a newer schema must not open"),
+        }
+    }
+
+    #[test]
+    fn opening_a_locked_database_with_a_short_timeout_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let holder = hold_exclusive_lock(&path);
+        let started = Instant::now();
+        let result = within_ten_seconds(move || {
+            Store::open_with_busy_timeout(&path, Duration::from_millis(100)).map(|_| ())
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&result, Err(StoreError::Sqlite(inner)) if is_busy(inner)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "gave up after {elapsed:?}, before the 100 ms timeout"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100) + Duration::from_secs(3),
+            "waited {elapsed:?} instead of about 100 ms"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn opening_retries_the_wal_switch_while_a_reader_holds_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader.db");
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch(MIGRATIONS[0]).unwrap();
+        reader.pragma_update(None, "user_version", 1).unwrap();
+        reader.execute_batch("BEGIN; SELECT * FROM runs;").unwrap();
+        let started = Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            reader.execute_batch("COMMIT").unwrap();
+        });
+        let store = within_ten_seconds(move || {
+            Store::open_with_busy_timeout(&path, Duration::from_secs(5))
+        })
+        .expect("open must keep retrying the WAL switch until the reader is gone");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "opened after {:?}, before the reader released",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn opening_waits_for_a_lock_that_is_released_within_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released-open.db");
+        let holder = hold_exclusive_lock(&path);
+        let started = Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let store = within_ten_seconds(move || {
+            Store::open_with_busy_timeout(&path, Duration::from_secs(5))
+        })
+        .expect("open must wait for the lock instead of giving up");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "opened after {:?}, before the lock was released",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn open_passes_its_timeout_to_the_wal_switch_and_in_memory_stores_skip_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(1234);
+        WAL_TIMEOUT_SEEN.with(|seen| seen.set(None));
+        drop(Store::open_with_busy_timeout(&dir.path().join("a.db"), timeout).unwrap());
+        assert_eq!(WAL_TIMEOUT_SEEN.with(|seen| seen.get()), Some(timeout));
+
+        WAL_TIMEOUT_SEEN.with(|seen| seen.set(None));
+        drop(Store::open(&dir.path().join("b.db")).unwrap());
+        assert_eq!(WAL_TIMEOUT_SEEN.with(|seen| seen.get()), Some(BUSY_TIMEOUT));
+
+        WAL_TIMEOUT_SEEN.with(|seen| seen.set(None));
+        drop(Store::open_in_memory().unwrap());
+        drop(Store::open(Path::new(":memory:")).unwrap());
+        assert_eq!(WAL_TIMEOUT_SEEN.with(|seen| seen.get()), None);
+    }
+
+    #[test]
+    fn a_pr_subject_is_read_back_from_a_file_store_as_a_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr.db");
+        let store = Store::open(&path).unwrap();
+        let pr = Subject::pr(12).unwrap();
+        let id = store.enqueue_run("o/r", &pr, "issue", 1).unwrap().unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let run = reopened.run(id).unwrap();
+        assert_eq!(run.subject.kind(), SubjectKind::Pr);
+        assert_eq!(run.subject, pr);
+        assert_eq!(reopened.next_queued("o/r").unwrap().unwrap().subject, pr);
+        assert_eq!(SubjectKind::parse("pr").unwrap(), SubjectKind::Pr);
+        assert_eq!(SubjectKind::parse("issue").unwrap(), SubjectKind::Issue);
+        assert_eq!(SubjectKind::parse("commit").unwrap(), SubjectKind::Commit);
+    }
+
+    #[test]
+    fn a_bare_relative_database_path_resolves_against_the_current_directory() {
+        let name = format!("inchworm-no-such-{}.db", std::process::id());
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert!(!cwd.join(&name).exists());
+        assert_eq!(
+            canonical_db_path(Path::new(&name)).unwrap(),
+            cwd.join(&name)
+        );
+        assert_eq!(
+            canonical_db_path(&Path::new(".").join(&name)).unwrap(),
+            cwd.join(&name)
+        );
+    }
+
+    #[test]
+    fn canonical_db_path_keeps_a_missing_file_under_its_real_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            canonical_db_path(&dir.path().join("new.db")).unwrap(),
+            real.join("new.db")
+        );
+        let err = canonical_db_path(&dir.path().join("missing").join("new.db")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn corrupt_errors_carry_the_exact_description_and_cause() {
+        match corrupt::<&str>("pr number")("out of range") {
+            StoreError::Corrupt(text) => assert_eq!(text, "pr number: out of range"),
+            other => panic!("expected Corrupt, got {other}"),
+        }
+        let cause = u32::try_from(-1i64).unwrap_err();
+        let cause_text = cause.to_string();
+        assert!(!cause_text.is_empty());
+        let shown = corrupt("attempt n")(cause);
+        assert_eq!(
+            shown.to_string(),
+            format!("stored value is corrupt: attempt n: {cause_text}")
+        );
+    }
+
+    #[test]
+    fn foreign_keys_are_enforced() {
+        let (store, _) = store_with_run();
+        let orphan = store.raw().execute(
+            "INSERT INTO attempts (run_id, n, state, started_at) VALUES (999, 1, 'dispatched', 1)",
+            [],
+        );
+        assert!(
+            matches!(
+                &orphan,
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            ),
+            "{orphan:?}"
+        );
+    }
+
+    #[test]
+    fn enqueue_deduplicates_on_repo_subject_and_flow() {
         let (store, id) = store_with_run();
-        assert!(store.enqueue_run("o/r", 1, "issue", 11).unwrap().is_none());
-        assert!(store.enqueue_run("o/r", 1, "other", 11).unwrap().is_some());
-        assert!(store.enqueue_run("o/r", 2, "issue", 11).unwrap().is_some());
-        assert!(store.enqueue_run("o/x", 1, "issue", 11).unwrap().is_some());
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 11)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "other", 11)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(2), "issue", 11)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/x", &issue(1), "issue", 11)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &Subject::pr(1).unwrap(), "issue", 11)
+                .unwrap()
+                .is_some()
+        );
+        let commit = Subject::commit(SHA1).unwrap();
+        assert!(
+            store
+                .enqueue_run("o/r", &commit, "issue", 11)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &commit, "issue", 12)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(store.run(id).unwrap().state, RunState::Queued);
     }
 
     #[test]
-    fn a_finished_issue_can_be_enqueued_again_but_an_open_one_cannot() {
-        let (store, first) = store_with_run();
-        store.set_run_state(first, RunState::Running, 11).unwrap();
-        assert!(store.enqueue_run("o/r", 1, "issue", 12).unwrap().is_none());
-        for state in [RunState::AwaitingCi, RunState::Judging] {
-            store.set_run_state(first, state, 13).unwrap();
-            assert!(store.enqueue_run("o/r", 1, "issue", 14).unwrap().is_none());
-        }
-        store.set_run_state(first, RunState::Failed, 15).unwrap();
-
-        let second = store.enqueue_run("o/r", 1, "issue", 16).unwrap().unwrap();
-        assert_ne!(first, second);
-        assert_eq!(store.run(first).unwrap().state, RunState::Failed);
-        assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, second);
-        assert!(store.enqueue_run("o/r", 1, "issue", 17).unwrap().is_none());
+    fn only_a_duplicate_open_run_is_reported_as_none() {
+        let (store, _) = store_with_run();
+        store
+            .raw()
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE INSERT ON runs
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        let err = store.enqueue_run("o/r", &issue(2), "issue", 1).unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)), "{err}");
     }
 
     #[test]
-    fn every_terminal_state_allows_a_rerun() {
-        for terminal in [
-            RunState::PrOpen,
-            RunState::Merged,
-            RunState::Escalated,
-            RunState::Failed,
+    fn issue_and_pr_subjects_need_a_positive_number_and_have_one_spelling() {
+        assert!(matches!(
+            Subject::issue(0),
+            Err(StoreError::InvalidSubject(_))
+        ));
+        assert!(matches!(Subject::pr(0), Err(StoreError::InvalidSubject(_))));
+        let seven = Subject::issue(7).unwrap();
+        assert_eq!(seven.kind(), SubjectKind::Issue);
+        assert_eq!(seven.reference(), "7");
+        assert_eq!(Subject::pr(7).unwrap().kind(), SubjectKind::Pr);
+        let largest = Subject::issue(u64::MAX).unwrap();
+        assert_eq!(largest.reference(), "18446744073709551615");
+        assert_eq!(
+            Subject::from_parts(SubjectKind::Issue, largest.reference()).unwrap(),
+            largest
+        );
+    }
+
+    #[test]
+    fn non_canonical_numbers_are_rejected_when_built_from_parts() {
+        for bad in [
+            "",
+            "0",
+            "00",
+            "07",
+            "+7",
+            "-1",
+            " 7",
+            "7 ",
+            "7\n",
+            "not a number",
+            "1.5",
+            "0x7",
+            "\u{663}",
+            "18446744073709551616",
+            "99999999999999999999999",
         ] {
-            let (store, run) = store_with_run();
-            store.set_run_state(run, RunState::Running, 11).unwrap();
-            match terminal {
-                RunState::PrOpen | RunState::Merged => {
-                    store.set_run_state(run, RunState::AwaitingCi, 12).unwrap();
-                    store.set_run_state(run, RunState::Judging, 13).unwrap();
-                }
-                _ => {}
+            for kind in [SubjectKind::Issue, SubjectKind::Pr] {
+                assert!(
+                    matches!(
+                        Subject::from_parts(kind, bad),
+                        Err(StoreError::InvalidSubject(_))
+                    ),
+                    "{kind:?} {bad:?}"
+                );
             }
-            store.set_run_state(run, terminal, 14).unwrap();
+        }
+        for good in ["1", "7", "10", "123456789"] {
             assert!(
-                store.enqueue_run("o/r", 1, "issue", 15).unwrap().is_some(),
-                "{terminal}"
+                Subject::from_parts(SubjectKind::Issue, good).is_ok(),
+                "{good}"
             );
         }
     }
@@ -498,10 +2208,20 @@ mod tests {
     #[test]
     fn the_attempt_count_is_scoped_to_one_repo_and_one_issue() {
         let store = Store::open_in_memory().unwrap();
-        let mine = store.enqueue_run("o/r", 1, "issue", 1).unwrap().unwrap();
-        let other_issue = store.enqueue_run("o/r", 2, "issue", 1).unwrap().unwrap();
-        let other_repo = store.enqueue_run("o/x", 1, "issue", 1).unwrap().unwrap();
+        let mine = store
+            .enqueue_run("o/r", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let other_issue = store
+            .enqueue_run("o/r", &issue(2), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let other_repo = store
+            .enqueue_run("o/x", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
         for run in [mine, mine, other_issue, other_repo, other_repo, other_repo] {
+            let _ = store.set_run_state(run, RunState::Running, 2);
             store.start_attempt(run, 2).unwrap();
         }
         assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 2);
@@ -525,15 +2245,97 @@ mod tests {
     }
 
     #[test]
+    fn commit_subjects_must_be_a_full_sha1_or_sha256_in_lowercase_hex() {
+        for bad in [
+            "",
+            "ZZZ",
+            "abcdef",
+            "0123abc",
+            &SHA1[..39],
+            &SHA1[..7],
+            &SHA256[..41],
+            &SHA256[..63],
+        ] {
+            assert!(is_invalid_subject(&Subject::commit(bad)), "{bad:?}");
+        }
+        let too_long = format!("{SHA256}0");
+        assert!(is_invalid_subject(&Subject::commit(&too_long)));
+        let not_hex = format!("g{}", &SHA1[1..]);
+        assert!(is_invalid_subject(&Subject::commit(&not_hex)));
+        assert!(Subject::commit(SHA1).is_ok());
+        assert!(Subject::commit(SHA256).is_ok());
+        assert_eq!(
+            Subject::commit(&SHA1.to_ascii_uppercase())
+                .unwrap()
+                .reference(),
+            SHA1
+        );
+    }
+
+    #[test]
+    fn from_parts_only_accepts_the_canonical_spelling() {
+        let upper = SHA1.to_ascii_uppercase();
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Commit,
+            &upper
+        )));
+        assert!(Subject::from_parts(SubjectKind::Commit, SHA1).is_ok());
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Commit,
+            "7"
+        )));
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Issue,
+            SHA1
+        )));
+    }
+
+    #[test]
+    fn one_subject_cannot_be_opened_twice_under_two_spellings() {
+        let store = Store::open_in_memory().unwrap();
+        let first = Subject::issue(7).unwrap();
+        let again = Subject::from_parts(SubjectKind::Issue, "7").unwrap();
+        assert!(
+            store
+                .enqueue_run("o/r", &first, "issue", 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &again, "issue", 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(is_invalid_subject(&Subject::from_parts(
+            SubjectKind::Issue,
+            "07"
+        )));
+        let lower = Subject::commit(SHA1).unwrap();
+        let upper = Subject::commit(&SHA1.to_ascii_uppercase()).unwrap();
+        assert!(
+            store
+                .enqueue_run("o/r", &lower, "issue", 3)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_run("o/r", &upper, "issue", 4)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn run_fields_round_trip() {
         let (store, id) = store_with_run();
-        let run = store.run(id).unwrap();
         assert_eq!(
-            run,
+            store.run(id).unwrap(),
             Run {
                 id,
                 repo: "o/r".into(),
-                issue: 1,
+                subject: issue(1),
                 flow: "issue".into(),
                 state: RunState::Queued,
                 created_at: 10,
@@ -577,11 +2379,77 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_subject_can_be_enqueued_again_but_an_open_one_cannot() {
+        let (store, first) = store_with_run();
+        for state in [RunState::Running, RunState::AwaitingCi, RunState::Judging] {
+            store.set_run_state(first, state, 11).unwrap();
+            assert!(
+                store
+                    .enqueue_run("o/r", &issue(1), "issue", 12)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        store.set_run_state(first, RunState::Failed, 15).unwrap();
+        let second = store
+            .enqueue_run("o/r", &issue(1), "issue", 16)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(store.run(first).unwrap().state, RunState::Failed);
+        assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, second);
+    }
+
+    #[test]
+    fn every_terminal_state_allows_a_rerun_and_every_open_state_blocks_it() {
+        for state in RunState::ALL {
+            let (store, id) = store_with_run();
+            force_state(&store, id, state.as_str());
+            let again = store.enqueue_run("o/r", &issue(1), "issue", 20).unwrap();
+            assert_eq!(again.is_some(), state.is_terminal(), "{state}");
+            assert_eq!(
+                store.active_run("o/r").unwrap().is_some(),
+                state.is_active(),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_open_state_index_is_derived_from_the_model() {
+        let (store, _) = store_with_run();
+        let sql: String = store
+            .raw()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'runs_one_open_per_subject'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for state in RunState::ALL {
+            assert_eq!(
+                sql.contains(&format!("'{}'", state.as_str())),
+                state.is_open(),
+                "{state}: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn next_queued_is_fifo_per_repo_and_active_run_sees_in_flight_states() {
         let store = Store::open_in_memory().unwrap();
-        let a1 = store.enqueue_run("o/a", 1, "issue", 1).unwrap().unwrap();
-        let b1 = store.enqueue_run("o/b", 1, "issue", 2).unwrap().unwrap();
-        let a2 = store.enqueue_run("o/a", 2, "issue", 3).unwrap().unwrap();
+        let a1 = store
+            .enqueue_run("o/a", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let b1 = store
+            .enqueue_run("o/b", &issue(1), "issue", 2)
+            .unwrap()
+            .unwrap();
+        let a2 = store
+            .enqueue_run("o/a", &issue(2), "issue", 3)
+            .unwrap()
+            .unwrap();
         assert_eq!(store.next_queued("o/a").unwrap().unwrap().id, a1);
         assert_eq!(store.next_queued("o/b").unwrap().unwrap().id, b1);
         assert!(store.next_queued("o/none").unwrap().is_none());
@@ -601,21 +2469,50 @@ mod tests {
     }
 
     #[test]
-    fn attempts_are_numbered_per_run() {
+    fn attempts_need_a_running_run_and_are_numbered_per_run() {
         let store = Store::open_in_memory().unwrap();
-        let r1 = store.enqueue_run("o/r", 1, "issue", 1).unwrap().unwrap();
-        let r2 = store.enqueue_run("o/r", 2, "issue", 1).unwrap().unwrap();
+        let r1 = store
+            .enqueue_run("o/r", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let r2 = store
+            .enqueue_run("o/r", &issue(2), "issue", 1)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            store.start_attempt(r1, 2),
+            Err(StoreError::RunNotRunning {
+                state: RunState::Queued,
+                ..
+            })
+        ));
+        store.set_run_state(r1, RunState::Running, 2).unwrap();
+        store.set_run_state(r2, RunState::Running, 2).unwrap();
         assert_eq!(store.start_attempt(r1, 2).unwrap().n, 1);
         assert_eq!(store.start_attempt(r1, 3).unwrap().n, 2);
         assert_eq!(store.start_attempt(r2, 4).unwrap().n, 1);
         let all = store.attempts(r1).unwrap();
         assert_eq!(all.iter().map(|a| a.n).collect::<Vec<_>>(), vec![1, 2]);
         assert!(all.iter().all(|a| a.state == AttemptState::Dispatched));
+
+        store.set_run_state(r1, RunState::Failed, 5).unwrap();
+        let err = store.start_attempt(r1, 6).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::RunNotRunning {
+                    state: RunState::Failed,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(store.attempts(r1).unwrap().len(), 2);
     }
 
     #[test]
     fn failed_attempts_keep_class_and_raw_error() {
-        let (store, run) = store_with_run();
+        let (store, run) = running_store();
         let attempt = store.start_attempt(run, 11).unwrap();
         store
             .finish_attempt_failed(attempt.id, FailureClass::MaxIterations, "ran out", 12)
@@ -629,7 +2526,7 @@ mod tests {
 
     #[test]
     fn successful_attempts_record_the_pr() {
-        let (store, run) = store_with_run();
+        let (store, run) = running_store();
         let attempt = store.start_attempt(run, 11).unwrap();
         store
             .record_pr(attempt.id, "inchworm/1-a1", "abc123", 42)
@@ -641,11 +2538,127 @@ mod tests {
         assert_eq!(done.head_sha.as_deref(), Some("abc123"));
         assert_eq!(done.pr_number, Some(42));
         assert_eq!(done.failure_class, None);
+        assert_eq!(done.raw_error, None);
+    }
+
+    fn is_invalid_subject<T>(result: &Result<T, StoreError>) -> bool {
+        matches!(result, Err(StoreError::InvalidSubject(_)))
+    }
+
+    fn invalid_pr(result: Result<(), StoreError>) -> String {
+        match result {
+            Err(StoreError::InvalidPullRequest(detail)) => detail,
+            other => panic!("expected InvalidPullRequest, got {other:?}"),
+        }
     }
 
     #[test]
-    fn finishing_twice_or_unknown_attempts_is_an_error() {
-        let (store, run) = store_with_run();
+    fn record_pr_rejects_pr_zero_blank_fields_control_characters_and_absurd_lengths() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let long_branch = "b".repeat(256);
+        let long_sha = "a".repeat(65);
+        let cases: Vec<(&str, &str, &str, u64, &str)> = vec![
+            ("pr 0", "feature", "abc123", 0, "pull request number"),
+            ("empty branch", "", "abc123", 1, "branch"),
+            ("blank branch", "   ", "abc123", 1, "branch"),
+            ("tab-only branch", "\t", "abc123", 1, "branch"),
+            ("newline in branch", "a\nb", "abc123", 1, "branch"),
+            ("nul in branch", "a\0b", "abc123", 1, "branch"),
+            ("delete in branch", "a\x7fb", "abc123", 1, "branch"),
+            ("long branch", &long_branch, "abc123", 1, "branch"),
+            ("empty sha", "feature", "", 1, "head sha"),
+            ("blank sha", "feature", "   ", 1, "head sha"),
+            ("newline in sha", "feature", "ab\nc", 1, "head sha"),
+            ("long sha", "feature", &long_sha, 1, "head sha"),
+        ];
+        for (name, branch, sha, pr, field) in cases {
+            let detail = invalid_pr(store.record_pr(attempt.id, branch, sha, pr));
+            assert!(detail.contains(field), "{name}: {detail}");
+            let unchanged = store.attempt(attempt.id).unwrap();
+            assert_eq!(
+                (unchanged.branch, unchanged.head_sha, unchanged.pr_number),
+                (None, None, None),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_pr_accepts_values_at_the_bounds() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let branch = "b".repeat(255);
+        let sha = "a".repeat(64);
+        store.record_pr(attempt.id, &branch, &sha, 1).unwrap();
+        let stored = store.attempt(attempt.id).unwrap();
+        assert_eq!(stored.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(stored.head_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(stored.pr_number, Some(1));
+        store
+            .record_pr(attempt.id, "feat/x y", "abc", u64::MAX >> 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn record_pr_numbers_beyond_what_sqlite_stores_are_an_invalid_pull_request() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let largest = i64::MAX as u64;
+        store
+            .record_pr(attempt.id, "feature", "abc", largest)
+            .unwrap();
+        assert_eq!(store.attempt(attempt.id).unwrap().pr_number, Some(largest));
+        for number in [largest + 1, (1u64 << 63) + 5, u64::MAX] {
+            let detail = invalid_pr(store.record_pr(attempt.id, "other", "def", number));
+            assert!(detail.contains("pull request number"), "{number}: {detail}");
+            assert!(detail.contains(&i64::MAX.to_string()), "{number}: {detail}");
+            let unchanged = store.attempt(attempt.id).unwrap();
+            assert_eq!(unchanged.branch.as_deref(), Some("feature"));
+            assert_eq!(unchanged.pr_number, Some(largest));
+        }
+    }
+
+    #[test]
+    fn record_pr_lengths_are_counted_in_bytes_not_characters() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let too_long_branch = "é".repeat(128);
+        let detail = invalid_pr(store.record_pr(attempt.id, &too_long_branch, "abc", 1));
+        assert!(
+            detail.contains("branch") && detail.contains("255 bytes"),
+            "{detail}"
+        );
+        let too_long_sha = "é".repeat(33);
+        assert_eq!(too_long_sha.chars().count(), 33);
+        let detail = invalid_pr(store.record_pr(attempt.id, "feature", &too_long_sha, 1));
+        assert!(
+            detail.contains("head sha") && detail.contains("64 bytes"),
+            "{detail}"
+        );
+        let branch = "é".repeat(127);
+        let sha = "é".repeat(32);
+        assert_eq!((branch.len(), sha.len()), (254, 64));
+        store.record_pr(attempt.id, &branch, &sha, 1).unwrap();
+        let stored = store.attempt(attempt.id).unwrap();
+        assert_eq!(stored.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(stored.head_sha.as_deref(), Some(sha.as_str()));
+    }
+
+    #[test]
+    fn a_recorded_pr_number_is_never_zero_so_recovery_cannot_be_diverted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
+        let attempt = store.start_attempt(run, 12).unwrap();
+        invalid_pr(store.record_pr(attempt.id, "feature", "abc123", 0));
+        store.recover_after_crash(&lock, 20).unwrap();
+        assert_eq!(store.run(run).unwrap().state, RunState::Queued);
+    }
+
+    #[test]
+    fn finished_attempts_cannot_be_changed_again() {
+        let (store, run) = running_store();
         let attempt = store.start_attempt(run, 11).unwrap();
         store.finish_attempt_ok(attempt.id, 12).unwrap();
         assert!(matches!(
@@ -656,7 +2669,13 @@ mod tests {
             store.finish_attempt_failed(attempt.id, FailureClass::Timeout, "x", 13),
             Err(StoreError::AttemptNotDispatched(_))
         ));
-        assert_eq!(store.attempt(attempt.id).unwrap().ended_at, Some(12));
+        assert!(matches!(
+            store.record_pr(attempt.id, "b", "s", 7),
+            Err(StoreError::AttemptNotDispatched(_))
+        ));
+        let unchanged = store.attempt(attempt.id).unwrap();
+        assert_eq!(unchanged.ended_at, Some(12));
+        assert_eq!(unchanged.pr_number, None);
         assert!(matches!(
             store.finish_attempt_ok(999, 1),
             Err(StoreError::AttemptNotFound(999))
@@ -667,32 +2686,896 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn crash_recovery_only_touches_dispatched_attempts() {
-        let (store, run) = store_with_run();
-        let done = store.start_attempt(run, 11).unwrap();
-        store.finish_attempt_ok(done.id, 12).unwrap();
-        let failed = store.start_attempt(run, 13).unwrap();
-        store
-            .finish_attempt_failed(failed.id, FailureClass::ModelError, "boom", 14)
+    fn file_store(dir: &tempfile::TempDir) -> (Store, DaemonLock) {
+        let path = dir.path().join("recovery.db");
+        let store = Store::open(&path).unwrap();
+        let lock = DaemonLock::acquire(&path).unwrap();
+        (store, lock)
+    }
+
+    fn running_in(store: &Store) -> RunId {
+        let id = store
+            .enqueue_run("o/r", &issue(1), "issue", 10)
+            .unwrap()
             .unwrap();
-        let lost = store.start_attempt(run, 15).unwrap();
+        store.set_run_state(id, RunState::Running, 11).unwrap();
+        id
+    }
 
-        assert_eq!(store.recover_after_crash(20).unwrap(), 1);
+    #[test]
+    fn recovery_fails_dispatched_attempts_and_requeues_the_run_so_the_subject_is_not_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
+        let lost = store.start_attempt(run, 12).unwrap();
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 13)
+                .unwrap()
+                .is_none()
+        );
 
+        let report = store.recover_after_crash(&lock, 20).unwrap();
         assert_eq!(
-            store.attempt(done.id).unwrap().state,
-            AttemptState::Succeeded
+            report,
+            Recovery {
+                attempts_failed: 1,
+                runs_requeued: 1,
+                resumable: Vec::new()
+            }
         );
-        assert_eq!(
-            store.attempt(failed.id).unwrap().failure_class,
-            Some(FailureClass::ModelError)
-        );
+
         let lost = store.attempt(lost.id).unwrap();
         assert_eq!(lost.state, AttemptState::Failed);
         assert_eq!(lost.failure_class, Some(FailureClass::OrchestratorLost));
+        assert_eq!(
+            lost.raw_error.as_deref(),
+            Some("inchworm stopped while this attempt was dispatched")
+        );
         assert_eq!(lost.ended_at, Some(20));
-        assert_eq!(store.recover_after_crash(21).unwrap(), 0);
+
+        let recovered = store.run(run).unwrap();
+        assert_eq!(recovered.state, RunState::Queued);
+        assert_eq!(recovered.updated_at, 20);
+        assert!(store.active_run("o/r").unwrap().is_none());
+        assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, run);
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 21)
+                .unwrap()
+                .is_none()
+        );
+
+        store.set_run_state(run, RunState::Running, 22).unwrap();
+        assert_eq!(store.start_attempt(run, 23).unwrap().n, 2);
+    }
+
+    #[test]
+    fn recovery_leaves_finished_attempts_and_other_runs_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let done_run = store
+            .enqueue_run("o/r", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
+        store.set_run_state(done_run, RunState::Running, 2).unwrap();
+        let ok = store.start_attempt(done_run, 3).unwrap();
+        store.finish_attempt_ok(ok.id, 4).unwrap();
+        let bad = store.start_attempt(done_run, 5).unwrap();
+        store
+            .finish_attempt_failed(bad.id, FailureClass::ModelError, "boom", 6)
+            .unwrap();
+        store
+            .set_run_state(done_run, RunState::AwaitingCi, 7)
+            .unwrap();
+
+        let queued = store
+            .enqueue_run("o/r", &issue(2), "issue", 8)
+            .unwrap()
+            .unwrap();
+
+        let report = store.recover_after_crash(&lock, 30).unwrap();
+        assert_eq!(
+            report,
+            Recovery {
+                attempts_failed: 0,
+                runs_requeued: 0,
+                resumable: vec![done_run]
+            }
+        );
+
+        assert_eq!(store.attempt(ok.id).unwrap().state, AttemptState::Succeeded);
+        assert_eq!(
+            store.attempt(bad.id).unwrap().failure_class,
+            Some(FailureClass::ModelError)
+        );
+        assert_eq!(store.run(done_run).unwrap().state, RunState::AwaitingCi);
+        assert_eq!(store.run(queued).unwrap().state, RunState::Queued);
+    }
+
+    type Case = (
+        &'static str,
+        &'static str,
+        Vec<(&'static str, Option<i64>)>,
+        RunState,
+        bool,
+    );
+
+    struct Seeded {
+        state: &'static str,
+        attempts: Vec<(&'static str, Option<i64>)>,
+    }
+
+    fn seed(store: &Store, subject: u64, spec: &Seeded) -> RunId {
+        let id = store
+            .enqueue_run("o/r", &issue(subject), "issue", 1)
+            .unwrap()
+            .unwrap();
+        force_state(store, id, spec.state);
+        for (n, (state, pr)) in spec.attempts.iter().enumerate() {
+            let class = (*state == "failed").then_some("model_error");
+            store
+                .raw()
+                .execute(
+                    "INSERT INTO attempts (run_id, n, state, pr_number, failure_class, started_at, ended_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                    params![id, n as i64 + 1, state, pr, class, (*state != "dispatched").then_some(2)],
+                )
+                .unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn recovery_is_decided_by_run_state_for_every_state_with_and_without_a_dispatched_attempt() {
+        use RunState::*;
+        let d = ("dispatched", None);
+        let cases: Vec<Case> = vec![
+            ("queued, none", "queued", vec![], Queued, false),
+            ("queued, dispatched", "queued", vec![d], Queued, false),
+            ("running, none", "running", vec![], Queued, false),
+            ("running, dispatched", "running", vec![d], Queued, false),
+            (
+                "running, published and finished",
+                "running",
+                vec![("succeeded", Some(7))],
+                AwaitingCi,
+                true,
+            ),
+            (
+                "running, finished without a pr",
+                "running",
+                vec![("succeeded", None)],
+                Queued,
+                false,
+            ),
+            (
+                "running, earlier failure after a pr",
+                "running",
+                vec![("failed", Some(7))],
+                Queued,
+                false,
+            ),
+            (
+                "running, pr recorded then crashed",
+                "running",
+                vec![("dispatched", Some(7))],
+                AwaitingCi,
+                true,
+            ),
+            (
+                "running, published once then a retry crashed",
+                "running",
+                vec![("succeeded", Some(7)), d],
+                Queued,
+                false,
+            ),
+            ("awaiting_ci, none", "awaiting_ci", vec![], AwaitingCi, true),
+            (
+                "awaiting_ci, dispatched",
+                "awaiting_ci",
+                vec![d],
+                AwaitingCi,
+                true,
+            ),
+            ("judging, none", "judging", vec![], Judging, true),
+            ("judging, dispatched", "judging", vec![d], Judging, true),
+            ("merged, none", "merged", vec![], Merged, false),
+            ("merged, dispatched", "merged", vec![d], Merged, false),
+            ("pr_open, dispatched", "pr_open", vec![d], PrOpen, false),
+            ("failed, dispatched", "failed", vec![d], Failed, false),
+            (
+                "escalated, dispatched",
+                "escalated",
+                vec![d],
+                Escalated,
+                false,
+            ),
+        ];
+        for (name, state, attempts, expected, resumable) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, lock) = file_store(&dir);
+            let run = seed(
+                &store,
+                1,
+                &Seeded {
+                    state,
+                    attempts: attempts.clone(),
+                },
+            );
+            let dispatched = attempts.iter().filter(|a| a.0 == "dispatched").count();
+            let report = store.recover_after_crash(&lock, 50).unwrap();
+
+            assert_eq!(store.run(run).unwrap().state, expected, "{name}");
+            assert_eq!(report.resumable.contains(&run), resumable, "{name}");
+            assert_eq!(report.attempts_failed, dispatched, "{name}");
+            assert_eq!(
+                report.runs_requeued,
+                usize::from(expected == Queued && state == "running"),
+                "{name}"
+            );
+            for attempt in store.attempts(run).unwrap() {
+                assert_ne!(attempt.state, AttemptState::Dispatched, "{name}");
+            }
+            let again = store.recover_after_crash(&lock, 60).unwrap();
+            assert_eq!(
+                (again.attempts_failed, again.runs_requeued),
+                (0, 0),
+                "{name}"
+            );
+            assert_eq!(again.resumable, report.resumable, "{name}");
+            assert_eq!(store.run(run).unwrap().state, expected, "{name}");
+            if expected.is_open() {
+                assert!(
+                    store
+                        .enqueue_run("o/r", &issue(1), "issue", 70)
+                        .unwrap()
+                        .is_none(),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_run_with_no_attempt_does_not_wedge_its_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 13)
+                .unwrap()
+                .is_none()
+        );
+        store.recover_after_crash(&lock, 20).unwrap();
+        assert_eq!(store.run(run).unwrap().state, RunState::Queued);
+        assert_eq!(store.next_queued("o/r").unwrap().unwrap().id, run);
+        assert!(
+            store
+                .enqueue_run("o/r", &issue(1), "issue", 21)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_lock_for_another_database_does_not_authorise_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        let store_a = Store::open(&a).unwrap();
+        let run = running_in(&store_a);
+        let attempt = store_a.start_attempt(run, 12).unwrap();
+        let lock_b = DaemonLock::acquire(&b).unwrap();
+
+        let err = store_a.recover_after_crash(&lock_b, 20).unwrap_err();
+        match &err {
+            StoreError::LockForDifferentDatabase { lock, store } => {
+                assert!(lock.ends_with("b.db") && store.ends_with("a.db"), "{err}");
+            }
+            other => panic!("expected LockForDifferentDatabase, got {other}"),
+        }
+        assert_eq!(store_a.run(run).unwrap().state, RunState::Running);
+        assert_eq!(
+            store_a.attempt(attempt.id).unwrap().state,
+            AttemptState::Dispatched
+        );
+    }
+
+    #[test]
+    fn an_in_memory_store_cannot_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let lock = DaemonLock::acquire(&dir.path().join("any.db")).unwrap();
+        assert!(matches!(
+            store.recover_after_crash(&lock, 1),
+            Err(StoreError::RecoveryNeedsFileStore)
+        ));
+    }
+
+    #[test]
+    fn the_lock_reports_the_canonical_path_and_can_be_taken_before_the_database_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("later.db");
+        let lock = DaemonLock::acquire(&path).unwrap();
+        assert_eq!(
+            lock.database(),
+            dir.path().canonicalize().unwrap().join("later.db")
+        );
+        let store = Store::open(&path).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store.recover_after_crash(&lock, 3).unwrap().attempts_failed,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_database_behind_a_symlinked_directory_shares_the_real_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let via_link = DaemonLock::acquire(&link_dir.join("new.db")).unwrap();
+        assert_eq!(
+            via_link.database(),
+            real_dir.canonicalize().unwrap().join("new.db")
+        );
+        assert!(matches!(
+            DaemonLock::acquire(&real_dir.join("new.db")),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(via_link);
+
+        let lock = acquire_after_release(&link_dir.join("new.db"));
+        let store = Store::open(&real_dir.join("new.db")).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store.recover_after_crash(&lock, 3).unwrap().attempts_failed,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_database_path_shares_one_lock_with_the_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        drop(Store::open(&real).unwrap());
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let first = DaemonLock::acquire(&real).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&link),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+        let via_link = acquire_after_release(&link);
+        assert!(matches!(
+            DaemonLock::acquire(&real),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        assert_eq!(via_link.database(), real.canonicalize().unwrap());
+
+        let store = Store::open(&real).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store
+                .recover_after_crash(&via_link, 3)
+                .unwrap()
+                .attempts_failed,
+            1
+        );
+
+        let opened_through_the_link = Store::open(&link).unwrap();
+        let other = opened_through_the_link
+            .enqueue_run("o/r", &issue(2), "issue", 4)
+            .unwrap()
+            .unwrap();
+        opened_through_the_link
+            .set_run_state(other, RunState::Running, 5)
+            .unwrap();
+        let report = opened_through_the_link
+            .recover_after_crash(&via_link, 6)
+            .expect("a store opened through a symlink is the same database as the lock");
+        assert_eq!(report.runs_requeued, 1);
+    }
+
+    fn acquire_after_release(path: &Path) -> DaemonLock {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match DaemonLock::acquire(path) {
+                Err(StoreError::AlreadyRunning(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => return other.unwrap(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_hard_links_to_one_database_share_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        drop(Store::open(&a).unwrap());
+        std::fs::hard_link(&a, &b).unwrap();
+
+        let first = DaemonLock::acquire(&a).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&b),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        let store_b = Store::open(&b).unwrap();
+        let run = running_in(&store_b);
+        store_b.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store_b
+                .recover_after_crash(&first, 3)
+                .unwrap()
+                .attempts_failed,
+            1
+        );
+        drop(first);
+        acquire_after_release(&b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_taken_through_a_dangling_symlink_is_the_lock_of_the_real_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let via_link = DaemonLock::acquire(&link).unwrap();
+        let store = Store::open(&real).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&real),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store
+                .recover_after_crash(&via_link, 3)
+                .unwrap()
+                .attempts_failed,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_taken_through_a_dangling_symlink_reports_the_real_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = DaemonLock::acquire(&link).unwrap();
+        let canonical = dir.path().canonicalize().unwrap().join("real.db");
+        assert_eq!(via_link.database(), canonical);
+        assert_ne!(
+            via_link.database(),
+            dir.path().canonicalize().unwrap().join("link.db")
+        );
+    }
+
+    fn assert_unlockable(path: &Path, needle: &str) {
+        match DaemonLock::acquire(path) {
+            Err(StoreError::LockIo { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(source.to_string().contains(needle), "{source}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_file_uri_is_refused_like_any_other_file_uri() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        for raw in [&b"file:y.db\xff"[..], &b"file:\xff.db"[..]] {
+            let path = Path::new(std::ffi::OsStr::from_bytes(raw));
+            assert!(is_file_uri(path));
+            assert_unlockable(path, "file: URI");
+            assert!(Store::open(path).is_err());
+        }
+        let plain = dir.path().join(std::ffi::OsStr::from_bytes(b"y\xff.db"));
+        let first = DaemonLock::acquire(&plain).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&plain),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn opening_a_file_uri_fails_before_creating_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("file:{}", dir.path().join("x.db").display());
+        let err = Store::open(Path::new(&uri)).err().unwrap();
+        assert!(matches!(err, StoreError::LockIo { .. }), "{err}");
+        assert!(!dir.path().join("x.db").exists());
+    }
+
+    #[test]
+    fn a_database_named_like_another_databases_lock_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = DaemonLock::acquire(&dir.path().join("l.db")).unwrap();
+        let clash = dir.path().join(".l.db.inchworm-lock");
+        assert_unlockable(&clash, "collides");
+        assert!(Store::open(&clash).is_err());
+        drop(held);
+        assert_unlockable(&clash, "collides");
+        assert!(DaemonLock::acquire(&dir.path().join("l.db")).is_ok());
+    }
+
+    #[test]
+    fn only_a_dotted_name_ending_in_the_lock_suffix_collides() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["l.db.inchworm-lock", ".inchworm-lockx", "inchworm-lock"] {
+            let held = DaemonLock::acquire(&dir.path().join(name)).unwrap();
+            drop(held);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_an_unlockable_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(dir.path().join(".l.db.inchworm-lock"), &link).unwrap();
+        assert_unlockable(&link, "collides");
+        let long = dir.path().join("a".repeat(MAX_LOCKABLE_NAME + 1));
+        std::fs::write(&long, b"").unwrap();
+        let link2 = dir.path().join("link2.db");
+        std::os::unix::fs::symlink(&long, &link2).unwrap();
+        assert_unlockable(&link2, "240 bytes");
+    }
+
+    #[test]
+    fn database_names_up_to_the_lock_file_name_limit_work_and_longer_ones_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let longest = dir.path().join("a".repeat(MAX_LOCKABLE_NAME));
+        let held = DaemonLock::acquire(&longest).unwrap();
+        assert!(sidecar_path(held.database()).file_name().unwrap().len() <= 255);
+        drop(held);
+        let too_long = dir.path().join("a".repeat(MAX_LOCKABLE_NAME + 1));
+        assert_unlockable(&too_long, "240 bytes");
+        assert!(Store::open(&too_long).is_err());
+        assert!(!too_long.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinking_the_database_while_the_lock_is_held_does_not_admit_a_second_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let first = DaemonLock::acquire(&db).unwrap();
+        std::fs::remove_file(&db).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&db),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+        acquire_after_release(&db);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renaming_another_file_over_the_held_database_does_not_admit_a_second_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let first = DaemonLock::acquire(&db).unwrap();
+        let restored = dir.path().join("restored.db");
+        std::fs::write(&restored, b"").unwrap();
+        std::fs::rename(&restored, &db).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&db),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+        acquire_after_release(&db);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_the_real_side_file_does_not_let_a_second_holder_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let first = DaemonLock::acquire(&db).unwrap();
+        let side = sidecar_path(first.database());
+        assert_eq!(
+            side,
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join(".state.db.inchworm-lock")
+        );
+        assert!(side.is_file());
+        std::fs::remove_file(&side).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&db),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_whose_database_was_unlinked_or_replaced_refuses_recovery() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("s.db");
+            let store = Store::open(&db).unwrap();
+            let run = running_in(&store);
+            store.start_attempt(run, 2).unwrap();
+            let lock = DaemonLock::acquire(&db).unwrap();
+            store.recover_after_crash(&lock, 3).unwrap();
+            if replace {
+                let other = dir.path().join("other.db");
+                std::fs::write(&other, b"").unwrap();
+                std::fs::rename(&other, &db).unwrap();
+            } else {
+                std::fs::remove_file(&db).unwrap();
+            }
+            match store.recover_after_crash(&lock, 4) {
+                Err(StoreError::DatabaseMoved(path)) => assert_eq!(path, lock.database()),
+                other => panic!("replace={replace}: expected DatabaseMoved, got {other:?}"),
+            }
+        }
+    }
+
+    fn replace_file(path: &Path) {
+        let other = path.with_extension("swap");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::rename(&other, path).unwrap();
+    }
+
+    fn set_verify_hook(hook: impl FnMut() + 'static) {
+        BEFORE_LOCK_VERIFY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    fn clear_verify_hook() {
+        BEFORE_LOCK_VERIFY.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_retries_when_the_database_is_replaced_while_it_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("race.db");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let target = db.clone();
+        set_verify_hook(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                replace_file(&target);
+            }
+        });
+        let lock = DaemonLock::acquire(&db);
+        clear_verify_hook();
+        let lock = lock.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let store = Store::open(&db).unwrap();
+        let run = running_in(&store);
+        store.start_attempt(run, 2).unwrap();
+        assert_eq!(
+            store.recover_after_crash(&lock, 3).unwrap().attempts_failed,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_gives_up_when_the_database_keeps_being_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("race.db");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let target = db.clone();
+        set_verify_hook(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            replace_file(&target);
+        });
+        let result = DaemonLock::acquire(&db);
+        clear_verify_hook();
+        match result {
+            Err(StoreError::DatabaseMoved(path)) => assert_eq!(path, db.canonicalize().unwrap()),
+            other => panic!("expected DatabaseMoved, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            LOCK_ATTEMPTS
+        );
+        assert!(DaemonLock::acquire(&db).is_ok());
+    }
+
+    #[test]
+    fn every_spelling_of_an_in_memory_name_is_recognised() {
+        for name in [
+            ":memory:",
+            "",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:memdb1?mode=memory&cache=shared",
+            "file:x.db?mode=memory",
+            "file:x.db?cache=shared&mode=memory",
+            "file:%3Amemory%3A",
+            "file:%3amemory%3a",
+            "file:%3Amemory:",
+            "file::memory%3A",
+            "file:x?mode=%6Demory",
+            "file:x?mode=%6demory",
+            "file:x?%6Dode=memory",
+            "file:x?mode=mem%6Fry",
+            "file:///:memory:",
+            "file:%2F%2F%2F%3Amemory%3A",
+        ] {
+            assert!(is_in_memory(Path::new(name)), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_in_memory_are_not_recognised_as_such() {
+        for name in [
+            "state.db",
+            "/var/lib/inchworm/state.db",
+            "memory",
+            "my:memory:.db",
+            "FILE::memory:",
+            "file:x.db",
+            "file:x.db?cache=shared",
+            "file:x.db?mode=rwc",
+            "file:x.db?mode=Memory",
+            "file:x.db?vfs=:memory:",
+            "file:x.db?note=mode%3Dmemory",
+            "file:x.db?mode=memory2",
+            "file:x.db#mode=memory",
+            "file:x.db#:memory:",
+            "file:100%.db",
+        ] {
+            assert!(!is_in_memory(Path::new(name)), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn percent_decoding_handles_both_hex_cases_and_malformed_escapes() {
+        assert_eq!(percent_decode("a%3Ab%3ac"), "a:b:c");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%C3%A9"), "\u{e9}");
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn in_memory_names_have_no_file_to_lock_and_cannot_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = DaemonLock::acquire(&dir.path().join("other.db")).unwrap();
+        for name in [":memory:", "", "file::memory:", "file:private?mode=memory"] {
+            assert!(
+                matches!(
+                    DaemonLock::acquire(Path::new(name)),
+                    Err(StoreError::RecoveryNeedsFileStore)
+                ),
+                "{name:?}"
+            );
+            let store = Store::open(Path::new(name)).unwrap();
+            let run = running_in(&store);
+            store.start_attempt(run, 2).unwrap();
+            assert!(
+                matches!(
+                    store.recover_after_crash(&other, 3),
+                    Err(StoreError::RecoveryNeedsFileStore)
+                ),
+                "{name:?}"
+            );
+            assert_eq!(store.run(run).unwrap().state, RunState::Running, "{name:?}");
+        }
+    }
+
+    fn lock_io(result: Result<DaemonLock, StoreError>) -> (PathBuf, std::io::Error) {
+        match result {
+            Err(StoreError::LockIo { path, source }) => (path, source),
+            other => panic!("expected LockIo, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_as_the_database_path_is_a_lock_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let err = canonical_db_path(&a).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+        let (path, source) = lock_io(DaemonLock::acquire(&a));
+        assert_eq!(path, a);
+        assert_eq!(source.raw_os_error(), Some(libc::ELOOP), "{source}");
+        assert!(matches!(Store::open(&a), Err(StoreError::Sqlite(_))));
+    }
+
+    #[test]
+    fn a_path_ending_in_dot_dot_below_a_missing_directory_has_no_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join("nonexistent").join("..");
+        let err = canonical_db_path(&odd).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "the database path has no file name");
+        let (path, source) = lock_io(DaemonLock::acquire(&odd));
+        assert_eq!(path, odd);
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_place_of_the_database_file_is_a_lock_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        std::fs::create_dir(&db).unwrap();
+        let (path, source) = lock_io(DaemonLock::acquire(&db));
+        assert_eq!(path, db.canonicalize().unwrap());
+        assert_eq!(source.raw_os_error(), Some(libc::EISDIR), "{source}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_named_like_the_old_side_file_does_not_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        std::fs::create_dir(dir.path().join("state.db.daemon.lock")).unwrap();
+        let first = DaemonLock::acquire(&db).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire(&db),
+            Err(StoreError::AlreadyRunning(_))
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn recovery_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
+        store.start_attempt(run, 12).unwrap();
+        assert_eq!(
+            store
+                .recover_after_crash(&lock, 20)
+                .unwrap()
+                .attempts_failed,
+            1
+        );
+        assert_eq!(
+            store.recover_after_crash(&lock, 21).unwrap(),
+            Recovery::default()
+        );
+        assert_eq!(store.run(run).unwrap().updated_at, 20);
+    }
+
+    #[test]
+    fn recovery_does_not_touch_a_run_that_cannot_be_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, lock) = file_store(&dir);
+        let run = running_in(&store);
+        store.start_attempt(run, 12).unwrap();
+        force_state(&store, run, "judging");
+        let report = store.recover_after_crash(&lock, 20).unwrap();
+        assert_eq!(report.attempts_failed, 1);
+        assert_eq!(report.runs_requeued, 0);
+        assert_eq!(store.run(run).unwrap().state, RunState::Judging);
     }
 
     #[test]
@@ -700,57 +3583,167 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let store = Store::open(&path).unwrap();
-        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        let run = store
+            .enqueue_run("o/r", &issue(5), "issue", 1)
+            .unwrap()
+            .unwrap();
         store.set_run_state(run, RunState::Running, 2).unwrap();
         let attempt = store.start_attempt(run, 3).unwrap();
         drop(store);
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.recover_after_crash(10).unwrap(), 1);
-        assert_eq!(store.run(run).unwrap().state, RunState::Running);
-        assert_eq!(store.active_run("o/r").unwrap().unwrap().id, run);
+        let lock = DaemonLock::acquire(&path).unwrap();
+        let report = store.recover_after_crash(&lock, 10).unwrap();
+        assert_eq!(report.attempts_failed, 1);
+        assert_eq!(store.run(run).unwrap().state, RunState::Queued);
         assert_eq!(
             store.attempt(attempt.id).unwrap().failure_class,
             Some(FailureClass::OrchestratorLost)
         );
     }
 
+    #[test]
+    fn the_daemon_lock_is_exclusive_and_reports_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let first = DaemonLock::acquire(&db).unwrap();
+        match DaemonLock::acquire(&db) {
+            Err(StoreError::AlreadyRunning(path)) => {
+                assert_eq!(path, db.canonicalize().unwrap());
+            }
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        drop(first);
+        acquire_after_release(&db);
+        let missing = dir.path().join("no-such-dir").join("state.db");
+        assert!(matches!(
+            DaemonLock::acquire(&missing),
+            Err(StoreError::LockIo { .. })
+        ));
+    }
+
+    #[test]
+    fn corrupt_rows_are_reported_not_trusted() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 12).unwrap();
+
+        force_state(&store, run, "weird");
+        assert!(matches!(store.run(run), Err(StoreError::Corrupt(_))));
+        force_state(&store, run, "running");
+
+        store
+            .raw()
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        let cases = [
+            "UPDATE runs SET subject_kind = 'weird'",
+            "UPDATE runs SET subject_ref = '07'",
+            "UPDATE runs SET subject_ref = '0'",
+            "UPDATE runs SET subject_ref = 'not a number'",
+            "UPDATE runs SET subject_kind = 'commit', subject_ref = 'abc1234'",
+            "UPDATE runs SET subject_kind = 'commit', subject_ref = '0123456789ABCDEF0123456789ABCDEF01234567'",
+            "UPDATE attempts SET state = 'weird'",
+            "UPDATE attempts SET n = -1",
+            "UPDATE attempts SET pr_number = -5",
+            "UPDATE attempts SET failure_class = 'not_a_class'",
+        ];
+        for statement in cases {
+            let backup_run = store.run(run).ok();
+            let backup_attempt = store.attempt(attempt.id).ok();
+            store.raw().execute(statement, []).unwrap();
+            let broken = store.run(run).is_err() || store.attempt(attempt.id).is_err();
+            assert!(broken, "{statement}");
+            assert!(
+                matches!(
+                    store
+                        .run(run)
+                        .err()
+                        .or_else(|| store.attempt(attempt.id).err()),
+                    Some(StoreError::Corrupt(_))
+                ),
+                "{statement}"
+            );
+            store
+                .raw()
+                .execute_batch(
+                    "UPDATE runs SET subject_kind = 'issue', subject_ref = '1';
+                     UPDATE attempts SET state = 'dispatched', n = 1, pr_number = NULL, failure_class = NULL;",
+                )
+                .unwrap();
+            assert_eq!(store.run(run).ok(), backup_run);
+            assert_eq!(store.attempt(attempt.id).ok(), backup_attempt);
+        }
+    }
+
     proptest! {
         #[test]
         fn attempt_numbers_are_sequential(count in 1usize..12) {
-            let (store, run) = store_with_run();
+            let (store, run) = running_store();
             for expected in 1..=count {
                 prop_assert_eq!(store.start_attempt(run, 1).unwrap().n as usize, expected);
             }
         }
 
         #[test]
-        fn store_follows_the_model_state_machine(steps in prop::collection::vec(0..RunState::ALL.len(), 0..16)) {
+        fn store_follows_the_documented_edge_table(steps in prop::collection::vec(0..RunState::ALL.len(), 0..16)) {
             let (store, run) = store_with_run();
-            let mut model = RunState::Queued;
+            let mut state = RunState::Queued;
             for index in steps {
                 let target = RunState::ALL[index];
+                let legal = EDGES.contains(&(state, target));
                 let result = store.set_run_state(run, target, 1);
-                match model.transition(target) {
-                    Ok(next) => {
-                        prop_assert!(result.is_ok());
-                        model = next;
-                    }
-                    Err(_) => prop_assert!(result.is_err()),
+                prop_assert_eq!(result.is_ok(), legal);
+                if legal {
+                    state = target;
                 }
-                prop_assert_eq!(store.run(run).unwrap().state, model);
+                prop_assert_eq!(store.run(run).unwrap().state, state);
             }
         }
 
         #[test]
         fn failure_class_and_text_round_trip(index in 0..FailureClass::ALL.len(), raw in ".{0,40}") {
-            let (store, run) = store_with_run();
+            let (store, run) = running_store();
             let attempt = store.start_attempt(run, 1).unwrap();
             let class = FailureClass::ALL[index];
             store.finish_attempt_failed(attempt.id, class, &raw, 2).unwrap();
             let done = store.attempt(attempt.id).unwrap();
             prop_assert_eq!(done.failure_class, Some(class));
             prop_assert_eq!(done.raw_error.as_deref(), Some(raw.as_str()));
+        }
+
+        #[test]
+        fn full_hex_commit_ids_are_accepted_and_lowercased(sha in "[0-9a-fA-F]{40}|[0-9a-fA-F]{64}") {
+            let subject = Subject::commit(&sha).unwrap();
+            prop_assert_eq!(subject.reference(), sha.to_ascii_lowercase());
+        }
+
+        #[test]
+        fn commit_ids_of_any_other_length_or_alphabet_are_rejected(
+            sha in "[0-9a-f]{0,39}|[0-9a-f]{41,63}|[0-9a-f]{65,70}|[0-9a-f]{10,30}[g-z][0-9a-f]{10,30}",
+        ) {
+            prop_assert!(is_invalid_subject(&Subject::commit(&sha)));
+        }
+
+        #[test]
+        fn canonical_numbers_round_trip_and_leading_zeros_are_rejected(
+            number in 1u64..,
+            zeros in "0{1,3}",
+        ) {
+            let subject = Subject::issue(number).unwrap();
+            prop_assert_eq!(subject.reference(), number.to_string());
+            prop_assert_eq!(Subject::from_parts(SubjectKind::Issue, subject.reference()).unwrap(), subject);
+            let padded = format!("{zeros}{number}");
+            prop_assert!(is_invalid_subject(&Subject::from_parts(SubjectKind::Issue, &padded)));
+        }
+
+        #[test]
+        fn arbitrary_text_never_builds_a_non_canonical_subject(text in ".{0,70}") {
+            for kind in [SubjectKind::Issue, SubjectKind::Pr, SubjectKind::Commit] {
+                if let Ok(subject) = Subject::from_parts(kind, &text) {
+                    prop_assert_eq!(subject.reference(), text.as_str());
+                    prop_assert_eq!(subject.kind(), kind);
+                }
+            }
         }
     }
 }

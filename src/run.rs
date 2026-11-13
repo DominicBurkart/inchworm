@@ -9,7 +9,7 @@ use crate::flow::{
 };
 use crate::github::{GitHub, GitHubError, Issue, PrState, PullRequest, issue_branch_attempt};
 use crate::model::{FailureClass, RunState};
-use crate::store::{AttemptId, RunId, Store, StoreError};
+use crate::store::{AttemptId, RunId, Store, StoreError, Subject};
 
 pub const RUNNING_LABEL: &str = "inchworm:running";
 pub const FAILED_LABEL: &str = "inchworm:failed";
@@ -308,7 +308,12 @@ pub fn run_issue(
     let issue = ctx.github.issue(ctx.slug, issue_number)?;
     let run_id = ctx
         .store
-        .enqueue_run(ctx.slug, issue_number, &flow.name, (ctx.now)())?
+        .enqueue_run(
+            ctx.slug,
+            &Subject::issue(issue_number)?,
+            &flow.name,
+            (ctx.now)(),
+        )?
         .ok_or_else(|| RunError::AlreadyRun {
             repo: ctx.slug.to_string(),
             issue: issue_number,

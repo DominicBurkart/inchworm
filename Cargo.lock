@@ -398,6 +398,7 @@ dependencies = [
  "cargo-husky",
  "clap",
  "ctrlc",
+ "libc",
  "predicates",
  "proptest",
  "rusqlite",

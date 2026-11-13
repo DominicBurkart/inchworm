@@ -3,6 +3,10 @@ use std::path::Path;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+fn quoted(path: &Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 fn write(root: &Path, relative: &str, text: &str) {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -25,33 +29,44 @@ fn good_repo(root: &Path) {
 }
 
 fn config(dir: &Path, repo: &Path) -> std::path::PathBuf {
+    let bin = dir.join("nanna");
+    std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let path = dir.join("config.toml");
     write(
         dir,
         "config.toml",
         &format!(
-            "nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
-            repo.display()
+            "nanna_bin = {}\n[[repo]]\nslug = \"o/r\"\npath = {}\n",
+            quoted(&bin),
+            quoted(repo)
         ),
     );
     path
 }
 
+fn inchworm() -> Command {
+    let mut command = Command::cargo_bin("inchworm").unwrap();
+    command.env_clear();
+    command
+}
+
 #[test]
-fn validate_exits_zero_for_a_complete_repo() {
+fn validate_exits_zero_for_a_complete_repo_with_no_environment_at_all() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     good_repo(&repo);
     let config = config(dir.path(), &repo);
-    Command::cargo_bin("inchworm")
-        .unwrap()
-        .env("HOME", dir.path())
-        .env_remove("XDG_CONFIG_HOME")
+    inchworm()
         .args(["validate", "--config"])
         .arg(&config)
         .assert()
         .success()
-        .stdout(predicates_contains("0 error(s), 0 warning(s)"));
+        .stdout(predicate::str::contains("0 error(s), 0 warning(s)"));
 }
 
 #[test]
@@ -61,39 +76,70 @@ fn validate_exits_one_when_a_repo_has_errors() {
     good_repo(&repo);
     std::fs::remove_file(repo.join(".nanna/protected.toml")).unwrap();
     let config = config(dir.path(), &repo);
-    Command::cargo_bin("inchworm")
-        .unwrap()
-        .env("HOME", dir.path())
-        .env_remove("XDG_CONFIG_HOME")
+    inchworm()
         .args(["validate", "--config"])
         .arg(&config)
         .assert()
         .code(1)
-        .stdout(predicates_contains("error: [o/r]"));
+        .stdout(predicate::str::contains("error: [o/r]"));
 }
 
 #[test]
-fn validate_exits_two_when_the_config_is_unreadable() {
+fn validate_exits_two_with_one_message_when_the_config_is_unreadable() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("inchworm")
-        .unwrap()
-        .env("HOME", dir.path())
-        .env_remove("XDG_CONFIG_HOME")
+    inchworm()
         .args(["validate", "--config"])
         .arg(dir.path().join("missing.toml"))
         .assert()
         .code(2)
-        .stderr(predicates_contains("cannot read"));
+        .stderr(predicate::str::contains("cannot read"))
+        .stderr(predicate::function(|text: &str| {
+            text.matches("os error").count() == 1
+        }));
 }
 
 #[test]
-fn unknown_subcommands_are_rejected() {
-    Command::cargo_bin("inchworm")
-        .unwrap()
-        .env("HOME", "/nonexistent-home")
+fn validate_finds_the_default_config_from_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    let config = config(dir.path(), &repo);
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".config/inchworm")).unwrap();
+    std::fs::copy(&config, home.join(".config/inchworm/config.toml")).unwrap();
+    inchworm()
+        .env("HOME", &home)
+        .arg("validate")
+        .assert()
+        .success();
+}
+
+#[test]
+fn unknown_subcommands_exit_two_and_print_usage() {
+    inchworm()
         .arg("bogus")
         .assert()
-        .failure();
+        .code(2)
+        .stderr(predicate::str::contains("Usage"));
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_exits_one_when_the_inchworm_directory_is_a_symlink_to_an_outside_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    write(&repo, ".inchworm/rubric.md", "rubric");
+    let outside = dir.path().join("outside");
+    std::fs::rename(repo.join(".inchworm"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join(".inchworm")).unwrap();
+    let config = config(dir.path(), &repo);
+    inchworm()
+        .args(["validate", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("`.inchworm` is a symlink"));
 }
 
 fn predicates_contains(needle: &'static str) -> impl predicates::Predicate<[u8]> {
@@ -155,7 +201,7 @@ fn fakes() -> Fakes {
     Fakes { dir, repo, config }
 }
 
-fn inchworm(fakes: &Fakes) -> Command {
+fn inchworm_with(fakes: &Fakes) -> Command {
     let mut command = Command::cargo_bin("inchworm").unwrap();
     let path = format!(
         "{}:{}",
@@ -171,7 +217,7 @@ fn inchworm(fakes: &Fakes) -> Command {
 #[test]
 fn online_validate_passes_when_identities_and_labels_resolve() {
     let fakes = fakes();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -184,7 +230,7 @@ fn online_validate_reports_unknown_identities_and_missing_labels() {
     let fakes = fakes();
     fakes.set("identities", "reviewer");
     fakes.set("labels", r#"[{"name":"inchworm"}]"#);
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -207,7 +253,7 @@ fn build_images_runs_nix_build_and_reports_failures() {
         "#!/bin/sh\necho \"$@\" > \"$NIX_ARGS\"\nexit 0\n",
     );
     let args_file = fakes.dir.path().join("nix-args");
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .env("NIX_ARGS", &args_file)
         .args(["validate", "--build-images", "--config"])
         .arg(&fakes.config)
@@ -227,7 +273,7 @@ fn build_images_runs_nix_build_and_reports_failures() {
         "nix",
         "#!/bin/sh\necho 'attribute missing' >&2\nexit 1\n",
     );
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--build-images", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -240,14 +286,14 @@ fn build_images_runs_nix_build_and_reports_failures() {
 #[test]
 fn run_dispatches_the_flow_and_records_the_pr() {
     let fakes = fakes();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .success()
         .stdout(predicates_contains("awaiting_ci after 1 attempt(s)"))
         .stdout(predicates_contains("pull/9"));
-    let again = inchworm(&fakes)
+    let again = inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -259,7 +305,7 @@ fn run_dispatches_the_flow_and_records_the_pr() {
 fn run_rejects_a_pr_that_touches_inchworm_files() {
     let fakes = fakes();
     fakes.set("files", "F src/lib.rs\nF .inchworm/flows.toml");
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -272,7 +318,7 @@ fn run_reports_a_failed_task_with_exit_one() {
     let fakes = fakes();
     fakes.set("state", "task_failed");
     fakes.set("result", "result_failed_structured");
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -283,20 +329,20 @@ fn run_reports_a_failed_task_with_exit_one() {
 #[test]
 fn run_accepts_a_repo_path_and_a_flow_name_and_rejects_unknown_ones() {
     let fakes = fakes();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run"])
         .arg(&fakes.repo)
         .args(["5", "--flow", "issue", "--config"])
         .arg(&fakes.config)
         .assert()
         .success();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "x/y", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .code(2)
         .stderr(predicates_contains("not in the config"));
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "6", "--flow", "nope", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -316,14 +362,14 @@ fn run_fails_cleanly_when_nanna_cannot_start_or_flows_are_missing() {
         ),
     )
     .unwrap();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .code(2)
         .stderr(predicates_contains("cannot start"));
     std::fs::remove_file(fakes.repo.join(".inchworm/flows.toml")).unwrap();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -432,7 +478,7 @@ fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
         "issue",
         r#"{"number":5,"title":"t","body":"b","labels":[{"name":"inchworm"}],"url":"u","state":"CLOSED","authorAssociation":"OWNER"}"#,
     );
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -443,7 +489,7 @@ fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
         "issue",
         r#"{"number":5,"title":"t","body":"b","labels":[{"name":"inchworm"}],"url":"u","state":"OPEN","authorAssociation":"NONE"}"#,
     );
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -454,7 +500,7 @@ fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
         "issue",
         r#"{"number":5,"title":"t","body":"b","labels":[{"name":"bug"}],"url":"u","state":"OPEN","authorAssociation":"OWNER"}"#,
     );
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
