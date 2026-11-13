@@ -108,13 +108,10 @@ const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
 fn open_store(config: &GlobalConfig) -> Result<Store> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = config.state_db.parent() {
-        let existed = parent.exists();
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
-        if !existed {
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("cannot restrict {}", parent.display()))?;
-        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot restrict {}", parent.display()))?;
     }
     let store = Store::open(&config.state_db)?;
     std::fs::set_permissions(&config.state_db, std::fs::Permissions::from_mode(0o600))
@@ -532,11 +529,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_sigterm_sent_before_the_shutdown_future_is_first_polled_is_not_lost() {
         let shutdown = termination_signal().unwrap();
-        let status = std::process::Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         tokio::time::timeout(Duration::from_secs(5), shutdown)
             .await
             .expect("the SIGTERM was handled");
@@ -578,6 +571,21 @@ mod tests {
             .mode();
         assert_eq!(db_mode & 0o777, 0o600);
         let parent = config.state_db.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn an_existing_world_readable_state_directory_is_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = env();
+        let config = GlobalConfig::load(&env.config, &env.tools.home).unwrap();
+        let parent = config.state_db.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(open_store(&config).unwrap());
         assert_eq!(
             std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
             0o700

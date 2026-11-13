@@ -182,6 +182,8 @@ struct Job {
     failures: u32,
 }
 
+const SETTLE_GRACE: Duration = Duration::from_secs(60);
+
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
 
 fn backoff(poll: Duration, failures: u32) -> Duration {
@@ -400,6 +402,16 @@ fn poll_repo(
         for issue in issues {
             let key = (repo.slug.clone(), issue.number);
             if unswapped.contains(&key) {
+                continue;
+            }
+            let settled_recently = store
+                .last_finished(&repo.slug, issue.number, &flow.name)
+                .map_err(|err| err.to_string())?
+                .is_some_and(|at| {
+                    deps.clock.now().saturating_sub(at)
+                        < i64::try_from(SETTLE_GRACE.as_secs()).unwrap_or(i64::MAX)
+                });
+            if settled_recently {
                 continue;
             }
             let mut warnings = Vec::new();
@@ -1046,7 +1058,20 @@ required_checks = ["build"]
         );
         assert!(second.to_string().contains("state.db.lock"));
         drop(first);
-        assert!(InstanceLock::acquire(&rig.db()).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let released = loop {
+            match InstanceLock::acquire(&rig.db()) {
+                Ok(lock) => break Some(lock),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break None,
+            }
+        };
+        assert!(
+            released.is_some(),
+            "the lock was not released after the holder dropped it"
+        );
     }
 
     #[test]
@@ -1697,5 +1722,39 @@ required_checks = ["build"]
         let run = store.recent_runs(5).unwrap().remove(0);
         assert_eq!(store.recent_runs(5).unwrap().len(), 1);
         assert_eq!(store.attempts(run.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_poll_between_a_runs_state_write_and_its_label_swap_does_not_queue_a_second_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
+        std::fs::write(repo.join(".inchworm/flows.toml"), FLOWS).unwrap();
+        let entry = RepoEntry {
+            slug: "o/r".into(),
+            path: repo,
+        };
+        let github = github_with_issue();
+        let store = Store::open_in_memory().unwrap();
+        let clock = Arc::new(crate::clock::FakeClock::new(1_000));
+        let deps = DaemonDeps {
+            github: Arc::new(github),
+            clock: clock.clone(),
+            dispatchers: Arc::new(Factory(Mutex::new(vec![]))),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let run = store.enqueue_run("o/r", 5, "issue", 900).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 901).unwrap();
+        store.set_run_state(run, RunState::AwaitingCi, 902).unwrap();
+        store.set_run_state(run, RunState::Judging, 903).unwrap();
+        store.set_run_state(run, RunState::PrOpen, 990).unwrap();
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        let mut unswapped = Unswapped::new();
+        poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
+        assert_eq!(store.recent_runs(10).unwrap().len(), 1);
+        assert_eq!(scheduler.queued_len("o/r"), 0);
+        clock.advance(i64::try_from(SETTLE_GRACE.as_secs()).unwrap() + 1);
+        poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
+        assert_eq!(store.recent_runs(10).unwrap().len(), 2);
     }
 }

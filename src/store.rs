@@ -300,6 +300,22 @@ impl Store {
         Ok((changed == 1).then(|| self.conn.last_insert_rowid()))
     }
 
+    pub fn last_finished(
+        &self,
+        repo: &str,
+        issue: u64,
+        flow: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let issue = i64::try_from(issue).map_err(corrupt("issue"))?;
+        Ok(self.conn.query_row(
+            "SELECT MAX(updated_at) FROM runs
+                 WHERE repo = ?1 AND issue = ?2 AND flow = ?3
+                   AND state IN ('merged', 'pr_open', 'failed', 'escalated')",
+            params![repo, issue, flow],
+            |row| row.get::<_, Option<i64>>(0),
+        )?)
+    }
+
     pub fn run(&self, id: RunId) -> Result<Run, StoreError> {
         self.conn
             .query_row("SELECT * FROM runs WHERE id = ?1", [id], |row| {
@@ -1302,5 +1318,18 @@ mod tests {
             prop_assert_eq!(done.failure_class, Some(class));
             prop_assert_eq!(done.raw_error.as_deref(), Some(raw.as_str()));
         }
+    }
+
+    #[test]
+    fn last_finished_reports_the_latest_terminal_run_of_an_issue_and_flow() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.last_finished("o/r", 5, "issue").unwrap(), None);
+        finish_run(&store, "o/r", 5, "issue", RunState::Failed, 10);
+        finish_run(&store, "o/r", 5, "issue", RunState::PrOpen, 30);
+        finish_run(&store, "o/r", 6, "issue", RunState::PrOpen, 99);
+        finish_run(&store, "o/r", 5, "other", RunState::PrOpen, 98);
+        assert_eq!(store.last_finished("o/r", 5, "issue").unwrap(), Some(30));
+        store.enqueue_run("o/r", 5, "issue", 40).unwrap().unwrap();
+        assert_eq!(store.last_finished("o/r", 5, "issue").unwrap(), Some(30));
     }
 }
