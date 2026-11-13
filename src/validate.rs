@@ -211,7 +211,9 @@ pub fn validate(config: &GlobalConfig, path_var: Option<&OsStr>) -> Report {
 }
 
 /// The first of `paths` that a step output must not touch: `inchworm.toml` or
-/// anything under `.inchworm/`, however it is spelled.
+/// anything under `.inchworm/` at the repository root, after the normalisation
+/// below. It is not a complete defence against every alias: Windows 8.3 short
+/// names, other whitespace, Unicode look-alikes and symlinks are not handled.
 ///
 /// This is independent of `.nanna/protected.toml`: it is the check inchworm
 /// applies to a patch itself. Paths are normalised lexically, compared without
