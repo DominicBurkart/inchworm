@@ -464,6 +464,59 @@ mod tests {
         assert_eq!(log.len(), 2);
     }
 
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_waiter_sleeps_while_work_is_claimable_for_every_short_event_sequence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const WAITERS: usize = 3;
+        for code in 0..3usize.pow(6) {
+            let s: Scheduler<usize> = Scheduler::new(1);
+            let releases = Arc::new(Semaphore::new(0));
+            let holding = Arc::new(AtomicUsize::new(0));
+            let tasks: Vec<_> = (0..WAITERS)
+                .map(|_| {
+                    let (s, releases, holding) = (s.clone(), releases.clone(), holding.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let lease = s.next().await;
+                            holding.fetch_add(1, Ordering::SeqCst);
+                            releases.acquire().await.unwrap().forget();
+                            holding.fetch_sub(1, Ordering::SeqCst);
+                            drop(lease);
+                        }
+                    })
+                })
+                .collect();
+            settle().await;
+            let mut rest = code;
+            for step in 0..6 {
+                match rest % 3 {
+                    0 => s.enqueue("a", step),
+                    1 => s.enqueue("b", step),
+                    _ => releases.add_permits(1),
+                }
+                rest /= 3;
+                settle().await;
+                let claimable = ["a", "b"]
+                    .into_iter()
+                    .filter(|repo| !s.is_active(repo) && s.queued_len(repo) > 0)
+                    .count();
+                assert!(
+                    claimable == 0 || holding.load(Ordering::SeqCst) == WAITERS,
+                    "sequence {code} step {step}: {claimable} claimable with a sleeping waiter"
+                );
+            }
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn every_waiter_blocked_on_an_empty_queue_is_woken_by_an_enqueue_in_turn() {
         let s = Scheduler::new(1);
