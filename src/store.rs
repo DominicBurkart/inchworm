@@ -2499,6 +2499,32 @@ CREATE TABLE attempts (
     }
 
     #[test]
+    fn record_pr_lengths_are_counted_in_bytes_not_characters() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let too_long_branch = "é".repeat(128);
+        let detail = invalid_pr(store.record_pr(attempt.id, &too_long_branch, "abc", 1));
+        assert!(
+            detail.contains("branch") && detail.contains("255 bytes"),
+            "{detail}"
+        );
+        let too_long_sha = "é".repeat(33);
+        assert_eq!(too_long_sha.chars().count(), 33);
+        let detail = invalid_pr(store.record_pr(attempt.id, "feature", &too_long_sha, 1));
+        assert!(
+            detail.contains("head sha") && detail.contains("64 bytes"),
+            "{detail}"
+        );
+        let branch = "é".repeat(127);
+        let sha = "é".repeat(32);
+        assert_eq!((branch.len(), sha.len()), (254, 64));
+        store.record_pr(attempt.id, &branch, &sha, 1).unwrap();
+        let stored = store.attempt(attempt.id).unwrap();
+        assert_eq!(stored.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(stored.head_sha.as_deref(), Some(sha.as_str()));
+    }
+
+    #[test]
     fn a_recorded_pr_number_is_never_zero_so_recovery_cannot_be_diverted() {
         let dir = tempfile::tempdir().unwrap();
         let (store, lock) = file_store(&dir);
@@ -3007,6 +3033,22 @@ CREATE TABLE attempts (
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_taken_through_a_dangling_symlink_reports_the_real_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = DaemonLock::acquire(&link).unwrap();
+        let canonical = dir.path().canonicalize().unwrap().join("real.db");
+        assert_eq!(via_link.database(), canonical);
+        assert_ne!(
+            via_link.database(),
+            dir.path().canonicalize().unwrap().join("link.db")
+        );
+    }
+
     #[test]
     fn removing_a_lock_side_file_does_not_let_a_second_holder_in() {
         let dir = tempfile::tempdir().unwrap();
@@ -3208,6 +3250,7 @@ CREATE TABLE attempts (
             "file:x.db?note=mode%3Dmemory",
             "file:x.db?mode=memory2",
             "file:x.db#mode=memory",
+            "file:x.db#:memory:",
             "file:100%.db",
         ] {
             assert!(!is_in_memory(Path::new(name)), "{name:?}");
