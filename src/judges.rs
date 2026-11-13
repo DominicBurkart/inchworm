@@ -1599,6 +1599,22 @@ mod tests {
     }
 
     #[test]
+    fn a_differing_header_without_target_lines_fails_even_when_another_file_follows() {
+        let next = patch("ok.rs", 1, 1);
+        for header in [
+            "diff --git a/ok.txt b/secrets/prod.key\n",
+            "diff --git a/ok.txt b/secrets/prod.key\nsimilarity index 100%\nrename from ok.txt\n",
+        ] {
+            let text = format!("{header}{next}");
+            assert!(patch_stats(&text).unparsable_header, "{text:?}");
+            assert!(
+                !diff_judge(&text, 1000, &["secrets/prod.key".to_string()]).passed,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_patch_without_a_final_newline_fails_closed() {
         let ok = patch("a", 1, 1);
         assert!(diff_judge(&ok, 10, &[]).passed);
