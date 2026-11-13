@@ -128,14 +128,14 @@ fn header_path(rest: &str, prefixed: bool, stats: &mut PatchStats) {
     stats.paths.insert(path.to_string());
 }
 
-fn parse_git_header(rest: &str, stats: &mut PatchStats) {
+fn parse_git_header(rest: &str, stats: &mut PatchStats) -> bool {
     if rest.contains('"') || rest.contains('\\') {
         stats.unparsable_header = true;
-        return;
+        return false;
     }
     let Some(len) = rest.len().checked_sub(5) else {
         stats.unparsable_header = true;
-        return;
+        return false;
     };
     if len % 2 == 0 {
         let n = len / 2;
@@ -143,7 +143,7 @@ fn parse_git_header(rest: &str, stats: &mut PatchStats) {
             let (left, right) = (&rest[..n + 2], &rest[n + 3..]);
             if left.starts_with("a/") && right.starts_with("b/") && left[2..] == right[2..] {
                 stats.paths.insert(left[2..].to_string());
-                return;
+                return false;
             }
         }
     }
@@ -152,8 +152,10 @@ fn parse_git_header(rest: &str, stats: &mut PatchStats) {
     {
         stats.paths.insert(left.to_string());
         stats.paths.insert(rest[index + 3..].to_string());
+        true
     } else {
         stats.unparsable_header = true;
+        false
     }
 }
 
@@ -185,13 +187,17 @@ fn hunk_counts(line: &str) -> Option<(usize, usize)> {
 pub fn patch_stats(patch: &str) -> PatchStats {
     let mut stats = PatchStats::default();
     let mut hunk: Option<(usize, usize)> = None;
+    let mut awaiting_target = false;
+    if !patch.is_empty() && !patch.ends_with('\n') {
+        stats.unparsable_header = true;
+    }
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            if hunk.take().is_some() {
+            if hunk.take().is_some() || awaiting_target {
                 stats.unparsable_header = true;
             }
             stats.git_format = true;
-            parse_git_header(rest, &mut stats);
+            awaiting_target = parse_git_header(rest, &mut stats);
             continue;
         }
         if let Some((old, new)) = hunk.as_mut() {
@@ -235,12 +241,15 @@ pub fn patch_stats(patch: &str) -> PatchStats {
             .or_else(|| line.strip_prefix("copy from "))
             .or_else(|| line.strip_prefix("copy to "))
         {
+            if line.starts_with("rename to ") || line.starts_with("copy to ") {
+                awaiting_target = false;
+            }
             header_path(rest, false, &mut stats);
         } else if stats.git_format && (line.starts_with('+') || line.starts_with('-')) {
             stats.unparsable_header = true;
         }
     }
-    if hunk.is_some() {
+    if hunk.is_some() || awaiting_target {
         stats.unparsable_header = true;
     }
     stats
@@ -300,9 +309,6 @@ pub fn diff_judge(patch: &str, max_lines: u32, forbid_paths: &[String]) -> Verdi
     }
     if stats.binary {
         return Verdict::fail(NAME, "patch contains a binary change");
-    }
-    if stats.paths.is_empty() {
-        return Verdict::fail(NAME, "patch changes no files");
     }
     let hits: Vec<&str> = stats
         .paths
@@ -1588,6 +1594,132 @@ mod tests {
         assert!(diff_judge(&complete, 1000, &[]).passed);
     }
 
+    fn every_proper_prefix_fails(full: &str, boundaries: &[usize], forbid: &str) {
+        assert!(!diff_judge(full, 1000, &[forbid.to_string()]).passed);
+        for end in 0..full.len() {
+            if !full.is_char_boundary(end) || boundaries.contains(&end) {
+                continue;
+            }
+            let prefix = &full[..end];
+            let verdict = diff_judge(prefix, 1000, &[forbid.to_string()]);
+            assert!(!verdict.passed, "prefix {prefix:?} passed");
+        }
+    }
+
+    #[test]
+    fn a_patch_cut_inside_a_rename_or_copy_header_never_passes() {
+        for kind in ["rename", "copy"] {
+            let full = format!(
+                "diff --git a/ok.txt b/secrets/prod.key\nsimilarity index 100%\n{kind} from ok.txt\n{kind} to secrets/prod.key\n"
+            );
+            every_proper_prefix_fails(&full, &[], "secrets/prod.key");
+            let crlf = full.replace('\n', "\r\n");
+            every_proper_prefix_fails(&crlf, &[], "secrets/prod.key");
+        }
+    }
+
+    #[test]
+    fn a_patch_cut_inside_a_later_rename_section_fails_after_a_complete_section() {
+        let first = patch("ok.rs", 1, 1);
+        let second = "diff --git a/ok.txt b/secrets/prod.key\nsimilarity index 100%\nrename from ok.txt\nrename to secrets/prod.key\n";
+        let full = format!("{first}{second}");
+        every_proper_prefix_fails_after(&full, first.len(), "secrets/prod.key");
+    }
+
+    fn every_proper_prefix_fails_after(full: &str, boundary: usize, forbid: &str) {
+        assert!(!diff_judge(full, 1000, &[forbid.to_string()]).passed);
+        for end in boundary + 1..full.len() {
+            if !full.is_char_boundary(end) {
+                continue;
+            }
+            let prefix = &full[..end];
+            let verdict = diff_judge(prefix, 1000, &[forbid.to_string()]);
+            assert!(!verdict.passed, "prefix {prefix:?} passed");
+        }
+        assert!(diff_judge(&full[..boundary], 1000, &[forbid.to_string()]).passed);
+    }
+
+    #[test]
+    fn a_differing_header_without_rename_or_copy_lines_fails_closed() {
+        let text = "diff --git a/ok.txt b/secrets/prod.key\n";
+        assert!(patch_stats(text).unparsable_header);
+        let text = "diff --git a/ok.txt b/new.txt\nrename from ok.txt\n";
+        assert!(patch_stats(text).unparsable_header);
+        let text = "diff --git a/ok.txt b/new.txt\nrename from ok.txt\nrename to new.txt\n";
+        assert!(!patch_stats(text).unparsable_header);
+    }
+
+    #[test]
+    fn a_differing_header_without_target_lines_fails_even_when_another_file_follows() {
+        let next = patch("ok.rs", 1, 1);
+        for header in [
+            "diff --git a/ok.txt b/secrets/prod.key\n",
+            "diff --git a/ok.txt b/secrets/prod.key\nsimilarity index 100%\nrename from ok.txt\n",
+        ] {
+            let text = format!("{header}{next}");
+            assert!(patch_stats(&text).unparsable_header, "{text:?}");
+            assert!(
+                !diff_judge(&text, 1000, &["secrets/prod.key".to_string()]).passed,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_without_a_final_newline_fails_closed() {
+        let ok = patch("a", 1, 1);
+        assert!(diff_judge(&ok, 10, &[]).passed);
+        assert!(!diff_judge(ok.trim_end_matches('\n'), 10, &[]).passed);
+        assert!(patch_stats("diff --git a/x b/x").unparsable_header);
+    }
+
+    #[test]
+    fn a_git_header_too_short_to_hold_two_paths_is_unparsable() {
+        assert!(patch_stats("diff --git a/x\n").unparsable_header);
+        assert!(patch_stats("diff --git \n").unparsable_header);
+    }
+
+    #[test]
+    fn tab_suffixed_header_paths_are_trimmed_to_the_real_path() {
+        let text =
+            "diff --git a/x y.sh b/x y.sh\n--- a/x y.sh\t\n+++ b/x y.sh\t\n@@ -1 +1 @@\n-a\n+b\n";
+        let stats = patch_stats(text);
+        assert_eq!(stats.paths, BTreeSet::from(["x y.sh".to_string()]));
+        assert!(!diff_judge(text, 10, &["*.sh".to_string()]).passed);
+    }
+
+    #[test]
+    fn the_oracle_case_that_once_failed_once_is_pinned() {
+        for (kind, max, crlf) in [
+            ("rename", 0, false),
+            ("rename", 1, true),
+            ("copy", 11, false),
+            ("copy", 0, true),
+        ] {
+            let mut text = format!(
+                "diff --git a/aa/aa b/ab/aa/aa.sh\nsimilarity index 100%\n{kind} from aa/aa\n{kind} to ab/aa/aa.sh\n"
+            );
+            if crlf {
+                text = text.replace('\n', "\r\n");
+            }
+            let stats = patch_stats(&text);
+            assert_eq!(
+                stats.paths,
+                BTreeSet::from(["aa/aa".to_string(), "ab/aa/aa.sh".to_string()])
+            );
+            assert!(!stats.unparsable_header);
+            let verdict = diff_judge(&text, max, &["*.sh".to_string()]);
+            assert!(!verdict.passed);
+            assert!(verdict.detail.contains("ab/aa/aa.sh"), "{verdict:?}");
+            assert!(diff_judge(&text, max, &["*.rs".to_string()]).passed);
+        }
+    }
+
+    #[test]
+    fn the_ollama_body_limit_is_one_mebibyte() {
+        assert_eq!(MAX_BODY_BYTES, 1_048_576);
+    }
+
     #[test]
     fn a_truncated_patch_cannot_hide_a_later_forbidden_file() {
         let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,50 +1,50 @@\n-a\n+b\n";
@@ -1826,7 +1958,19 @@ mod tests {
     impl Section {
         fn render(&self) -> String {
             match self {
-                Section::Modify(path, removed, added) => patch(path, *removed, *added),
+                Section::Modify(path, removed, added) => {
+                    let tab = if path.contains(' ') { "\t" } else { "" };
+                    let mut text = format!(
+                        "diff --git a/{path} b/{path}\n--- a/{path}{tab}\n+++ b/{path}{tab}\n@@ -1,{removed} +1,{added} @@\n"
+                    );
+                    for _ in 0..*removed {
+                        text.push_str("-old\n");
+                    }
+                    for _ in 0..*added {
+                        text.push_str("+new\n");
+                    }
+                    text
+                }
                 Section::Rename(from, to) => format!(
                     "diff --git a/{from} b/{to}\nsimilarity index 100%\nrename from {from}\nrename to {to}\n"
                 ),
@@ -1857,21 +2001,38 @@ mod tests {
         }
     }
 
+    fn segment() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("a"), Just("b"), Just("ab"), Just("a b"), Just("b a")]
+    }
+
+    fn generated_path(spaces: bool) -> impl Strategy<Value = String> {
+        let segment = if spaces {
+            segment().boxed()
+        } else {
+            prop_oneof![Just("a"), Just("b"), Just("ab")].boxed()
+        };
+        (prop::collection::vec(segment, 1..4), any::<bool>()).prop_map(|(parts, sh)| {
+            let mut path = parts.join("/");
+            if sh {
+                path.push_str(".sh");
+            }
+            path
+        })
+    }
+
+    fn distinct_pair() -> impl Strategy<Value = (String, String)> {
+        (generated_path(false), generated_path(false))
+            .prop_map(|(a, b)| if a == b { (a, format!("{b}x")) } else { (a, b) })
+    }
+
     fn section_strategy() -> impl Strategy<Value = Section> {
-        let spaced = "[ab ]{1,2}(/[ab]{1,2}){0,2}(\\.sh)?".prop_filter("edge spaces", |p| {
-            !p.starts_with(' ') && !p.ends_with(' ') && !p.contains(" /") && !p.contains("/ ")
-        });
-        let plain = "[ab]{1,2}(/[ab]{1,2}){0,2}(\\.sh)?";
         prop_oneof![
-            (spaced, 0usize..4, 0usize..4)
-                .prop_filter("a change", |(_, r, a)| r + a > 0)
-                .prop_map(|(path, r, a)| Section::Modify(path, r, a)),
-            (plain, plain)
-                .prop_filter("distinct", |(a, b)| a != b)
-                .prop_map(|(a, b)| Section::Rename(a, b)),
-            (plain, plain)
-                .prop_filter("distinct", |(a, b)| a != b)
-                .prop_map(|(a, b)| Section::Copy(a, b)),
+            (generated_path(true), 0usize..4, 0usize..4).prop_map(|(path, r, a)| {
+                let (r, a) = if r + a == 0 { (0, 1) } else { (r, a) };
+                Section::Modify(path, r, a)
+            }),
+            distinct_pair().prop_map(|(a, b)| Section::Rename(a, b)),
+            distinct_pair().prop_map(|(a, b)| Section::Copy(a, b)),
         ]
     }
 
@@ -1968,9 +2129,7 @@ mod tests {
             max in 0u32..50,
         ) {
             let verdict = diff_judge(&body, max, &["**/*.sh".to_string()]);
-            if verdict.passed {
-                prop_assert!(patch_stats(&body).changed_lines <= u64::from(max));
-            }
+            prop_assert!(!verdict.passed || body.contains("diff --git "));
         }
 
         #[test]

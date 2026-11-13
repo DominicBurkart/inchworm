@@ -69,13 +69,43 @@ impl<T> RepoQueues<T> {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct Probes {
+    after_claim: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    wake_log: Mutex<Vec<BTreeSet<String>>>,
+}
+
 struct Shared<T> {
     queues: Mutex<RepoQueues<T>>,
     wake: Notify,
     permit: Arc<Semaphore>,
+    #[cfg(test)]
+    probes: Probes,
 }
 
 impl<T> Shared<T> {
+    fn claim(&self) -> Option<(String, T)> {
+        let claimed = self.queues().claim();
+        #[cfg(test)]
+        {
+            let hook = self.probes.after_claim.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        claimed
+    }
+
+    fn wake_all(&self) {
+        #[cfg(test)]
+        {
+            let active = self.queues().active.clone();
+            self.probes.wake_log.lock().unwrap().push(active);
+        }
+        self.wake.notify_waiters();
+    }
+
     fn queues(&self) -> MutexGuard<'_, RepoQueues<T>> {
         self.queues
             .lock()
@@ -114,7 +144,7 @@ impl<T> Lease<T> {
 impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
         self.shared.queues().finish(&self.repo);
-        self.shared.wake.notify_waiters();
+        self.shared.wake_all();
     }
 }
 
@@ -140,6 +170,8 @@ impl<T> Scheduler<T> {
                 queues: Mutex::new(RepoQueues::default()),
                 wake: Notify::new(),
                 permit: Arc::new(Semaphore::new(permits.max(1))),
+                #[cfg(test)]
+                probes: Probes::default(),
             }),
         }
     }
@@ -150,7 +182,7 @@ impl<T> Scheduler<T> {
 
     pub fn enqueue(&self, repo: &str, item: T) {
         self.shared.queues().enqueue(repo, item);
-        self.shared.wake.notify_waiters();
+        self.shared.wake_all();
     }
 
     pub fn is_active(&self, repo: &str) -> bool {
@@ -164,7 +196,7 @@ impl<T> Scheduler<T> {
     pub async fn next(&self) -> Lease<T> {
         loop {
             let notified = self.shared.wake.notified();
-            let claimed = self.shared.queues().claim();
+            let claimed = self.shared.claim();
             if let Some((repo, item)) = claimed {
                 return Lease {
                     repo,
@@ -388,6 +420,48 @@ mod tests {
         assert_eq!(s.queued_len("a"), 1);
         assert!(!s.is_active("a"));
         assert_eq!(*s.next().await.item(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enqueue_between_a_failed_claim_and_the_wait_is_not_lost() {
+        let s: Scheduler<u8> = Scheduler::new(1);
+        let racer = s.clone();
+        *s.shared.probes.after_claim.lock().unwrap() =
+            Some(Box::new(move || racer.enqueue("r", 9)));
+        let lease = timeout(SHORT, s.next())
+            .await
+            .expect("the enqueue that raced the failed claim was lost");
+        assert_eq!(*lease.item(), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_drop_between_a_failed_claim_and_the_wait_is_not_lost() {
+        let s = Scheduler::new(1);
+        s.enqueue("r", 1);
+        s.enqueue("r", 2);
+        let first = s.next().await;
+        let cell = Mutex::new(Some(first));
+        *s.shared.probes.after_claim.lock().unwrap() = Some(Box::new(move || {
+            drop(cell.lock().unwrap().take());
+        }));
+        let second = timeout(SHORT, s.next())
+            .await
+            .expect("the lease drop that raced the failed claim was lost");
+        assert_eq!(*second.item(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_drop_wakes_waiters_only_after_the_repo_is_marked_free() {
+        let s = Scheduler::new(1);
+        s.enqueue("r", 1);
+        let lease = s.next().await;
+        s.shared.probes.wake_log.lock().unwrap().clear();
+        drop(lease);
+        let log = s.shared.probes.wake_log.lock().unwrap().clone();
+        assert_eq!(log, [BTreeSet::new()]);
+        s.enqueue("q", 2);
+        let log = s.shared.probes.wake_log.lock().unwrap().clone();
+        assert_eq!(log.len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
