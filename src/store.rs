@@ -58,9 +58,10 @@ CREATE TABLE attempts (
 );
 "];
 
-const FROZEN_OBJECTS: &[(&str, &str, &str)] = &[
+const FROZEN_OBJECTS: &[(&str, &str, &str, &str)] = &[
     (
         "table",
+        "runs",
         "runs",
         "CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
@@ -76,12 +77,14 @@ const FROZEN_OBJECTS: &[(&str, &str, &str)] = &[
     (
         "index",
         "runs_one_open_per_subject",
+        "runs",
         "CREATE UNIQUE INDEX runs_one_open_per_subject
     ON runs (repo, subject_kind, subject_ref, flow)
     WHERE state IN ('queued', 'running', 'awaiting_ci', 'judging')",
     ),
     (
         "table",
+        "attempts",
         "attempts",
         "CREATE TABLE attempts (
     id INTEGER PRIMARY KEY,
@@ -811,18 +814,39 @@ impl Store {
                 "the index `runs_one_open_per_subject` covers {indexed:?}, expected {EXPECTED_INDEX_COLUMNS:?}"
             ));
         }
-        for (kind, name, expected) in FROZEN_OBJECTS {
-            let stored: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-                    [kind, name],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if stored.as_deref().map(normalise_sql) != Some(normalise_sql(expected)) {
+        let mut statement = self.conn.prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master
+             WHERE substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name",
+        )?;
+        let stored: Vec<(String, String, String, Option<String>)> = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (kind, name, table, expected) in FROZEN_OBJECTS {
+            let Some((_, _, found_table, sql)) = stored
+                .iter()
+                .find(|(found_kind, found_name, ..)| found_kind == kind && found_name == name)
+            else {
+                return mismatch(format!(
+                    "the {kind} `{name}` required by migration 1 is missing"
+                ));
+            };
+            if found_table != table
+                || sql.as_deref().map(normalise_sql) != Some(normalise_sql(expected))
+            {
                 return mismatch(format!(
                     "the definition of the {kind} `{name}` differs from migration 1"
+                ));
+            }
+        }
+        for (kind, name, ..) in &stored {
+            if !FROZEN_OBJECTS
+                .iter()
+                .any(|(frozen_kind, frozen_name, ..)| frozen_kind == kind && frozen_name == name)
+            {
+                return mismatch(format!(
+                    "the database has an unexpected {kind} `{name}` that migration 1 does not define"
                 ));
             }
         }
@@ -1381,6 +1405,71 @@ CREATE TABLE attempts (
         }
     }
 
+    fn open_with_extra(extra: &str) -> Result<Store, StoreError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = database_made_from(MIGRATIONS[0], &dir);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(extra)
+            .unwrap();
+        Store::open(&path)
+    }
+
+    #[test]
+    fn any_object_beyond_the_frozen_set_is_refused() {
+        let extras = [
+            (
+                "unique index",
+                "CREATE UNIQUE INDEX evil ON attempts(branch);",
+            ),
+            ("plain index", "CREATE INDEX meh ON runs(repo);"),
+            (
+                "index on a new table",
+                "CREATE TABLE other(x); CREATE INDEX other_x ON other(x);",
+            ),
+            (
+                "trigger",
+                "CREATE TRIGGER t BEFORE UPDATE ON runs BEGIN SELECT RAISE(IGNORE); END;",
+            ),
+            ("view", "CREATE VIEW v AS SELECT * FROM runs;"),
+            ("table", "CREATE TABLE other(x);"),
+            (
+                "table named like an internal one",
+                "CREATE TABLE sqliteevil(x);",
+            ),
+        ];
+        for (name, extra) in extras {
+            let detail = mismatch(open_with_extra(extra));
+            assert!(detail.contains("unexpected"), "{name}: {detail}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_renamed_object_is_refused() {
+        let detail = mismatch(open_with_extra("DROP INDEX runs_one_open_per_subject;"));
+        assert!(detail.contains("runs_one_open_per_subject"), "{detail}");
+        let renamed = MIGRATIONS[0].replace("runs_one_open_per_subject", "renamed_index");
+        let dir = tempfile::tempdir().unwrap();
+        let path = database_made_from(&renamed, &dir);
+        assert!(!mismatch(Store::open(&path)).is_empty());
+        let detail = mismatch(open_with_extra("DROP TABLE attempts;"));
+        assert!(detail.contains("attempts"), "{detail}");
+    }
+
+    #[test]
+    fn sqlites_own_internal_objects_are_not_extra() {
+        let store = open_with_extra("ANALYZE;").unwrap();
+        let internal: i64 = store
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(internal >= 2);
+    }
+
     #[test]
     fn a_schema_that_differs_only_in_whitespace_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
@@ -1530,9 +1619,9 @@ CREATE TABLE attempts (
 
     fn hold_exclusive_lock(path: &Path) -> Connection {
         let holder = Connection::open(path).unwrap();
-        holder
-            .execute_batch("CREATE TABLE IF NOT EXISTS t (x); BEGIN EXCLUSIVE")
-            .unwrap();
+        holder.execute_batch(MIGRATIONS[0]).unwrap();
+        holder.pragma_update(None, "user_version", 1).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
         holder
     }
 
@@ -1693,9 +1782,9 @@ CREATE TABLE attempts (
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reader.db");
         let reader = Connection::open(&path).unwrap();
-        reader
-            .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1); BEGIN; SELECT * FROM t;")
-            .unwrap();
+        reader.execute_batch(MIGRATIONS[0]).unwrap();
+        reader.pragma_update(None, "user_version", 1).unwrap();
+        reader.execute_batch("BEGIN; SELECT * FROM runs;").unwrap();
         let started = Instant::now();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
