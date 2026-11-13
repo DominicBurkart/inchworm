@@ -9,7 +9,7 @@ The MVP is functionally complete behind fakes: configuration, run state, the SQL
 Not done or deliberately off:
 
 - `merge_when` is built and tested but no shipped config enables it. Every repo should start at `draft_pr`.
-- The human gate (nanna `.nanna/policy.toml` `human_gate`) is not consulted; the policy input is always `NotConsulted`. This is a pending decision, see the plan.
+- Merging is unreachable in production: every entry point passes `MergeGrant::Denied`, so `merge_when` degrades to `draft_pr` until nanna-coder#1043 defines the capability and a later change wires the grant to it.
 - Nothing in the test suite talks to a real nanna, GitHub or Ollama. Run `inchworm validate --online` and one foreground `inchworm run` on a throwaway issue before trusting the daemon.
 
 ## Install
@@ -121,14 +121,14 @@ With `--online` it also checks that every step identity resolves with `nanna age
 2. The last step must leave a PR on `inchworm/<issue>-a<n>`. inchworm records its number and head SHA and the nanna report (denials, QA) and the attempt becomes `published`.
 3. inchworm polls the check-runs of that exact SHA until every name in `required_checks` has a finished run (30 s interval, 2 h limit). A red required check fails the attempt as `ci_red`, a timeout as `timeout`.
 4. The judges (`diff`, `nanna_clean`, `llm`) run against the PR patch fetched from GitHub; the head must still equal the recorded SHA. Verdicts are stored per attempt. The LLM judge shares the single model permit with nanna dispatch.
-5. `policy::decide` picks the outcome. `draft_pr`: comment on the issue with the outcome, swap the labels to `inchworm:done`, leave the PR a draft, run ends `pr_open`. `merge_when`: `gh pr ready` then `gh pr merge <n> --match-head-commit <sha> --merge|--squash|--rebase`; never `--admin`; run ends `merged`. A rejection fails the attempt as `judge_rejected` or `merge_blocked` and retries if allowed.
+5. `policy::decide` picks the outcome. `draft_pr`: comment on the issue with the outcome, swap the labels to `inchworm:done`, leave the PR a draft, run ends `pr_open`. `merge_when` (unreachable in production while the grant is always `Denied`): `gh pr ready` then `gh pr merge <n> --match-head-commit <sha> --merge|--squash|--rebase`; never `--admin`; run ends `merged`. A rejection fails the attempt as `judge_rejected` or `merge_blocked` and retries if allowed.
 6. After the last attempt the issue gets `inchworm:failed` and a comment with the failure class.
 
 ## Known limitations
 
 - CI is read from check-runs on the head SHA. Legacy commit-status contexts (some coverage bots post those) are not read, so a `required_checks` entry that branch protection satisfies with a status context would wait until the CI timeout and fail as `timeout`.
 - The PR of a rejected attempt stays open. A merge refused after `gh pr ready` marks the PR a draft again; if that undo fails the failure text says so.
-- The human gate is never consulted.
+- The merge grant is always `Denied`, so no run merges.
 
 ## Daemon
 
@@ -178,7 +178,7 @@ required_checks = ["Tests"]
 
 ## LLM judge safety
 
-The `llm` judge fails closed. Ollama being down, refusing the connection, answering with a non-2xx status, hanging past the timeout, returning a body that is not the expected envelope, or returning a reply that is not exactly `{"score": <integer 0-10>, "reason": <string>}` (extra keys, duplicate keys, prose, code fences, trailing text, out-of-range or non-integer scores, replies over 8 KiB) all produce a failed verdict with no score. Patches over 64 KiB are not judged and fail. Every model call is bounded by a timeout and holds the global model permit only while it runs.
+The `llm` judge fails closed. Ollama being down, refusing the connection, answering with a non-2xx status, hanging past the timeout, returning a body that is not the expected envelope, or returning a reply that is not exactly `{"score": <integer 0-10>, "reason": <string>}` (extra keys, duplicate keys, prose, code fences, trailing text, out-of-range or non-integer scores, a response body over 1 MiB, replies over 8 KiB) all produce a failed verdict with no score. Patches over 64 KiB are not judged and fail. Every model call is bounded by a timeout and holds the global model permit only while it runs.
 
 The patch is untrusted input. It is placed in a delimited data section whose begin and end markers carry a fresh random value for every call, every line is prefixed with `| ` and control characters are escaped, so the patch cannot forge the section end marker, a new rubric, or a reply. The model is told the section is data, that instructions inside it must not change the rubric, and the reply format is restated after the data. The rubric comes from `.inchworm/`, which `validate` requires to be protected from agents.
 
@@ -188,13 +188,14 @@ Residual risk: this reduces but does not eliminate prompt injection. A small loc
 
 ## Judge and policy contract
 
-- The `diff` judge only accepts `git diff` output (`diff --git` headers). A patch without them, a binary change, a hunk whose lines do not match its declared counts, and any quoted, backslash-escaped or non-ASCII path (git's default quoting) fail closed, so a file with such a name cannot be merged automatically.
-- `forbid_paths` globs are matched against repository-relative paths, including both sides of renames and copies. `*` crosses `/`, matching is case-sensitive, `!` is literal, a bare `publish.sh` does not match `sub/publish.sh` (use `**/publish.sh`) and a directory needs `dir/**`.
+- The `diff` judge only accepts `git diff` output (`diff --git` headers). A patch without them, a binary change, a hunk whose lines do not match its declared counts (too many, or too few because the patch is truncated), and any quoted, backslash-escaped or non-ASCII path (git's default quoting) fail closed, so a file with such a name cannot be merged automatically.
+- `forbid_paths` entries are [globset](https://docs.rs/globset) globs matched against the exact repository-relative path (forward slashes, no normalisation), including both sides of renames and copies. Syntax: `*` and `**` cross `/`, `?` is one character, `[abc]` and `[a-z]` are classes, `[!a]` or `[^a]` negate a class, `{a,b}` is alternation, `\` escapes the next character, and a `!` outside a class is literal (it does not negate the pattern). Matching is case-sensitive. A malformed or empty entry is rejected when the flow file is loaded (and by `validate`), and the judge also fails closed on one.
+- Patterns that are valid but silently match nothing: a leading `./` or `/` (`./a.rs`, `/a.rs` never match `a.rs`), a bare directory (`src` and `src/` do not match `src/a.rs`; use `src/**`), a different case (`SRC/**` does not match `src/a.rs`), and a bare file name below the root (`publish.sh` does not match `sub/publish.sh`; use `**/publish.sh`). `dir/**` does not match a path named exactly `dir` (a file or symlink replacing the directory), so list `.github` next to `.github/**` to cover that case.
 - `policy::decide` rejects with `judge_rejected` unless the verdicts equal the configured judges by kind and index, all passed. If every failed verdict is an infrastructure failure (Ollama down, timeout, bad envelope) the class is `model_error` instead. Judges take precedence over CI: a failed judge with a red check is `judge_rejected`.
 - CI: a required check must be green on the exact judged SHA. A failed run followed by a green rerun with the same name and SHA stays `ci_red`. GitHub conclusions map fail closed: only `success` is green, `skipped`, `neutral`, `cancelled`, `timed_out`, `action_required`, `stale` and anything unknown are red, and anything not `completed` is pending.
-- An unconsulted human gate (the default) never merges: `merge_when` degrades to `draft_pr` until the gate is wired. Every shipped default and example uses `draft_pr`; nothing enables `merge_when`.
+- `policy::decide` takes a caller-supplied `MergeGrant` (`Denied` by default, `Granted`) meaning that a repository-declared rule currently grants this orchestrator the right to merge there. `Merge` is returned only when the mode is `merge_when`, the grant is `Granted` and every safety condition holds; otherwise the result is a draft pull request. Nothing reads a repository file to decide the grant, so merging is unreachable in production until nanna-coder#1043 defines the capability and a later change wires `Granted` to it. Every shipped default and example uses `draft_pr`; nothing enables `merge_when`.
 - The scheduler gives each repo one active run at a time. The global `concurrency` limit is a semaphore around model calls (dispatch and the LLM judge), not around leases, so runs in different repos wait on CI in parallel and a run that holds its lease can still judge.
-- Not implemented: per-directory configuration, offramps and a per-step auditor (D1 to D3). `Verdict` carries an optional `step` and is `non_exhaustive`; `config::Judge` and `config::Trigger` are not, so adding a variant is a breaking change for code that matches them exhaustively.
+- Not implemented: per-directory configuration, offramps and a per-step auditor (D1 to D3). `Verdict` carries an optional `step` and is `non_exhaustive`; `config::Judge` and `config::Trigger` are not, so adding a variant is a breaking change for code that matches them exhaustively. A per-step verdict (D3) additionally needs a policy change: `policy::decide` matches verdicts by (kind, index) and requires exactly one per configured judge, so a second verdict with the same kind and index and a different `step` is currently rejected as a duplicate.
 
 ## Development
 

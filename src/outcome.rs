@@ -11,7 +11,7 @@ use crate::flow::{PROTECTED_DIR, protected_paths_in};
 use crate::github::{GitHub, PrState, PullRequest};
 use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
-use crate::policy::{CheckConclusion, CheckRun, Decision, HumanGate, PolicyInput, decide};
+use crate::policy::{CheckConclusion, CheckRun, Decision, MergeGrant, PolicyInput, decide};
 use crate::run::{RUNNING_LABEL, trigger_label};
 use crate::store::{AttemptId, RunId, Store, StoreError};
 
@@ -36,7 +36,7 @@ pub struct OutcomeEnv<'a> {
     pub scorer: &'a dyn DynScorer,
     pub model_permit: Arc<Semaphore>,
     pub ci: CiPolicy,
-    pub human_gate: HumanGate,
+    pub merge_grant: MergeGrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,7 +444,7 @@ pub async fn conclude(
         live_head_sha: &live.head_sha,
         expected_judges: &expected_judges,
         verdicts: &verdicts,
-        human_gate: env.human_gate,
+        merge_grant: env.merge_grant,
     });
 
     match decision {
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_when_with_an_unconsulted_human_gate_stays_a_draft_and_never_touches_the_pr() {
+    async fn merge_when_with_an_unconsulted_merge_grant_stays_a_draft_and_never_touches_the_pr() {
         let rig = rig();
         rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
         rig.github.push_check_poll(
@@ -1076,7 +1076,7 @@ mod tests {
         );
         rig.github.set_pr_patch("o/r", 77, &patch(2));
         let mut env = env(&rig.scorer);
-        env.human_gate = HumanGate::NotConsulted;
+        env.merge_grant = MergeGrant::Denied;
         let (mut client, _fake) = connect(two_successes(1));
         client.initialize().unwrap();
         let summary = run_issue(&rig.ctx(), &env, &merge_flow(), 5, &mut client)
@@ -1192,7 +1192,7 @@ mod tests {
         let mut flow = merge_flow();
         flow.outcome.required_checks = names(&["build"]);
         let mut env = env(&rig.scorer);
-        env.human_gate = HumanGate::Absent;
+        env.merge_grant = MergeGrant::Granted;
         let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), "b".repeat(40).as_str()).await;
         assert!(
             matches!(concluded, Concluded::Rejected { .. }),

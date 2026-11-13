@@ -115,7 +115,6 @@ impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
         self.shared.queues().finish(&self.repo);
         self.shared.wake.notify_waiters();
-        self.shared.wake.notify_one();
     }
 }
 
@@ -151,7 +150,7 @@ impl<T> Scheduler<T> {
 
     pub fn enqueue(&self, repo: &str, item: T) {
         self.shared.queues().enqueue(repo, item);
-        self.shared.wake.notify_one();
+        self.shared.wake.notify_waiters();
     }
 
     pub fn is_active(&self, repo: &str) -> bool {
@@ -165,8 +164,6 @@ impl<T> Scheduler<T> {
     pub async fn next(&self) -> Lease<T> {
         loop {
             let notified = self.shared.wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
             let claimed = self.shared.queues().claim();
             if let Some((repo, item)) = claimed {
                 return Lease {
@@ -267,7 +264,7 @@ mod tests {
         tokio::time::sleep(SHORT).await;
         assert!(!waiter.is_finished());
         s.enqueue("r", 5);
-        assert_eq!(waiter.await.unwrap(), 5);
+        assert_eq!(timeout(SHORT, waiter).await.unwrap().unwrap(), 5);
     }
 
     #[tokio::test(start_paused = true)]
@@ -283,7 +280,7 @@ mod tests {
         tokio::time::sleep(SHORT).await;
         assert!(!waiter.is_finished());
         drop(first);
-        assert_eq!(waiter.await.unwrap(), 2);
+        assert_eq!(timeout(SHORT, waiter).await.unwrap().unwrap(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -308,7 +305,7 @@ mod tests {
         drop(first);
         let mut got = Vec::new();
         for waiter in waiters {
-            got.push(waiter.await.unwrap());
+            got.push(timeout(SHORT, waiter).await.unwrap().unwrap());
         }
         got.sort();
         assert_eq!(got, [2, 3]);
@@ -391,6 +388,87 @@ mod tests {
         assert_eq!(s.queued_len("a"), 1);
         assert!(!s.is_active("a"));
         assert_eq!(*s.next().await.item(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_waiter_blocked_on_an_empty_queue_is_woken_by_an_enqueue_in_turn() {
+        let s = Scheduler::new(1);
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    let lease = s.next().await;
+                    *lease.item()
+                })
+            })
+            .collect();
+        tokio::time::sleep(SHORT).await;
+        for (i, repo) in ["a", "b", "c"].into_iter().enumerate() {
+            s.enqueue(repo, i);
+        }
+        let mut got = Vec::new();
+        for waiter in waiters {
+            got.push(timeout(SHORT, waiter).await.unwrap().unwrap());
+        }
+        got.sort();
+        assert_eq!(got, [0, 1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_wakeup_is_lost_when_enqueues_and_lease_drops_race_with_claims() {
+        let s: Scheduler<usize> = Scheduler::new(1);
+        let total = 400usize;
+        let consumers: Vec<_> = (0..4)
+            .map(|_| {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    loop {
+                        let lease = s.next().await;
+                        if *lease.item() == usize::MAX {
+                            return seen;
+                        }
+                        seen.push(*lease.item());
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        let producer = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                for i in 0..total {
+                    s.enqueue(["a", "b"][i % 2], i);
+                    if i % 7 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+        timeout(Duration::from_secs(60), producer)
+            .await
+            .unwrap()
+            .unwrap();
+        loop {
+            if s.queued_len("a") + s.queued_len("b") == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..4 {
+            s.enqueue("stop", usize::MAX);
+        }
+        let mut all = Vec::new();
+        for consumer in consumers {
+            all.extend(
+                timeout(Duration::from_secs(60), consumer)
+                    .await
+                    .expect("a consumer was left sleeping while work was queued")
+                    .unwrap(),
+            );
+        }
+        all.sort();
+        assert_eq!(all, (0..total).collect::<Vec<_>>());
     }
 
     struct Fixed;

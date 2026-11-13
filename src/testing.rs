@@ -8,7 +8,7 @@ use crate::config::{Flow, FlowFile};
 use crate::github::{FakeGitHub, Issue, PrState, PullRequest};
 use crate::judges::{LlmError, Scorer};
 use crate::outcome::{CiPolicy, OutcomeEnv};
-use crate::policy::HumanGate;
+use crate::policy::MergeGrant;
 
 pub struct FakeScorer {
     replies: Mutex<VecDeque<Result<String, LlmError>>>,
@@ -47,7 +47,7 @@ pub fn env(scorer: &FakeScorer) -> OutcomeEnv<'_> {
     OutcomeEnv {
         scorer,
         model_permit: Arc::new(Semaphore::new(1)),
-        human_gate: HumanGate::Absent,
+        merge_grant: MergeGrant::Granted,
         ci: CiPolicy {
             poll_interval: Duration::from_secs(10),
             timeout: Duration::from_secs(60),

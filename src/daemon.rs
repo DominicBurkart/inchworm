@@ -16,7 +16,7 @@ use crate::judges::DynScorer;
 use crate::model::RunState;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskOutcome};
 use crate::outcome::{CiPolicy, OutcomeEnv};
-use crate::policy::HumanGate;
+use crate::policy::MergeGrant;
 use crate::run::{RunContext, RunError, enqueue_issue, execute_run};
 use crate::scheduler::Scheduler;
 use crate::store::{RunId, Store, StoreError};
@@ -233,7 +233,7 @@ async fn process(
         scorer: deps.scorer.as_ref(),
         model_permit: scheduler.model_permit(),
         ci,
-        human_gate: HumanGate::NotConsulted,
+        merge_grant: MergeGrant::Denied,
     };
     let mut dispatcher = Reconnecting {
         factory: Arc::clone(&deps.dispatchers),
@@ -784,6 +784,19 @@ required_checks = ["build"]
                 .iter()
                 .any(|c| c.2.contains("draft_pr"))
         );
+    }
+
+    #[test]
+    fn a_merge_when_flow_never_merges_because_the_daemon_passes_a_denied_grant() {
+        let rig = Rig::new(&FLOWS.replace("draft_pr", "merge_when"));
+        rig.green(77, 5, 1, SHA);
+        let running = rig.start(rig.settings(), ScriptedFactory::with(vec![successes()]));
+        wait_for("the run to finish", || {
+            states(&rig.store()) == [(5, RunState::PrOpen)]
+        });
+        running.stop().unwrap();
+        assert!(rig.github.merge_calls().is_empty());
+        assert!(rig.github.ready_calls().is_empty());
     }
 
     #[test]

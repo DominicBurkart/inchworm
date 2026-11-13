@@ -14,7 +14,7 @@ use crate::model::{RunState, sanitize_text};
 use crate::nanna_client::NannaClient;
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
 use crate::outcome::{CiPolicy, OutcomeEnv};
-use crate::policy::HumanGate;
+use crate::policy::MergeGrant;
 use crate::run::{RunContext, run_issue};
 use crate::stats::{parse_class, render_failures, render_stats, render_status};
 use crate::store::Store;
@@ -261,7 +261,7 @@ fn run_command(
         scorer: &scorer,
         model_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         ci: CiPolicy::default(),
-        human_gate: HumanGate::NotConsulted,
+        merge_grant: MergeGrant::Denied,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
