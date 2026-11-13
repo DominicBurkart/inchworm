@@ -29,7 +29,17 @@ pub enum ProjectError {
         "[auditor] runs_in is host, but no host check exists yet, so a host default would be a silent skip of every auditor; use a nanna identity"
     )]
     HostAuditorDefault,
-    #[error("auditor identity `{0}` is empty or invalid")]
+    #[error(
+        "flow `{flow}` step `{step}`: the auditor is set to run on the host, but no host check exists yet, so this step would run unaudited; use a nanna auditor"
+    )]
+    HostAuditorStep { flow: String, step: String },
+    #[error(
+        "flow `{flow}` step `{step}`: the auditor has no checks because the flow has no judges; add a judge or name checks, otherwise nothing is audited"
+    )]
+    AuditorWithoutChecks { flow: String, step: String },
+    #[error("[offramp.flow] names flow `{0}` more than once, ignoring case")]
+    DuplicateOfframpFlow(String),
+    #[error("auditor identity {0:?} is empty or invalid")]
     InvalidAuditorIdentity(String),
     #[error(
         "auditor identity `{identity}` is also the identity of step `{step}` in flow `{flow}`; an agent must not audit itself"
@@ -75,7 +85,11 @@ pub struct OfframpConfig {
 
 impl OfframpConfig {
     pub fn for_flow(&self, flow: &str) -> Offramp {
-        self.flow.get(flow).copied().unwrap_or(self.default)
+        self.flow
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(flow))
+            .map(|(_, offramp)| *offramp)
+            .unwrap_or(self.default)
     }
 }
 
@@ -260,6 +274,9 @@ impl ProjectConfig {
     /// name = "implement"
     /// identity = "rust-implementer"
     ///
+    /// [[flow.judge]]
+    /// kind = "nanna_clean"
+    ///
     /// [flow.outcome]
     /// mode = "draft_pr"
     /// "#).unwrap();
@@ -280,20 +297,6 @@ impl ProjectConfig {
             .expect("a validated ProjectConfig always has an auditor")
     }
 
-    pub fn host_auditor_steps(&self) -> Vec<(String, String)> {
-        let auditor = self.auditor();
-        self.flow
-            .iter()
-            .flat_map(|flow| flow.step.iter().map(move |step| (flow, step.name.as_str())))
-            .filter(|(flow, step)| {
-                auditor
-                    .plan_for(flow, step)
-                    .is_some_and(|plan| plan.runs_in == AuditorPlace::Host {})
-            })
-            .map(|(flow, step)| (flow.name.clone(), step.to_string()))
-            .collect()
-    }
-
     pub fn flow_file(&self) -> FlowFile {
         FlowFile {
             flow: self.flow.clone(),
@@ -306,7 +309,11 @@ impl ProjectConfig {
         if auditor.runs_in == (AuditorPlace::Host {}) {
             return Err(ProjectError::HostAuditorDefault);
         }
+        let mut offramp_names = HashSet::new();
         for name in self.offramp.flow.keys() {
+            if !offramp_names.insert(name.to_ascii_lowercase()) {
+                return Err(ProjectError::DuplicateOfframpFlow(name.clone()));
+            }
             if !self
                 .flow
                 .iter()
@@ -358,6 +365,18 @@ impl ProjectConfig {
                 let plan = auditor
                     .plan_for(flow, &step.name)
                     .expect("every step of a defined flow has a plan");
+                if plan.runs_in == (AuditorPlace::Host {}) {
+                    return Err(ProjectError::HostAuditorStep {
+                        flow: flow.name.clone(),
+                        step: step.name.clone(),
+                    });
+                }
+                if plan.checks.is_empty() {
+                    return Err(ProjectError::AuditorWithoutChecks {
+                        flow: flow.name.clone(),
+                        step: step.name.clone(),
+                    });
+                }
                 if let AuditorPlace::Nanna { identity } = &plan.runs_in {
                     if !identity_is_valid(identity) {
                         return Err(ProjectError::InvalidAuditorIdentity(identity.clone()));
@@ -506,17 +525,148 @@ mode = "draft_pr"
     }
 
     #[test]
-    fn steps_whose_auditor_resolves_to_the_host_are_listed() {
-        let none = ProjectConfig::parse(&minimal()).unwrap();
-        assert!(none.host_auditor_steps().is_empty());
+    fn a_per_step_host_auditor_is_a_parse_error_naming_the_step() {
         let text = with(
             "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"host\" }\n",
         );
-        let config = ProjectConfig::parse(&text).unwrap();
-        assert_eq!(
-            config.host_auditor_steps(),
-            vec![("issue".to_string(), "implement".to_string())]
+        assert!(matches!(
+            ProjectConfig::parse(&text),
+            Err(ProjectError::HostAuditorStep { flow, step }) if flow == "issue" && step == "implement"
+        ));
+        assert!(
+            error(&text)
+                .contains("flow `issue` step `implement`: the auditor is set to run on the host")
         );
+    }
+
+    #[test]
+    fn per_flow_offramp_keys_use_one_case_insensitive_rule_in_both_directions() {
+        let auditor = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
+        let upper_key = with(&format!("[offramp.flow]\nIssue = \"escalate\"\n{auditor}"));
+        let config = ProjectConfig::parse(&upper_key).unwrap();
+        assert_eq!(config.offramp.for_flow("issue"), Offramp::Escalate);
+        assert_eq!(config.offramp.for_flow("ISSUE"), Offramp::Escalate);
+        let reverse = with(&format!(
+            "[offramp]\ndefault = \"escalate\"\n[offramp.flow]\nIssue = \"noop\"\n{auditor}"
+        ));
+        let config = ProjectConfig::parse(&reverse).unwrap();
+        assert_eq!(config.offramp.for_flow("issue"), Offramp::Noop);
+        assert_eq!(config.offramp.for_flow("other"), Offramp::Escalate);
+        let twice = with(&format!(
+            "[offramp.flow]\nIssue = \"noop\"\nissue = \"escalate\"\n{auditor}"
+        ));
+        assert!(matches!(
+            ProjectConfig::parse(&twice),
+            Err(ProjectError::DuplicateOfframpFlow(_))
+        ));
+    }
+
+    #[test]
+    fn a_step_with_no_checks_is_an_error_because_nothing_would_be_audited() {
+        let no_judges = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n";
+        assert!(matches!(
+            ProjectConfig::parse(no_judges),
+            Err(ProjectError::AuditorWithoutChecks { flow, step }) if flow == "issue" && step == "implement"
+        ));
+        assert!(error(no_judges).contains("nothing is audited"));
+    }
+
+    #[test]
+    fn an_invalid_auditor_identity_is_shown_escaped() {
+        let text = with("[auditor]\nruns_in = { kind = \"nanna\", identity = \"a\\u0000b\" }\n");
+        let message = error(&text);
+        assert!(message.contains("\"a\\0b\""), "{message:?}");
+        assert!(!message.contains('\0'));
+    }
+
+    #[test]
+    fn the_step_override_limit_is_exactly_640_and_the_identity_limit_exactly_64() {
+        let flows: String = (0..32)
+            .map(|f| {
+                let steps: String = (0..20)
+                    .map(|n| {
+                        format!(
+                            "[[flow.step]]\nname = \"s{n}\"\nidentity = \"impl\"\n"
+                        )
+                    })
+                    .collect();
+                format!(
+                    "[[flow]]\nname = \"f{f}\"\ntrigger = {{ kind = \"label\", label = \"l{f}\" }}\n{steps}[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n"
+                )
+            })
+            .collect();
+        let overrides: String = (0..32)
+            .flat_map(|f| (0..20).map(move |n| (f, n)))
+            .map(|(f, n)| {
+                format!(
+                    "[[auditor.step]]\nflow = \"f{f}\"\nstep = \"s{n}\"\nruns_in = {{ kind = \"nanna\", identity = \"second\" }}\n"
+                )
+            })
+            .collect();
+        let head = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
+        assert!(ProjectConfig::parse(&format!("{head}{overrides}{flows}")).is_ok());
+        let extra = "[[auditor.step]]\nflow = \"f0\"\nstep = \"s0\"\n";
+        assert!(matches!(
+            ProjectConfig::parse(&format!("{head}{overrides}{extra}{flows}")),
+            Err(ProjectError::TooManyAuditedSteps(641))
+        ));
+        for (identity, ok) in [("a".repeat(64), true), ("a".repeat(65), false)] {
+            let auditor = with(&format!(
+                "[auditor]\nruns_in = {{ kind = \"nanna\", identity = \"{identity}\" }}\n"
+            ));
+            assert_eq!(
+                ProjectConfig::parse(&auditor).is_ok(),
+                ok,
+                "{}",
+                identity.len()
+            );
+        }
+    }
+
+    #[test]
+    fn default_checks_are_exactly_the_judges_the_flow_has() {
+        let all = FLOW.replace(
+            "[flow.outcome]",
+            "[[flow.judge]]\nkind = \"llm\"\nrubric = \".inchworm/rubric.md\"\nmodel = \"gemma4:e4b\"\nmin_score = 7\n\n[flow.outcome]",
+        );
+        let head = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
+        let config = ProjectConfig::parse(&format!("{head}{all}")).unwrap();
+        let plan = config
+            .auditor()
+            .plan_for(&config.flow[0], "implement")
+            .unwrap();
+        assert_eq!(
+            plan.checks,
+            vec![Check::Diff, Check::NannaClean, Check::Llm]
+        );
+        let diff_only = FLOW.replace("[[flow.judge]]\nkind = \"nanna_clean\"\n", "");
+        let config = ProjectConfig::parse(&format!("{head}{diff_only}")).unwrap();
+        let plan = config
+            .auditor()
+            .plan_for(&config.flow[0], "implement")
+            .unwrap();
+        assert_eq!(plan.checks, vec![Check::Diff]);
+        let named = format!(
+            "{head}[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nchecks = [\"nanna_clean\"]\n{diff_only}"
+        );
+        assert!(matches!(
+            ProjectConfig::parse(&named),
+            Err(ProjectError::UnknownCheck {
+                check: "nanna_clean",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_auditor_table_rejects_unknown_keys_and_plans_ignore_step_case() {
+        let unknown =
+            with("[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\nbogus = 1\n");
+        assert!(ProjectConfig::parse(&unknown).is_err());
+        let config = ProjectConfig::parse(&minimal()).unwrap();
+        let flow = &config.flow[0];
+        assert!(config.auditor().plan_for(flow, "IMPLEMENT").is_some());
+        assert!(config.auditor().plan_for(flow, "Research").is_some());
     }
 
     #[test]
@@ -557,7 +707,7 @@ mode = "draft_pr"
     #[test]
     fn each_step_gets_a_plan_and_overrides_win_for_that_step_only() {
         let text = with(
-            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"IMPLEMENT\"\nruns_in = { kind = \"host\" }\nchecks = [\"diff\"]\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"IMPLEMENT\"\nruns_in = { kind = \"nanna\", identity = \"second\" }\nchecks = [\"diff\"]\n",
         );
         let config = ProjectConfig::parse(&text).unwrap();
         let flow = &config.flow[0];
@@ -570,7 +720,12 @@ mode = "draft_pr"
         );
         assert_eq!(research.checks, vec![Check::Diff, Check::NannaClean]);
         let implement = config.auditor().plan_for(flow, "implement").unwrap();
-        assert_eq!(implement.runs_in, AuditorPlace::Host {});
+        assert_eq!(
+            implement.runs_in,
+            AuditorPlace::Nanna {
+                identity: "second".to_string()
+            }
+        );
         assert_eq!(implement.checks, vec![Check::Diff]);
         assert_eq!(config.auditor().plan_for(flow, "ghost"), None);
     }
@@ -578,14 +733,19 @@ mode = "draft_pr"
     #[test]
     fn an_override_that_names_no_checks_keeps_all_of_the_flows_judges() {
         let text = with(
-            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"host\" }\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"nanna\", identity = \"second\" }\n",
         );
         let config = ProjectConfig::parse(&text).unwrap();
         let plan = config
             .auditor()
             .plan_for(&config.flow[0], "implement")
             .unwrap();
-        assert_eq!(plan.runs_in, AuditorPlace::Host {});
+        assert_eq!(
+            plan.runs_in,
+            AuditorPlace::Nanna {
+                identity: "second".to_string()
+            }
+        );
         assert_eq!(plan.checks, vec![Check::Diff, Check::NannaClean]);
     }
 
@@ -749,7 +909,7 @@ mode = "draft_pr"
         let overrides = ["research", "implement"]
             .map(|step| {
                 format!(
-                    "[[auditor.step]]\nflow = \"issue\"\nstep = \"{step}\"\nruns_in = {{ kind = \"host\" }}\n"
+                    "[[auditor.step]]\nflow = \"issue\"\nstep = \"{step}\"\nruns_in = {{ kind = \"nanna\", identity = \"second\" }}\n"
                 )
             })
             .concat();

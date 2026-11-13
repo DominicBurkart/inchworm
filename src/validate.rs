@@ -215,8 +215,12 @@ pub fn validate(config: &GlobalConfig, path_var: Option<&OsStr>) -> Report {
 ///
 /// This is independent of `.nanna/protected.toml`: it is the check inchworm
 /// applies to a patch itself. Paths are normalised lexically, compared without
-/// regard to ASCII case (case-insensitive file systems), and a path that
-/// climbs out of the repository counts as touching it.
+/// regard to ASCII case (case-insensitive file systems), with trailing dots and
+/// spaces and `:stream` suffixes removed from each component (other file
+/// systems alias those names). A path that climbs out of the repository, is
+/// absolute (a leading separator or a drive letter) or contains NUL counts as
+/// touching it. Splitting a diff into paths (rename and copy headers, quoted
+/// names) is the caller's job.
 ///
 /// ```
 /// use inchworm::validate::protected_path_touched;
@@ -226,25 +230,46 @@ pub fn validate(config: &GlobalConfig, path_var: Option<&OsStr>) -> Report {
 /// assert_eq!(protected_path_touched(["src/lib.rs", "docs/inchworm.toml"]), None);
 /// ```
 pub fn protected_path_touched<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    paths.into_iter().find(|path| {
-        let mut parts: Vec<&str> = Vec::new();
-        for part in path.split(['/', '\\']) {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    if parts.pop().is_none() {
-                        return true;
-                    }
+    paths.into_iter().find(|path| path_is_protected(path))
+}
+
+fn component(part: &str) -> &str {
+    let stream = part.split(':').next().unwrap_or_default();
+    let spaced = stream.trim_end_matches(' ');
+    if spaced == ".." || spaced == "." {
+        spaced
+    } else {
+        spaced.trim_end_matches(['.', ' '])
+    }
+}
+
+fn path_is_protected(path: &str) -> bool {
+    if path.contains('\0') || path.starts_with(['/', '\\']) {
+        return true;
+    }
+    let mut chars = path.chars();
+    if let (Some(drive), Some(':')) = (chars.next(), chars.next())
+        && drive.is_ascii_alphabetic()
+    {
+        return true;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match component(part) {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return true;
                 }
-                other => parts.push(other),
             }
+            other => parts.push(other),
         }
-        match parts.as_slice() {
-            [first, ..] if first.eq_ignore_ascii_case(RUBRIC_DIR) => true,
-            [only] => only.eq_ignore_ascii_case(PROJECT_FILE),
-            _ => false,
-        }
-    })
+    }
+    match parts.as_slice() {
+        [first, ..] if first.eq_ignore_ascii_case(RUBRIC_DIR) => true,
+        [only] => only.eq_ignore_ascii_case(PROJECT_FILE),
+        _ => false,
+    }
 }
 
 fn is_git_repository(root: &Path) -> Result<(), &'static str> {
@@ -390,15 +415,6 @@ fn check_flows(repo: &RepoEntry, report: &mut Report) {
             return;
         }
     };
-    for (flow, step) in file.host_auditor_steps() {
-        report.push(
-            slug,
-            Severity::Error,
-            format!(
-                "flow `{flow}` step `{step}`: the auditor is set to run on the host, but no host check exists yet, so this step would run unaudited; use a nanna auditor"
-            ),
-        );
-    }
     for flow in &file.flow {
         if file.offramp.for_flow(&flow.name) == Offramp::Escalate {
             report.push(
@@ -1290,6 +1306,22 @@ mode = "draft_pr"
             "..",
             ".inchworm\\rubric.md",
             "//inchworm.toml",
+            "inchworm.toml.",
+            "inchworm.toml ",
+            "inchworm.toml...",
+            "inchworm.toml:stream",
+            "INCHWORM.TOML::$DATA",
+            ".inchworm./x",
+            ".inchworm /x",
+            "a/../.. /x",
+            ".. /inchworm.toml",
+            "a\0b",
+            "/repo/inchworm.toml",
+            "/etc/passwd",
+            "\\server\\share",
+            "C:/x",
+            "c:\\inchworm.toml",
+            "x:y/z",
         ] {
             assert_eq!(
                 protected_path_touched(["src/main.rs", touched]),
@@ -1305,6 +1337,8 @@ mode = "draft_pr"
             ".inchwormx/a",
             "a/.inchworm/b",
             "inchworm/inchworm.toml",
+            "docs/inchworm.toml:x",
+            "a/.inchworm./b",
             "",
         ] {
             assert_eq!(protected_path_touched([fine]), None, "{fine:?}");
@@ -1356,6 +1390,38 @@ mode = "draft_pr"
         );
         let report = run_with(&f, &as_default);
         assert!(has(&report, "silent skip"), "{:?}", messages(&report));
+    }
+
+    #[test]
+    fn the_moved_error_needs_a_missing_inchworm_toml_and_a_real_old_file() {
+        let f = fixture();
+        std::fs::remove_file(f.root.join("inchworm.toml")).unwrap();
+        std::fs::create_dir(f.root.join("inchworm.toml")).unwrap();
+        write(&f.root, ".inchworm/flows.toml", FLOWS);
+        let report = run(&f);
+        assert!(!has(&report, "has moved"), "{:?}", messages(&report));
+        assert!(
+            has(&report, "cannot read inchworm.toml"),
+            "{:?}",
+            messages(&report)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_old_flows_file_is_not_reported_as_moved() {
+        let f = fixture();
+        std::fs::remove_file(f.root.join("inchworm.toml")).unwrap();
+        let target = f.root.join("elsewhere.toml");
+        std::fs::write(&target, FLOWS).unwrap();
+        std::os::unix::fs::symlink(&target, f.root.join(".inchworm/flows.toml")).unwrap();
+        let report = run(&f);
+        assert!(!has(&report, "has moved"), "{:?}", messages(&report));
+        assert!(
+            has(&report, "cannot read inchworm.toml"),
+            "{:?}",
+            messages(&report)
+        );
     }
 
     #[test]

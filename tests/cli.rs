@@ -18,7 +18,7 @@ fn good_repo(root: &Path) {
     write(
         root,
         "inchworm.toml",
-        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
     );
     write(
         root,
@@ -166,4 +166,27 @@ fn list_exits_two_when_the_config_is_unreadable_and_prints_nothing_to_stdout() {
         .code(2)
         .stdout("")
         .stderr(predicate::str::contains("cannot read"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn list_to_a_full_device_exits_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    let config = config(dir.path(), &repo);
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_inchworm"))
+        .env_clear()
+        .args(["list", "--config"])
+        .arg(&config)
+        .stdout(full)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot write the list"));
 }

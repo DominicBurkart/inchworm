@@ -138,8 +138,28 @@ fn list_command(
         Ok(config) => config,
         Err(code) => return code,
     };
+    let bad: Vec<&str> = config
+        .repo
+        .iter()
+        .filter(|repo| {
+            repo.slug.chars().any(char::is_control)
+                || repo.path.to_string_lossy().chars().any(char::is_control)
+        })
+        .map(|repo| repo.slug.as_str())
+        .collect();
+    if !bad.is_empty() {
+        let _ = writeln!(
+            err,
+            "error: cannot list {:?}: a slug or path contains a control character",
+            bad
+        );
+        return EXIT_REPO_ERRORS;
+    }
     for repo in &config.repo {
-        let _ = writeln!(out, "{}\t{}", repo.slug, repo.path.display());
+        if let Err(error) = writeln!(out, "{}\t{}", repo.slug, repo.path.display()) {
+            let _ = writeln!(err, "error: cannot write the list: {error}");
+            return EXIT_UNUSABLE;
+        }
     }
     EXIT_VALID
 }
@@ -196,7 +216,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".nanna")).unwrap();
         std::fs::write(
             repo.join("inchworm.toml"),
-            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -300,6 +320,75 @@ mod tests {
         let (code, out, err) = exec(&["inchworm", "list", "--config", config], &Env::default());
         assert_eq!((code, err.as_str()), (0, ""));
         assert_eq!(out, format!("o/r\t{}\n", s.repo.display()));
+    }
+
+    fn two_repo_config(s: &Setup, second: &str) -> String {
+        let text = std::fs::read_to_string(&s.config).unwrap();
+        format!(
+            "{text}[[repo]]\nslug = \"o/second\"\npath = {}\n",
+            quoted(Path::new(second))
+        )
+    }
+
+    #[test]
+    fn list_prints_every_registered_directory_in_order() {
+        let s = setup();
+        let second = s.dir.path().join("second");
+        std::fs::write(&s.config, two_repo_config(&s, second.to_str().unwrap())).unwrap();
+        let (code, out, _) = exec(
+            &["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            format!(
+                "o/r\t{}\no/second\t{}\n",
+                s.repo.display(),
+                second.display()
+            )
+        );
+    }
+
+    #[test]
+    fn list_refuses_a_path_with_a_control_character_instead_of_breaking_the_line_format() {
+        let s = setup();
+        let bad = format!("{}/new\nline", s.dir.path().display());
+        std::fs::write(&s.config, two_repo_config(&s, &bad)).unwrap();
+        let (code, out, err) = exec(
+            &["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(
+            err.contains("control character") && err.contains("o/second"),
+            "{err}"
+        );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn list_reports_a_failed_write_and_does_not_exit_zero() {
+        let s = setup();
+        let mut err = Vec::new();
+        let code = run(
+            ["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+            &mut FailingWriter,
+            &mut err,
+        );
+        assert_eq!(code, 2);
+        assert!(String::from_utf8(err).unwrap().contains("disk full"));
     }
 
     #[test]
