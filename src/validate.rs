@@ -390,6 +390,15 @@ fn check_flows(repo: &RepoEntry, report: &mut Report) {
             return;
         }
     };
+    for (flow, step) in file.host_auditor_steps() {
+        report.push(
+            slug,
+            Severity::Error,
+            format!(
+                "flow `{flow}` step `{step}`: the auditor is set to run on the host, but no host check exists yet, so this step would run unaudited; use a nanna auditor"
+            ),
+        );
+    }
     for flow in &file.flow {
         if file.offramp.for_flow(&flow.name) == Offramp::Escalate {
             report.push(
@@ -1322,6 +1331,31 @@ mode = "draft_pr"
             messages(&report)
         );
         assert_eq!(report.error_count(), 1, "{:?}", messages(&report));
+    }
+
+    #[test]
+    fn a_step_whose_auditor_runs_on_the_host_is_an_error_until_a_host_check_exists() {
+        let f = fixture();
+        let per_step = FLOWS.replace(
+            "[[flow]]",
+            "[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"host\" }\n\n[[flow]]",
+        );
+        let report = run_with(&f, &per_step);
+        assert!(!report.is_ok());
+        assert!(
+            has(
+                &report,
+                "flow `issue` step `implement`: the auditor is set to run on the host"
+            ),
+            "{:?}",
+            messages(&report)
+        );
+        let as_default = FLOWS.replace(
+            "kind = \"nanna\", identity = \"auditor\"",
+            "kind = \"host\"",
+        );
+        let report = run_with(&f, &as_default);
+        assert!(has(&report, "silent skip"), "{:?}", messages(&report));
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub enum ProjectError {
     DuplicateAuditedStep { flow: String, step: String },
     #[error("[[auditor.step]] has {0} entries; at most {MAX_AUDITOR_STEP_OVERRIDES} are allowed")]
     TooManyAuditedSteps(usize),
+    #[error(
+        "[auditor] runs_in is host, but no host check exists yet, so a host default would be a silent skip of every auditor; use a nanna identity"
+    )]
+    HostAuditorDefault,
     #[error("auditor identity `{0}` is empty or invalid")]
     InvalidAuditorIdentity(String),
     #[error(
@@ -276,6 +280,20 @@ impl ProjectConfig {
             .expect("a validated ProjectConfig always has an auditor")
     }
 
+    pub fn host_auditor_steps(&self) -> Vec<(String, String)> {
+        let auditor = self.auditor();
+        self.flow
+            .iter()
+            .flat_map(|flow| flow.step.iter().map(move |step| (flow, step.name.as_str())))
+            .filter(|(flow, step)| {
+                auditor
+                    .plan_for(flow, step)
+                    .is_some_and(|plan| plan.runs_in == AuditorPlace::Host {})
+            })
+            .map(|(flow, step)| (flow.name.clone(), step.to_string()))
+            .collect()
+    }
+
     pub fn flow_file(&self) -> FlowFile {
         FlowFile {
             flow: self.flow.clone(),
@@ -285,6 +303,9 @@ impl ProjectConfig {
     pub fn validate(&self) -> Result<(), ProjectError> {
         self.flow_file().validate()?;
         let auditor = self.auditor.as_ref().ok_or(ProjectError::MissingAuditor)?;
+        if auditor.runs_in == (AuditorPlace::Host {}) {
+            return Err(ProjectError::HostAuditorDefault);
+        }
         for name in self.offramp.flow.keys() {
             if !self
                 .flow
@@ -419,7 +440,7 @@ mode = "draft_pr"
         assert_eq!(Offramp::default(), Offramp::Noop);
         assert_eq!(OfframpConfig::default().default, Offramp::Noop);
         let config = ProjectConfig::parse(&with(
-            "[offramp]\ndefault = \"issue\"\n[offramp.flow]\nissue = \"escalate\"\n[auditor]\nruns_in = { kind = \"host\" }\n",
+            "[offramp]\ndefault = \"issue\"\n[offramp.flow]\nissue = \"escalate\"\n[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n",
         ))
         .unwrap();
         assert_eq!(config.offramp.default, Offramp::Issue);
@@ -429,11 +450,13 @@ mode = "draft_pr"
 
     #[test]
     fn offramp_values_are_a_closed_set_and_flows_must_exist() {
-        let bad =
-            with("[offramp]\ndefault = \"page-me\"\n[auditor]\nruns_in = { kind = \"host\" }\n");
+        let bad = with(
+            "[offramp]\ndefault = \"page-me\"\n[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n",
+        );
         assert!(ProjectConfig::parse(&bad).is_err());
-        let ghost =
-            with("[offramp.flow]\nghost = \"issue\"\n[auditor]\nruns_in = { kind = \"host\" }\n");
+        let ghost = with(
+            "[offramp.flow]\nghost = \"issue\"\n[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n",
+        );
         assert!(error(&ghost).contains("`ghost`"));
     }
 
@@ -455,7 +478,7 @@ mode = "draft_pr"
             "[auditor]\nruns_in = { kind = \"host\", identity = \"x\" }\n",
             "[auditor]\nruns_in = { kind = \"nanna\", identity = \"a b\" }\n",
             "[auditor]\nruns_in = { kind = \"nanna\", identity = \"\" }\n",
-            "[auditor]\nruns_in = { kind = \"host\" }\non_failure = \"allow\"\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\non_failure = \"allow\"\n",
         ] {
             assert!(ProjectConfig::parse(&with(bad)).is_err(), "{bad}");
         }
@@ -464,14 +487,43 @@ mode = "draft_pr"
             "a".repeat(65)
         );
         assert!(error(&with(&long)).contains("invalid"));
-        assert!(ProjectConfig::parse(&with("[auditor]\nruns_in = { kind = \"host\" }\n")).is_ok());
+        assert!(
+            ProjectConfig::parse(&with(
+                "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_host_auditor_cannot_be_the_project_default() {
+        let text = with("[auditor]\nruns_in = { kind = \"host\" }\n");
+        assert!(matches!(
+            ProjectConfig::parse(&text),
+            Err(ProjectError::HostAuditorDefault)
+        ));
+        assert!(error(&text).contains("silent skip"));
+    }
+
+    #[test]
+    fn steps_whose_auditor_resolves_to_the_host_are_listed() {
+        let none = ProjectConfig::parse(&minimal()).unwrap();
+        assert!(none.host_auditor_steps().is_empty());
+        let text = with(
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"host\" }\n",
+        );
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(
+            config.host_auditor_steps(),
+            vec![("issue".to_string(), "implement".to_string())]
+        );
     }
 
     #[test]
     fn the_auditor_identity_rule_matches_the_step_identity_rule() {
         for identity in ["ok", "a-b_c.d", "a b", "", "é", "a/b"] {
             let step_text = format!(
-                "[auditor]\nruns_in = {{ kind = \"host\" }}\n{}",
+                "[auditor]\nruns_in = {{ kind = \"nanna\", identity = \"auditor\" }}\n{}",
                 FLOW.replace("rust-implementer", identity)
             );
             let auditor_text = with(&format!(
@@ -494,7 +546,7 @@ mode = "draft_pr"
             Err(ProjectError::SelfAudit { .. })
         ));
         let per_step = with(
-            "[auditor]\nruns_in = { kind = \"host\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"nanna\", identity = \"rust-implementer\" }\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"nanna\", identity = \"rust-implementer\" }\n",
         );
         assert!(matches!(
             ProjectConfig::parse(&per_step),
@@ -539,7 +591,7 @@ mode = "draft_pr"
 
     #[test]
     fn step_overrides_must_name_real_steps_and_real_checks_once() {
-        let head = "[auditor]\nruns_in = { kind = \"host\" }\n";
+        let head = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
         let ghost_step = with(&format!(
             "{head}[[auditor.step]]\nflow = \"issue\"\nstep = \"ghost\"\n"
         ));
@@ -577,7 +629,7 @@ mode = "draft_pr"
     #[test]
     fn there_is_no_way_to_skip_the_auditor_for_a_step() {
         let skip = with(
-            "[auditor]\nruns_in = { kind = \"host\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"none\" }\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\nruns_in = { kind = \"none\" }\n",
         );
         assert!(ProjectConfig::parse(&skip).is_err());
         let off = with("[auditor]\nenabled = false\nruns_in = { kind = \"host\" }\n");
@@ -631,7 +683,7 @@ mode = "draft_pr"
             "[flow.outcome]",
             "[flow.outcome]\nrequired_checks = [\"Tests\"]",
         );
-        let head = "[auditor]\nruns_in = { kind = \"host\" }\n";
+        let head = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
         assert!(matches!(
             ProjectConfig::parse(&format!("{head}{merge_flow}")),
             Err(ProjectError::MergeNotAllowed(name)) if name == "issue"
@@ -652,7 +704,7 @@ mode = "draft_pr"
 
     #[test]
     fn flow_errors_pass_through_unchanged_and_unknown_keys_are_rejected() {
-        let head = "[auditor]\nruns_in = { kind = \"host\" }\n";
+        let head = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
         assert!(error(head).contains("no flows"));
         assert!(error(&format!("{head}{}", FLOW.replace("400", "0"))).contains("max_lines"));
         assert!(ProjectConfig::parse(&format!("mystery = 1\n{head}{FLOW}")).is_err());
@@ -683,7 +735,7 @@ mode = "draft_pr"
     fn too_many_step_overrides_are_refused() {
         let entry = "[[auditor.step]]\nflow = \"issue\"\nstep = \"implement\"\n";
         let head = format!(
-            "[auditor]\nruns_in = {{ kind = \"host\" }}\n{}",
+            "[auditor]\nruns_in = {{ kind = \"nanna\", identity = \"auditor\" }}\n{}",
             entry.repeat(MAX_AUDITOR_STEP_OVERRIDES + 1)
         );
         assert!(matches!(
