@@ -6,26 +6,29 @@ A daemon and CLI for configuring fallible, repeated agentic processes on local m
 
 This is milestone 1 of an MVP: configuration, run state, a SQLite store and offline validation. It cannot run an agent yet.
 
-It was written from a planning conversation, not from the project's design. The design is issue [#1](https://github.com/DominicBurkart/inchworm/issues/1) and `DESIGN.md`, which exists only on the unmerged branch `ccr-a1899a5f-disb85`. Where the two differ, the design wins. The differences are tracked in issue [#6](https://github.com/DominicBurkart/inchworm/issues/6):
+It was written from a planning conversation, not from the project's design. The design is issue [#1](https://github.com/DominicBurkart/inchworm/issues/1) and `DESIGN.md`, which is now on `main`. Where the two differ, the design wins. The differences are tracked in issue [#6](https://github.com/DominicBurkart/inchworm/issues/6):
 
-- **D1, not met**: a directory is configured here by a global `[[repo]]` list plus `.inchworm/flows.toml`, not by a per-directory `inchworm.toml`; there is no `register`, `unregister` or `list`.
-- **D2, not met**: there are no offramps (`noop`, `issue`, `escalate`).
-- **D3, not met**: there are no per-step auditors; the model has judges after a run.
+- **D1, met except `register`/`unregister`**: a directory is configured by `inchworm.toml` at its root, and `inchworm list` prints the registered directories (one `slug<TAB>path` line each; it refuses a slug or path with a control character, and exits `2` if it cannot write). A directory is registered by adding a `[[repo]]` entry to the global config by hand; `register` and `unregister` are a documented non-goal for now because editing the config without losing its comments needs a TOML-editing dependency. The old `.inchworm/flows.toml` is no longer read: `validate` reports that it moved.
+- **D2, configuration only**: `[offramp]` accepts `noop`, `issue` and `escalate` with a default and per-flow values, validated, but nothing executes an offramp yet.
+- **D3, configuration only**: `[auditor]` is mandatory, says where the auditor runs and fails closed, but nothing runs an auditor yet. The judges after a run remain.
 - **D4, partial**: only the issue-to-draft-PR journey exists. The tagged `trigger` is the extension point for the CI-failure and merge-conflict journeys; any other `kind` is rejected with an "unknown variant" error.
 - **D5, not addressed**: the marigold/Rust control-flow split and the fate of the prototype branch are undecided.
-- **D6, not met**: `DESIGN.md` is not on `main`.
+- **D6, met**: `DESIGN.md` is on `main` with a table mapping each concept to where it is implemented.
 
 Everything below describes what this code does today.
 
 ## Merging has no default
 
-A flow must state its outcome: `outcome` and `outcome.mode` are required and have no default. `merge_when` exists as a mode and is validated, but no shipped example uses it, and `inchworm validate` warns when a flow turns it on. The intended direction is that merging becomes a capability a user grants to a nanna subagent or another agent, with the user defining when and how (nanna-coder issue 1043). Do not enable `merge_when` in a real repository.
+A flow must state its outcome: `outcome` and `outcome.mode` are required and have no default. `merge_when` exists as a mode and is validated, but no shipped example uses it, and `inchworm validate` warns when a flow turns it on. The intended direction is that merging becomes a capability a user grants to a nanna subagent or another agent, with the user defining when and how (nanna-coder issue 1043). Whether merging is possible at all is one switch, `[merge] allow` in `inchworm.toml`, which is `false` unless set. With it `false` a flow in `merge_when` mode is a configuration error, not a warning. `MergeConfig::grant` maps it to `MergeGrantSetting::Denied` or `Granted`, the one place the later policy code reads. Do not enable `merge_when` in a real repository.
 
 ## Commands
 
 ```
 inchworm validate [--config PATH]
+inchworm list [--config PATH]
 ```
+
+`list` prints one line per registered directory, the slug and the path separated by a tab, and exits `0`, or `2` when the config cannot be found, read or parsed.
 
 Exit codes:
 
@@ -38,14 +41,15 @@ Exit codes:
 For the global config it checks that `nanna_bin` is an executable file or, for a bare name, that it is on `PATH`. For every repository it checks:
 
 - the path is a git repository (a `.git` file or symlink must lead to a gitdir that exists)
-- `.inchworm/flows.toml` passes the flow rules below
+- `inchworm.toml` at the repository root passes the rules below; if only the old `.inchworm/flows.toml` exists, that is an error saying it moved
 - every `llm` judge rubric exists and is a regular file inside `.inchworm/`
-- `.nanna/protected.toml` follows nanna's entry rules and lists `.inchworm/**`. Its only key is `extra`, for example `extra = [".inchworm/**", "scripts/deploy.sh"]`; any other key (such as `entries`) is rejected as an unknown key
+- `.inchworm` is not a symlink
+- `.nanna/protected.toml` follows nanna's entry rules and lists both `inchworm.toml` and `.inchworm/**`, so agents can change neither the configuration nor the rubrics. Its only key is `extra`, for example `extra = ["inchworm.toml", ".inchworm/**", "scripts/deploy.sh"]`; any other key (such as `entries`) is rejected as an unknown key
 - `.nanna/prompt.md` exists (a warning only)
 
-The repo-controlled files above (`.inchworm`, `.nanna` and everything read from them) are read only if no component of the path under the repository root is a symlink at the time of the check, each is a regular file, and each is read with a size cap: 256 KiB for `flows.toml`, 64 KiB for `protected.toml`, 4 KiB for a `.git` file. The symlink check is a walk of the path before the read, and only the final component is opened without following symlinks, so a directory swapped for a symlink between the walk and the read is not prevented. The global config may itself be a symlink (for example from home-manager), but must resolve to a regular file of at most 256 KiB.
+The repo-controlled files above (`.inchworm`, `.nanna` and everything read from them) are read only if no component of the path under the repository root is a symlink at the time of the check, each is a regular file, and each is read with a size cap: 256 KiB for `inchworm.toml`, 64 KiB for `protected.toml`, 4 KiB for a `.git` file. The symlink check is a walk of the path before the read, and only the final component is opened without following symlinks, so a directory swapped for a symlink between the walk and the read is not prevented. The global config may itself be a symlink (for example from home-manager), but must resolve to a regular file of at most 256 KiB.
 
-What a passing `validate` proves: the files inchworm reads are well formed, `.inchworm/**` is declared protected, and nothing it reads escapes the repository through a symlink. The `protected.toml` check mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` as of nanna-coder commit `239a1c94`; it does not run nanna's code, so a later change there is not tracked. It does not prove that identities named in flows exist, that labels exist, or that branch protection matches `required_checks`; those online checks are not built yet.
+What a passing `validate` proves: the files inchworm reads are well formed, `inchworm.toml` and `.inchworm/**` are declared protected, and nothing it reads escapes the repository through a symlink. The `protected.toml` check mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` as of nanna-coder commit `239a1c94`; it does not run nanna's code, so a later change there is not tracked. It does not prove that identities named in flows exist, that labels exist, or that branch protection matches `required_checks`; those online checks are not built yet.
 
 ## Global config
 
@@ -67,9 +71,50 @@ path = "~/code/marigold"
 - Repo slugs are `owner/name` (case-insensitively unique), and no two repos may share a path.
 - Unknown keys are rejected everywhere.
 
+## Project file
+
+`inchworm.toml` at the root of each registered directory holds `[[flow]]` tables (below) and three more: `[offramp]`, `[auditor]` and `[merge]`. A complete minimal file:
+
+```toml
+[auditor]
+runs_in = { kind = "nanna", identity = "auditor" }
+
+[[flow]]
+name = "issue"
+trigger = { kind = "label", label = "inchworm" }
+
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+
+[[flow.judge]]
+kind = "nanna_clean"
+
+[flow.outcome]
+mode = "draft_pr"
+```
+
+### Offramps
+
+`[offramp] default` is what happens when a flow falls off its path: `noop` (the default when the key is omitted), `issue` or `escalate`. `[offramp.flow]` overrides it per flow, by flow name; names are compared ignoring ASCII case when validating and when looking up, a name that is not a flow is an error, and two names that differ only in case are an error. No offramp executes yet. `issue` is meant to reuse nanna's escalation sink (an open question in `DESIGN.md`, not built). `escalate` would hand the work to a frontier agent; it is the only setting that can leave local models, so it must be named explicitly and `validate` warns on it. It is not implemented: nothing is handed anywhere.
+
+### Auditors
+
+`[auditor]` is required, and a file without it is an error: every agent step needs an auditor and there is no default. `runs_in` says where the auditor runs: `{ kind = "nanna", identity = "..." }` (a nanna sub-agent) or `{ kind = "host" }` (deterministic checks, no model). The host place is reserved and unusable: no host check exists, so `host` is a parse error, both as the project default (a default that cannot run would silently skip every auditor) and as a per-step override (the error names the flow and step). Every step must also have at least one check: a flow with no judges, and no named checks, is an error rather than an auditor that verifies nothing. `[[auditor.step]]` entries pick another place and a subset of the flow's judges (`checks = ["diff", "nanna_clean", "llm"]`) for one step of one flow; every other step uses the default and all of the flow's judges. In `[[auditor.step]]`, `checks = []` (or no `checks` key) means all of the flow's judges, not none; a step always has at least one check. A nanna auditor may not have the identity of the step it audits. There is no setting that skips an auditor. `on_failure` accepts only `block`: `AuditorConfig::decide` turns an auditor that errored into a halt of the step. Nothing runs an auditor yet. A model auditor is not a safety gate (nanna's own scorecard for it fails the zero-false-allow bar); safety rests on container isolation, the protected-path list and draft PRs.
+
+### Protected paths
+
+`validate::protected_path_touched` is the check inchworm applies to a patch itself. It refuses a path that is, or lies under, `inchworm.toml` or `.inchworm/` at the repository root, after this normalisation, and nothing else:
+
+- handled: `./` and empty components, `..` segments (a path that climbs out of the repository is refused), `/` and `\` as separators, ASCII case, trailing dots and spaces on a component, and `:stream` suffixes on a component. Also refused outright: NUL, a leading `/` or `\`, and a drive letter prefix (`C:`).
+- not handled: Windows 8.3 short names (`INCHWO~1.TOM`), other whitespace such as tab or no-break space, Unicode look-alike characters (confusables) and Unicode normalisation or case folding beyond ASCII, symlinks and hard links (the path is compared as text and no file system is read), and a path below another directory such as `docs/inchworm.toml` or `sub/.inchworm/x` (the policy covers the repository root; see issue #26).
+- not done here: turning a diff into paths (rename and copy headers, quoted names) is the caller's job and is not done or tested.
+
+It is stricter than a POSIX path comparison on purpose, because a blocklist errs on the safe side, but it is not a complete defence against every alias; the protected-path list in `.nanna/protected.toml` and draft pull requests are the other layers. Nothing calls it on a real patch yet.
+
 ## Flows
 
-`.inchworm/flows.toml` in each repository:
+The `[[flow]]` tables of `inchworm.toml`:
 
 ```toml
 [[flow]]

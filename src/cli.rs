@@ -64,6 +64,11 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// List the registered directories (slug, then path, tab separated).
+    List {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// Runs the CLI and returns the process exit code: 0 when everything is
@@ -98,15 +103,15 @@ where
     };
     match cli.command {
         Command::Validate { config } => validate_command(config, env, out, err),
+        Command::List { config } => list_command(config, env, out, err),
     }
 }
 
-fn validate_command(
+fn load_config(
     config: Option<PathBuf>,
     env: &Env,
-    out: &mut dyn Write,
     err: &mut dyn Write,
-) -> u8 {
+) -> Result<GlobalConfig, u8> {
     let path = config.or_else(|| {
         GlobalConfig::default_path(env.xdg_config_home.as_deref(), env.home.as_deref())
     });
@@ -115,14 +120,59 @@ fn validate_command(
             err,
             "error: cannot find the config: pass --config, or set XDG_CONFIG_HOME or HOME"
         );
-        return EXIT_UNUSABLE;
+        return Err(EXIT_UNUSABLE);
     };
-    let config = match GlobalConfig::load(&path, env.home.as_deref()) {
+    GlobalConfig::load(&path, env.home.as_deref()).map_err(|error| {
+        let _ = writeln!(err, "error: {error}");
+        EXIT_UNUSABLE
+    })
+}
+
+fn list_command(
+    config: Option<PathBuf>,
+    env: &Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let config = match load_config(config, env, err) {
         Ok(config) => config,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
+        Err(code) => return code,
+    };
+    let bad: Vec<&str> = config
+        .repo
+        .iter()
+        .filter(|repo| {
+            repo.slug.chars().any(char::is_control)
+                || repo.path.to_string_lossy().chars().any(char::is_control)
+        })
+        .map(|repo| repo.slug.as_str())
+        .collect();
+    if !bad.is_empty() {
+        let _ = writeln!(
+            err,
+            "error: cannot list {:?}: a slug or path contains a control character",
+            bad
+        );
+        return EXIT_REPO_ERRORS;
+    }
+    for repo in &config.repo {
+        if let Err(error) = writeln!(out, "{}\t{}", repo.slug, repo.path.display()) {
+            let _ = writeln!(err, "error: cannot write the list: {error}");
             return EXIT_UNUSABLE;
         }
+    }
+    EXIT_VALID
+}
+
+fn validate_command(
+    config: Option<PathBuf>,
+    env: &Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let config = match load_config(config, env, err) {
+        Ok(config) => config,
+        Err(code) => return code,
     };
     let report = validate(&config, env.path.as_deref());
     let _ = write!(out, "{}", report.render());
@@ -165,13 +215,13 @@ mod tests {
         std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
         std::fs::create_dir_all(repo.join(".nanna")).unwrap();
         std::fs::write(
-            repo.join(".inchworm/flows.toml"),
-            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+            repo.join("inchworm.toml"),
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
         )
         .unwrap();
         std::fs::write(
             repo.join(".nanna/protected.toml"),
-            "extra = [\".inchworm/**\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
         )
         .unwrap();
         std::fs::write(repo.join(".nanna/prompt.md"), "prompt").unwrap();
@@ -261,6 +311,99 @@ mod tests {
         );
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("invalid config"), "{err}");
+    }
+
+    #[test]
+    fn list_prints_each_registered_directory_and_nothing_else() {
+        let s = setup();
+        let config = s.config.to_str().unwrap();
+        let (code, out, err) = exec(&["inchworm", "list", "--config", config], &Env::default());
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, format!("o/r\t{}\n", s.repo.display()));
+    }
+
+    fn two_repo_config(s: &Setup, second: &str) -> String {
+        let text = std::fs::read_to_string(&s.config).unwrap();
+        format!(
+            "{text}[[repo]]\nslug = \"o/second\"\npath = {}\n",
+            quoted(Path::new(second))
+        )
+    }
+
+    #[test]
+    fn list_prints_every_registered_directory_in_order() {
+        let s = setup();
+        let second = s.dir.path().join("second");
+        std::fs::write(&s.config, two_repo_config(&s, second.to_str().unwrap())).unwrap();
+        let (code, out, _) = exec(
+            &["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            format!(
+                "o/r\t{}\no/second\t{}\n",
+                s.repo.display(),
+                second.display()
+            )
+        );
+    }
+
+    #[test]
+    fn list_refuses_a_path_with_a_control_character_instead_of_breaking_the_line_format() {
+        let s = setup();
+        let bad = format!("{}/new\nline", s.dir.path().display());
+        std::fs::write(&s.config, two_repo_config(&s, &bad)).unwrap();
+        let (code, out, err) = exec(
+            &["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(
+            err.contains("control character") && err.contains("o/second"),
+            "{err}"
+        );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn list_reports_a_failed_write_and_does_not_exit_zero() {
+        let s = setup();
+        let mut err = Vec::new();
+        let code = run(
+            ["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+            &mut FailingWriter,
+            &mut err,
+        );
+        assert_eq!(code, 2);
+        assert!(String::from_utf8(err).unwrap().contains("disk full"));
+    }
+
+    #[test]
+    fn list_reports_an_unusable_config_like_validate_does() {
+        let s = setup();
+        let missing = s.dir.path().join("missing.toml");
+        let (code, out, err) = exec(
+            &["inchworm", "list", "--config", missing.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert!(err.contains("cannot read"), "{err}");
+        let (code, out, err) = exec(&["inchworm", "list"], &Env::default());
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert!(err.contains("XDG_CONFIG_HOME or HOME"), "{err}");
     }
 
     #[test]
