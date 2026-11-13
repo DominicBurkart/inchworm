@@ -414,7 +414,7 @@ const LOCK_ATTEMPTS: usize = 3;
 fn sidecar_path(database: &Path) -> PathBuf {
     let mut name = std::ffi::OsString::from(".");
     name.push(database.file_name().unwrap_or_default());
-    name.push(".inchworm-lock");
+    name.push(LOCK_SUFFIX);
     database.with_file_name(name)
 }
 
@@ -477,8 +477,55 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
 fn is_file_uri(path: &Path) -> bool {
-    path.to_str().is_some_and(|text| text.starts_with("file:"))
+    path_bytes(path).starts_with(b"file:")
+}
+
+const LOCK_SUFFIX: &str = ".inchworm-lock";
+const MAX_LOCKABLE_NAME: usize = 255 - 1 - LOCK_SUFFIX.len();
+
+fn unlockable_reason(path: &Path) -> Option<&'static str> {
+    if is_file_uri(path) {
+        return Some(
+            "a file: URI cannot be resolved to one database file to lock; pass a plain path",
+        );
+    }
+    let name = path
+        .file_name()
+        .map(|name| path_bytes(Path::new(name)).into_owned())
+        .unwrap_or_default();
+    if name.len() > MAX_LOCKABLE_NAME {
+        return Some(
+            "the database file name is longer than 240 bytes, so its lock file name would exceed the 255-byte file name limit",
+        );
+    }
+    if name.starts_with(b".") && name.ends_with(LOCK_SUFFIX.as_bytes()) {
+        return Some(
+            "a database file name that starts with '.' and ends with '.inchworm-lock' collides with the lock file of another database; rename it",
+        );
+    }
+    None
+}
+
+fn refuse_unlockable(path: &Path) -> Result<(), StoreError> {
+    match unlockable_reason(path) {
+        None => Ok(()),
+        Some(reason) => Err(StoreError::LockIo {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
+        }),
+    }
 }
 
 fn is_in_memory(path: &Path) -> bool {
@@ -525,15 +572,7 @@ impl DaemonLock {
         if is_in_memory(db_path) {
             return Err(StoreError::RecoveryNeedsFileStore);
         }
-        if is_file_uri(db_path) {
-            return Err(StoreError::LockIo {
-                path: db_path.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "a file: URI cannot be resolved to one database file to lock; pass a plain path",
-                ),
-            });
-        }
+        refuse_unlockable(db_path)?;
         let mut database = canonical_db_path(db_path).map_err(|source| StoreError::LockIo {
             path: db_path.to_path_buf(),
             source,
@@ -544,6 +583,7 @@ impl DaemonLock {
             #[cfg(not(unix))]
             let inode_lock: Option<File> = None;
             database = canonical_db_path(&database).unwrap_or(database);
+            refuse_unlockable(&database)?;
             let side = sidecar_path(&database);
             let path_lock = open_for_lock(&side)?;
             lock_exclusive(&path_lock, &side, &database)?;
@@ -749,8 +789,11 @@ impl Store {
         path: &Path,
         timeout: Duration,
     ) -> Result<Store, StoreError> {
-        let conn = Connection::open(path)?;
         let in_memory = is_in_memory(path);
+        if !in_memory {
+            refuse_unlockable(path)?;
+        }
+        let conn = Connection::open(path)?;
         let mut store = Store::from_connection(conn, !in_memory, timeout)?;
         if !in_memory {
             let canonical = canonical_db_path(path).unwrap_or_else(|_| path.to_path_buf());
@@ -3049,20 +3092,91 @@ CREATE TABLE attempts (
         );
     }
 
+    fn assert_unlockable(path: &Path, needle: &str) {
+        match DaemonLock::acquire(path) {
+            Err(StoreError::LockIo { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(source.to_string().contains(needle), "{source}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn removing_a_lock_side_file_does_not_let_a_second_holder_in() {
+    fn a_non_utf8_file_uri_is_refused_like_any_other_file_uri() {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("state.db");
-        let first = DaemonLock::acquire(&db).unwrap();
-        let mut side = first.database().as_os_str().to_owned();
-        side.push(".daemon.lock");
-        let _ = std::fs::remove_file(PathBuf::from(side));
+        for raw in [&b"file:y.db\xff"[..], &b"file:\xff.db"[..]] {
+            let path = Path::new(std::ffi::OsStr::from_bytes(raw));
+            assert!(is_file_uri(path));
+            assert_unlockable(path, "file: URI");
+            assert!(Store::open(path).is_err());
+        }
+        let plain = dir.path().join(std::ffi::OsStr::from_bytes(b"y\xff.db"));
+        let first = DaemonLock::acquire(&plain).unwrap();
         assert!(matches!(
-            DaemonLock::acquire(&db),
+            DaemonLock::acquire(&plain),
             Err(StoreError::AlreadyRunning(_))
         ));
         drop(first);
-        acquire_after_release(&db);
+    }
+
+    #[test]
+    fn opening_a_file_uri_fails_before_creating_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("file:{}", dir.path().join("x.db").display());
+        let err = Store::open(Path::new(&uri)).err().unwrap();
+        assert!(matches!(err, StoreError::LockIo { .. }), "{err}");
+        assert!(!dir.path().join("x.db").exists());
+    }
+
+    #[test]
+    fn a_database_named_like_another_databases_lock_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = DaemonLock::acquire(&dir.path().join("l.db")).unwrap();
+        let clash = dir.path().join(".l.db.inchworm-lock");
+        assert_unlockable(&clash, "collides");
+        assert!(Store::open(&clash).is_err());
+        drop(held);
+        assert_unlockable(&clash, "collides");
+        assert!(DaemonLock::acquire(&dir.path().join("l.db")).is_ok());
+    }
+
+    #[test]
+    fn only_a_dotted_name_ending_in_the_lock_suffix_collides() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["l.db.inchworm-lock", ".inchworm-lockx", "inchworm-lock"] {
+            let held = DaemonLock::acquire(&dir.path().join(name)).unwrap();
+            drop(held);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_an_unlockable_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(dir.path().join(".l.db.inchworm-lock"), &link).unwrap();
+        assert_unlockable(&link, "collides");
+        let long = dir.path().join("a".repeat(MAX_LOCKABLE_NAME + 1));
+        std::fs::write(&long, b"").unwrap();
+        let link2 = dir.path().join("link2.db");
+        std::os::unix::fs::symlink(&long, &link2).unwrap();
+        assert_unlockable(&link2, "240 bytes");
+    }
+
+    #[test]
+    fn database_names_up_to_the_lock_file_name_limit_work_and_longer_ones_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let longest = dir.path().join("a".repeat(MAX_LOCKABLE_NAME));
+        let held = DaemonLock::acquire(&longest).unwrap();
+        assert!(sidecar_path(held.database()).file_name().unwrap().len() <= 255);
+        drop(held);
+        let too_long = dir.path().join("a".repeat(MAX_LOCKABLE_NAME + 1));
+        assert_unlockable(&too_long, "240 bytes");
+        assert!(Store::open(&too_long).is_err());
+        assert!(!too_long.exists());
     }
 
     #[cfg(unix)]
