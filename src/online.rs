@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{FlowFile, GlobalConfig, RepoEntry, Trigger};
+use crate::config::{FlowFile, GlobalConfig, PROJECT_FILE, ProjectConfig, RepoEntry, Trigger};
 use crate::exec::{CmdSpec, Runner, SystemRunner};
 use crate::github::GitHub;
 use crate::validate::{Report, Severity, validate};
@@ -205,12 +205,13 @@ fn required_labels(file: &FlowFile) -> BTreeSet<String> {
 
 fn check_repo_online(repo: &RepoEntry, online: &Online<'_>, report: &mut Report) {
     let slug = Some(repo.slug.as_str());
-    let Ok(text) = std::fs::read_to_string(repo.path.join(".inchworm/flows.toml")) else {
+    let Ok(text) = std::fs::read_to_string(repo.path.join(PROJECT_FILE)) else {
         return;
     };
-    let Ok(file) = FlowFile::parse(&text) else {
+    let Ok(project) = ProjectConfig::parse(&text) else {
         return;
     };
+    let file = project.flow_file();
 
     match online.catalog.identities(&repo.path) {
         Ok(known) => {
@@ -286,6 +287,8 @@ mod tests {
     use std::cell::RefCell;
 
     const FLOWS: &str = r#"
+[auditor]
+runs_in = { kind = "nanna", identity = "auditor" }
 [[flow]]
 name = "issue"
 trigger = { kind = "label", label = "inchworm" }
@@ -295,6 +298,8 @@ identity = "rust-implementer"
 [[flow.step]]
 name = "publish"
 identity = "pr-shepherd"
+[[flow.judge]]
+kind = "nanna_clean"
 [flow.outcome]
 mode = "draft_pr"
 "#;
@@ -359,10 +364,10 @@ mode = "draft_pr"
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join(".inchworm")).unwrap();
         std::fs::create_dir_all(dir.join(".nanna")).unwrap();
-        std::fs::write(dir.join(".inchworm/flows.toml"), FLOWS).unwrap();
+        std::fs::write(dir.join("inchworm.toml"), FLOWS).unwrap();
         std::fs::write(
             dir.join(".nanna/protected.toml"),
-            "extra = [\".inchworm/**\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
         )
         .unwrap();
         std::fs::write(dir.join(".nanna/prompt.md"), "p").unwrap();
@@ -552,9 +557,9 @@ mode = "draft_pr"
     fn a_custom_trigger_label_must_exist_too() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let flows = std::fs::read_to_string(dir.path().join(".inchworm/flows.toml")).unwrap();
+        let flows = std::fs::read_to_string(dir.path().join("inchworm.toml")).unwrap();
         std::fs::write(
-            dir.path().join(".inchworm/flows.toml"),
+            dir.path().join("inchworm.toml"),
             flows.replace("label = \"inchworm\"", "label = \"queue-me\""),
         )
         .unwrap();
@@ -655,7 +660,7 @@ mode = "draft_pr"
     fn repos_with_unusable_flows_are_left_to_the_offline_checks() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        std::fs::write(dir.path().join(".inchworm/flows.toml"), "garbage = [").unwrap();
+        std::fs::write(dir.path().join("inchworm.toml"), "garbage = [").unwrap();
         let catalog = Catalog(Err("never asked"));
         let github = FakeGitHub::new();
         let online = Online {
@@ -665,7 +670,7 @@ mode = "draft_pr"
         };
         let report = validate_online(&config, &online, None);
         assert!(messages(&report).iter().all(|m| !m.contains("never asked")));
-        std::fs::remove_file(dir.path().join(".inchworm/flows.toml")).unwrap();
+        std::fs::remove_file(dir.path().join("inchworm.toml")).unwrap();
         assert!(!validate_online(&config, &online, None).is_ok());
     }
 

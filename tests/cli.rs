@@ -17,13 +17,13 @@ fn good_repo(root: &Path) {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         root,
-        ".inchworm/flows.toml",
-        "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        "inchworm.toml",
+        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
     );
     write(
         root,
         ".nanna/protected.toml",
-        "extra = [\".inchworm/**\"]\n",
+        "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
     );
     write(root, ".nanna/prompt.md", "prompt");
 }
@@ -368,7 +368,7 @@ fn run_fails_cleanly_when_nanna_cannot_start_or_flows_are_missing() {
         .assert()
         .code(2)
         .stderr(predicates_contains("cannot start"));
-    std::fs::remove_file(fakes.repo.join(".inchworm/flows.toml")).unwrap();
+    std::fs::remove_file(fakes.repo.join("inchworm.toml")).unwrap();
     inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
@@ -510,4 +510,41 @@ fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
         !fakes.dir.path().join("state/nanna").exists(),
         "a refused run must not start nanna or leave its state files"
     );
+}
+
+#[test]
+fn list_prints_one_tab_separated_line_per_registered_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    let config = config(dir.path(), &repo);
+    inchworm()
+        .args(["list", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(format!("o/r\t{}\n", repo.display()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn list_to_a_full_device_exits_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    let config = config(dir.path(), &repo);
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_inchworm"))
+        .env_clear()
+        .args(["list", "--config"])
+        .arg(&config)
+        .stdout(full)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot write the list"));
 }

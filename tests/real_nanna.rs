@@ -321,12 +321,12 @@ mod validate_online_against_the_real_nanna {
         let repo = root.join("target-repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         write(
-            &repo.join(".inchworm/flows.toml"),
-            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+            &repo.join("inchworm.toml"),
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
         );
         write(
             &repo.join(".nanna/protected.toml"),
-            "extra = [\".inchworm/**\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
         );
         write(&repo.join(".nanna/prompt.md"), "prompt");
         let bin_dir = root.join("fake-bin");

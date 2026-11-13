@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
-use crate::config::{FlowFile, GlobalConfig, RepoEntry};
+use crate::config::{GlobalConfig, PROJECT_FILE, ProjectConfig, RepoEntry};
 use crate::github::GhCli;
 use crate::model::RunState;
 use crate::nanna_client::{NannaClient, SpawnOptions, state_dir_for};
@@ -71,29 +71,40 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Debug, Args)]
+pub struct ValidateArgs {
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub online: bool,
+    #[arg(
+        long,
+        help = "Also build each repository's devContainerImage with nix (implies --online). \
+                This evaluates the repository's own Nix code on this machine; use it only on repositories you trust."
+    )]
+    pub build_images: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    pub repo: String,
+    pub issue: u64,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub flow: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Check the global config and every registered repository.
-    Validate {
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        online: bool,
-        #[arg(
-            long,
-            help = "Also build each repository's devContainerImage with nix (implies --online). \
-                    This evaluates the repository's own Nix code on this machine; use it only on repositories you trust."
-        )]
-        build_images: bool,
-    },
+    Validate(ValidateArgs),
     /// Run one flow for one issue in the foreground.
-    Run {
-        repo: String,
-        issue: u64,
+    Run(RunArgs),
+    /// List the registered directories (slug, then path, tab separated).
+    List {
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
-        flow: Option<String>,
     },
 }
 
@@ -128,32 +139,35 @@ where
         }
     };
     match cli.command {
-        Command::Validate {
-            config,
-            online,
-            build_images,
-        } => validate_command(config, online, build_images, env, out, err),
-        Command::Run {
-            repo,
-            issue,
-            config,
-            flow,
-        } => {
-            let loaded = match load_config(config, env) {
-                Ok(config) => config,
-                Err(code) => {
-                    let _ = writeln!(err, "error: {code}");
-                    return EXIT_UNUSABLE;
-                }
-            };
-            match run_command(loaded, env, &repo, issue, flow.as_deref(), out) {
-                Ok(true) => EXIT_VALID,
-                Ok(false) => EXIT_REPO_ERRORS,
-                Err(error) => {
-                    let _ = writeln!(err, "error: {error:#}");
-                    EXIT_UNUSABLE
-                }
-            }
+        Command::Validate(args) => {
+            validate_command(args.config, args.online, args.build_images, env, out, err)
+        }
+        Command::List { config } => list_command(config, env, out, err),
+        Command::Run(args) => run_entry(args, env, out, err),
+    }
+}
+
+fn run_entry(args: RunArgs, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let loaded = match load_config(args.config, env) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return EXIT_UNUSABLE;
+        }
+    };
+    match run_command(
+        loaded,
+        env,
+        &args.repo,
+        args.issue,
+        args.flow.as_deref(),
+        out,
+    ) {
+        Ok(true) => EXIT_VALID,
+        Ok(false) => EXIT_REPO_ERRORS,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error:#}");
+            EXIT_UNUSABLE
         }
     }
 }
@@ -170,6 +184,45 @@ fn load_config(config: Option<PathBuf>, env: &Env) -> std::result::Result<Global
         );
     };
     GlobalConfig::load(&path, env.home.as_deref()).map_err(|error| error.to_string())
+}
+
+fn list_command(
+    config: Option<PathBuf>,
+    env: &Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let config = match load_config(config, env) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return EXIT_UNUSABLE;
+        }
+    };
+    let bad: Vec<&str> = config
+        .repo
+        .iter()
+        .filter(|repo| {
+            repo.slug.chars().any(char::is_control)
+                || repo.path.to_string_lossy().chars().any(char::is_control)
+        })
+        .map(|repo| repo.slug.as_str())
+        .collect();
+    if !bad.is_empty() {
+        let _ = writeln!(
+            err,
+            "error: cannot list {:?}: a slug or path contains a control character",
+            bad
+        );
+        return EXIT_REPO_ERRORS;
+    }
+    for repo in &config.repo {
+        if let Err(error) = writeln!(out, "{}\t{}", repo.slug, repo.path.display()) {
+            let _ = writeln!(err, "error: cannot write the list: {error}");
+            return EXIT_UNUSABLE;
+        }
+    }
+    EXIT_VALID
 }
 
 fn validate_command(
@@ -209,11 +262,12 @@ fn validate_command(
 }
 
 fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEntry> {
-    config
-        .repo
-        .iter()
-        .find(|repo| repo.slug == selector || repo.path == Path::new(selector))
-        .ok_or_else(|| anyhow!("repo `{selector}` is not in the config"))
+    for repo in &config.repo {
+        if repo.slug == selector || repo.path == Path::new(selector) {
+            return Ok(repo);
+        }
+    }
+    Err(anyhow!("repo `{selector}` is not in the config"))
 }
 
 fn now() -> i64 {
@@ -246,10 +300,10 @@ fn run_command(
     out: &mut dyn Write,
 ) -> Result<bool> {
     let repo = find_repo(&config, selector)?;
-    let flows_path = repo.path.join(".inchworm/flows.toml");
+    let flows_path = repo.path.join(PROJECT_FILE);
     let text = std::fs::read_to_string(&flows_path)
         .with_context(|| format!("cannot read {}", flows_path.display()))?;
-    let file = FlowFile::parse(&text)?;
+    let file = ProjectConfig::parse(&text)?;
     let selected = match flow {
         Some(name) => file.flow.iter().find(|f| f.name == name),
         None => file.flow.first(),
@@ -343,13 +397,13 @@ mod tests {
         std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
         std::fs::create_dir_all(repo.join(".nanna")).unwrap();
         std::fs::write(
-            repo.join(".inchworm/flows.toml"),
-            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+            repo.join("inchworm.toml"),
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
         )
         .unwrap();
         std::fs::write(
             repo.join(".nanna/protected.toml"),
-            "extra = [\".inchworm/**\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
         )
         .unwrap();
         std::fs::write(repo.join(".nanna/prompt.md"), "prompt").unwrap();
@@ -439,6 +493,99 @@ mod tests {
         );
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("invalid config"), "{err}");
+    }
+
+    #[test]
+    fn list_prints_each_registered_directory_and_nothing_else() {
+        let s = setup();
+        let config = s.config.to_str().unwrap();
+        let (code, out, err) = exec(&["inchworm", "list", "--config", config], &Env::default());
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, format!("o/r\t{}\n", s.repo.display()));
+    }
+
+    fn two_repo_config(s: &Setup, second: &str) -> String {
+        let text = std::fs::read_to_string(&s.config).unwrap();
+        format!(
+            "{text}[[repo]]\nslug = \"o/second\"\npath = {}\n",
+            quoted(Path::new(second))
+        )
+    }
+
+    #[test]
+    fn list_prints_every_registered_directory_in_order() {
+        let s = setup();
+        let second = s.dir.path().join("second");
+        std::fs::write(&s.config, two_repo_config(&s, second.to_str().unwrap())).unwrap();
+        let (code, out, _) = exec(
+            &["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            format!(
+                "o/r\t{}\no/second\t{}\n",
+                s.repo.display(),
+                second.display()
+            )
+        );
+    }
+
+    #[test]
+    fn list_refuses_a_path_with_a_control_character_instead_of_breaking_the_line_format() {
+        let s = setup();
+        let bad = format!("{}/new\nline", s.dir.path().display());
+        std::fs::write(&s.config, two_repo_config(&s, &bad)).unwrap();
+        let (code, out, err) = exec(
+            &["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(
+            err.contains("control character") && err.contains("o/second"),
+            "{err}"
+        );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn list_reports_a_failed_write_and_does_not_exit_zero() {
+        let s = setup();
+        let mut err = Vec::new();
+        let code = run(
+            ["inchworm", "list", "--config", s.config.to_str().unwrap()],
+            &Env::default(),
+            &mut FailingWriter,
+            &mut err,
+        );
+        assert_eq!(code, 2);
+        assert!(String::from_utf8(err).unwrap().contains("disk full"));
+    }
+
+    #[test]
+    fn list_reports_an_unusable_config_like_validate_does() {
+        let s = setup();
+        let missing = s.dir.path().join("missing.toml");
+        let (code, out, err) = exec(
+            &["inchworm", "list", "--config", missing.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert!(err.contains("cannot read"), "{err}");
+        let (code, out, err) = exec(&["inchworm", "list"], &Env::default());
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert!(err.contains("XDG_CONFIG_HOME or HOME"), "{err}");
     }
 
     #[test]
@@ -641,6 +788,57 @@ mod tests {
     }
 
     #[test]
+    fn run_with_an_unusable_config_exits_two_before_touching_anything() {
+        let f = fakes();
+        let missing = f.setup.dir.path().join("missing.toml");
+        let (code, out, err) = exec(
+            &[
+                "inchworm",
+                "run",
+                "o/r",
+                "5",
+                "--config",
+                missing.to_str().unwrap(),
+            ],
+            &f.env,
+        );
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn run_selects_the_repository_by_path_as_well_as_by_slug() {
+        let by_slug = fakes().args(&["run", "o/r", "5"]);
+        let f = fakes();
+        let path = f.setup.repo.display().to_string();
+        let by_path = f.args(&["run", &path, "5"]);
+        assert_eq!(by_slug.0, by_path.0, "{by_path:?}");
+        assert!(by_path.1.contains("for o/r#5"), "{}", by_path.1);
+        let (code, _, err) = fakes().args(&["run", "nobody/none", "5"]);
+        assert_eq!(code, EXIT_UNUSABLE);
+        assert!(err.contains("nobody/none"), "{err}");
+    }
+
+    #[test]
+    fn run_treats_failed_label_and_comment_updates_as_warnings_not_failures() {
+        let baseline = fakes().args(&["run", "o/r", "5"]);
+        let f = fakes();
+        f.set("edit_fail", "1");
+        let degraded = f.args(&["run", "o/r", "5"]);
+        assert_eq!(degraded.0, baseline.0, "{degraded:?}");
+        assert!(degraded.1.contains("for o/r#5"), "{}", degraded.1);
+    }
+
+    #[test]
+    fn a_second_run_for_an_issue_with_an_open_run_is_refused_with_exit_two() {
+        let f = fakes();
+        assert_eq!(f.args(&["run", "o/r", "5"]).0, EXIT_VALID);
+        let (code, out, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("already has a run for flow `issue`"), "{err}");
+    }
+
+    #[test]
     fn run_rejects_a_pr_touching_inchworm() {
         let f = fakes();
         f.set("files", "F src/lib.rs\nF .inchworm/flows.toml");
@@ -677,7 +875,7 @@ mod tests {
         let (code, _, err) = f.args(&["run", "o/r", "5"]);
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("cannot start"), "{err}");
-        std::fs::remove_file(f.setup.repo.join(".inchworm/flows.toml")).unwrap();
+        std::fs::remove_file(f.setup.repo.join("inchworm.toml")).unwrap();
         let (code, _, err) = f.args(&["run", "o/r", "5"]);
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("cannot read"), "{err}");
