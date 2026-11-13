@@ -412,7 +412,13 @@ pub fn run_issue(
                         ),
                     )
                 }
-                Err(err) => (FailureClass::AgentFailed, err.to_string()),
+                Err(err) => {
+                    no_retry = Some(
+                        "the pull request lookup failed, so replaying the steps would not help"
+                            .to_string(),
+                    );
+                    (FailureClass::AgentFailed, err.to_string())
+                }
             },
             FlowOutcome::Failed {
                 step,
@@ -1130,6 +1136,34 @@ mode = "draft_pr"
         ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
             self.0.open_prs_for_issue(r, n)
         }
+    }
+
+    #[test]
+    fn a_failing_pr_lookup_after_the_steps_is_not_retried() {
+        let store = Store::open_in_memory().unwrap();
+        let github = LookupFails(github());
+        let (mut client, fake) = connect(vec![
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let context = RunContext {
+            store: &store,
+            github: &github,
+            slug: "o/r",
+            repo_path: Path::new("/repo"),
+            now: &|| 1,
+        };
+        let summary = run_issue(&context, &flow(3, "\"agent_failed\""), 5, &mut client).unwrap();
+        assert_eq!(summary.attempts, 1);
+        assert!(
+            github.0.comments()[0].2.contains("not retried")
+                || github.0.comments()[0].2.contains("would not help")
+        );
+        drop(client);
+        assert_eq!(fake.assigned().len(), 2, "one attempt of the two steps");
     }
 
     #[test]

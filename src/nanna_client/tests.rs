@@ -1302,6 +1302,19 @@ fn every_fixture_says_inside_itself_whether_it_was_captured_or_reconstructed() {
 }
 
 #[test]
+fn pid_alive_reports_a_live_process_and_then_a_dead_one() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id().to_string();
+    assert!(pid_alive(&pid));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!pid_alive(&pid));
+}
+
+#[test]
 fn the_documented_timeouts_and_limits_are_these_numbers() {
     assert_eq!(DEFAULT_READ_TIMEOUT, Duration::from_secs(120));
     assert_eq!(SHUTDOWN_GRACE, Duration::from_secs(5));

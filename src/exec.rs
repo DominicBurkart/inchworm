@@ -505,7 +505,7 @@ mod tests {
             started.elapsed()
         );
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < Duration::from_millis(2500),
             "{:?}",
             started.elapsed()
         );
@@ -519,6 +519,17 @@ mod tests {
         assert_eq!(SystemRunner.run(&at).unwrap().stdout.len(), 1000);
         let over = CmdSpec::new("sh", ["-c", "head -c 1001 /dev/zero"]).with_max_output(1000);
         assert!(SystemRunner.run(&over).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_reports_a_live_process_and_then_a_dead_one() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        assert!(pid_alive(&pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!pid_alive(&pid));
     }
 
     #[cfg(unix)]
