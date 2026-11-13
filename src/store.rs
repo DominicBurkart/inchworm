@@ -1742,10 +1742,12 @@ CREATE TABLE attempts (
             other => panic!("expected Corrupt, got {other}"),
         }
         let cause = u32::try_from(-1i64).unwrap_err();
+        let cause_text = cause.to_string();
+        assert!(!cause_text.is_empty());
         let shown = corrupt("attempt n")(cause);
         assert_eq!(
             shown.to_string(),
-            "stored value is corrupt: attempt n: out of range integral type conversion attempted"
+            format!("stored value is corrupt: attempt n: {cause_text}")
         );
     }
 
