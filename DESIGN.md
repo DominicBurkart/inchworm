@@ -112,7 +112,7 @@ Status values: **implemented** (code and tests on `main`), **config only** (pars
 | Journeys 4 and 5: code review, review addressers | flows with other identities; nothing specific | not implemented |
 | Offramps `noop` / `issue` / `escalate` | `config::Offramp`, `OfframpConfig` (default plus per-flow); `validate` warns on `escalate` | config only. `noop` is the default and `escalate` must be named. Whether `issue` reuses nanna's escalation sink is **open**; `escalate` hands nothing anywhere |
 | 100% local intelligence | the only setting that can leave local models is `escalate`, which is off | config only |
-| Agents are fallible; auditors after every step | `config::AuditorConfig`, `AuditorPlace`, `StepAudit`, `AuditorConfig::plan_for` and `decide` | config only. The auditor is mandatory, cannot be skipped and cannot be the audited step's own identity; an auditor error halts the step. Where it runs is a nanna identity; `host` parses per step but `validate` rejects it because no host check exists, and it cannot be the project default. Auditor design (same model, other prompt, other model) is **open** |
+| Agents are fallible; auditors after every step | `config::AuditorConfig`, `AuditorPlace`, `StepAudit`, `AuditorConfig::plan_for` and `decide` | config only. The auditor is mandatory, cannot be skipped and cannot be the audited step's own identity; an auditor error halts the step. Where it runs is a nanna identity; `host` is rejected everywhere (project default or per step) because no host check exists. Every step needs at least one check, either the flow's judges or a named subset; a flow with no judges is an error because its auditor would verify nothing. Auditor design (same model, other prompt, other model) is **open** |
 | Judges after a run | `config::Judge` (`diff`, `nanna_clean`, `llm`) | config only |
 | Nanna only for coding agents | step identities are nanna identities; `validate` checks only their syntax | config only; identity existence is an online check, not built |
 | Merging | `[merge] allow` (default `false`), `MergeConfig::grant` giving `MergeGrantSetting::{Denied, Granted}`; a `merge_when` flow with `allow = false` is rejected | config only. This is the single mapping point for the later policy code's `MergeGrant` (PR #3): `allow = false` is `Denied`, `true` is `Granted`, and there is no second concept. Aligns with nanna-coder #1043, where the capability is still being designed |
@@ -124,6 +124,8 @@ Status values: **implemented** (code and tests on `main`), **config only** (pars
 | Marigold or Rust control flow | undecided | **open** (delta D5) |
 
 ## Reading the table
+
+- The config sketch in the design above is illustrative. Its tables `[issues]`, `[ci]`, `[conflicts]` and `[review]` are **not parsed yet**: `inchworm.toml` rejects unknown keys, so a file containing them fails validation until those journeys are built.
 
 - "Config only" means a file can say it and `inchworm validate` checks it, but no running code acts on it. Do not read a configured auditor or offramp as protection.
 - Safety today rests on three things that exist: container isolation in nanna, the protected-path list, and draft pull requests. A model auditor is not a safety gate: the nanna reviewer's scorecard for nanna's model auditor fails the zero-false-allow bar.

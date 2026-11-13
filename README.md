@@ -6,9 +6,9 @@ A daemon and CLI for configuring fallible, repeated agentic processes on local m
 
 This is milestone 1 of an MVP: configuration, run state, a SQLite store and offline validation. It cannot run an agent yet.
 
-It was written from a planning conversation, not from the project's design. The design is issue [#1](https://github.com/DominicBurkart/inchworm/issues/1) and `DESIGN.md`, which exists only on the unmerged branch `ccr-a1899a5f-disb85`. Where the two differ, the design wins. The differences are tracked in issue [#6](https://github.com/DominicBurkart/inchworm/issues/6):
+It was written from a planning conversation, not from the project's design. The design is issue [#1](https://github.com/DominicBurkart/inchworm/issues/1) and `DESIGN.md`, which is now on `main`. Where the two differ, the design wins. The differences are tracked in issue [#6](https://github.com/DominicBurkart/inchworm/issues/6):
 
-- **D1, met except `register`/`unregister`**: a directory is configured by `inchworm.toml` at its root, and `inchworm list` prints the registered directories. A directory is registered by adding a `[[repo]]` entry to the global config by hand; `register` and `unregister` are a documented non-goal for now because editing the config without losing its comments needs a TOML-editing dependency. The old `.inchworm/flows.toml` is no longer read: `validate` reports that it moved.
+- **D1, met except `register`/`unregister`**: a directory is configured by `inchworm.toml` at its root, and `inchworm list` prints the registered directories (one `slug<TAB>path` line each; it refuses a slug or path with a control character, and exits `2` if it cannot write). A directory is registered by adding a `[[repo]]` entry to the global config by hand; `register` and `unregister` are a documented non-goal for now because editing the config without losing its comments needs a TOML-editing dependency. The old `.inchworm/flows.toml` is no longer read: `validate` reports that it moved.
 - **D2, configuration only**: `[offramp]` accepts `noop`, `issue` and `escalate` with a default and per-flow values, validated, but nothing executes an offramp yet.
 - **D3, configuration only**: `[auditor]` is mandatory, says where the auditor runs and fails closed, but nothing runs an auditor yet. The judges after a run remain.
 - **D4, partial**: only the issue-to-draft-PR journey exists. The tagged `trigger` is the extension point for the CI-failure and merge-conflict journeys; any other `kind` is rejected with an "unknown variant" error.
@@ -87,21 +87,24 @@ trigger = { kind = "label", label = "inchworm" }
 name = "implement"
 identity = "rust-implementer"
 
+[[flow.judge]]
+kind = "nanna_clean"
+
 [flow.outcome]
 mode = "draft_pr"
 ```
 
 ### Offramps
 
-`[offramp] default` is what happens when a flow falls off its path: `noop` (the default when the key is omitted), `issue` or `escalate`. `[offramp.flow]` overrides it per flow, by flow name, and a name that is not a flow is an error. No offramp executes yet. `issue` is meant to reuse nanna's escalation sink (an open question in `DESIGN.md`, not built). `escalate` would hand the work to a frontier agent; it is the only setting that can leave local models, so it must be named explicitly and `validate` warns on it. It is not implemented: nothing is handed anywhere.
+`[offramp] default` is what happens when a flow falls off its path: `noop` (the default when the key is omitted), `issue` or `escalate`. `[offramp.flow]` overrides it per flow, by flow name; names are compared ignoring ASCII case when validating and when looking up, a name that is not a flow is an error, and two names that differ only in case are an error. No offramp executes yet. `issue` is meant to reuse nanna's escalation sink (an open question in `DESIGN.md`, not built). `escalate` would hand the work to a frontier agent; it is the only setting that can leave local models, so it must be named explicitly and `validate` warns on it. It is not implemented: nothing is handed anywhere.
 
 ### Auditors
 
-`[auditor]` is required, and a file without it is an error: every agent step needs an auditor and there is no default. `runs_in` says where the auditor runs: `{ kind = "nanna", identity = "..." }` (a nanna sub-agent) or `{ kind = "host" }` (deterministic checks, no model). The host place is reserved and unusable: no host check exists, so `host` as the project default is a parse error (a default that cannot run would silently skip every auditor) and `inchworm validate` reports an error for any step whose auditor resolves to `host`. `[[auditor.step]]` entries pick another place and a subset of the flow's judges (`checks = ["diff", "nanna_clean", "llm"]`) for one step of one flow; every other step uses the default and all of the flow's judges. A nanna auditor may not have the identity of the step it audits. There is no setting that skips an auditor. `on_failure` accepts only `block`: `AuditorConfig::decide` turns an auditor that errored into a halt of the step. Nothing runs an auditor yet. A model auditor is not a safety gate (nanna's own scorecard for it fails the zero-false-allow bar); safety rests on container isolation, the protected-path list and draft PRs.
+`[auditor]` is required, and a file without it is an error: every agent step needs an auditor and there is no default. `runs_in` says where the auditor runs: `{ kind = "nanna", identity = "..." }` (a nanna sub-agent) or `{ kind = "host" }` (deterministic checks, no model). The host place is reserved and unusable: no host check exists, so `host` is a parse error, both as the project default (a default that cannot run would silently skip every auditor) and as a per-step override (the error names the flow and step). Every step must also have at least one check: a flow with no judges, and no named checks, is an error rather than an auditor that verifies nothing. `[[auditor.step]]` entries pick another place and a subset of the flow's judges (`checks = ["diff", "nanna_clean", "llm"]`) for one step of one flow; every other step uses the default and all of the flow's judges. A nanna auditor may not have the identity of the step it audits. There is no setting that skips an auditor. `on_failure` accepts only `block`: `AuditorConfig::decide` turns an auditor that errored into a halt of the step. Nothing runs an auditor yet. A model auditor is not a safety gate (nanna's own scorecard for it fails the zero-false-allow bar); safety rests on container isolation, the protected-path list and draft PRs.
 
 ### Protected paths
 
-`validate::protected_path_touched` is the check inchworm applies to a patch itself: any path that is, or lies under, `inchworm.toml` or `.inchworm/`, in any spelling (`./`, `..` segments, ASCII case, backslashes, a path that leaves the repository), is refused. It is deliberately stricter than a POSIX path comparison, because a blocklist errs on the safe side. It does not fold Unicode look-alike characters (confusables); that is not required and is not done. Nothing calls it on a real patch yet.
+`validate::protected_path_touched` is the check inchworm applies to a patch itself: any path that is, or lies under, `inchworm.toml` or `.inchworm/`, in any spelling (`./`, `..` segments, ASCII case, backslashes, trailing dots and spaces and `:stream` suffixes that other file systems alias, a path that leaves the repository), is refused. NUL, absolute paths (a leading `/` or `\`, or a drive letter) are refused too. Turning a diff into paths (rename and copy headers, quoted names) is the caller's job and is not done or tested here. A path below another directory, such as `docs/inchworm.toml`, is deliberately not flagged: the policy covers the repository root. It is deliberately stricter than a POSIX path comparison, because a blocklist errs on the safe side. It does not fold Unicode look-alike characters (confusables); that is not required and is not done. Nothing calls it on a real patch yet.
 
 ## Flows
 
