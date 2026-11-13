@@ -17,13 +17,13 @@ fn good_repo(root: &Path) {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         root,
-        ".inchworm/flows.toml",
-        "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        "inchworm.toml",
+        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
     );
     write(
         root,
         ".nanna/protected.toml",
-        "extra = [\".inchworm/**\"]\n",
+        "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
     );
     write(root, ".nanna/prompt.md", "prompt");
 }
@@ -140,4 +140,30 @@ fn validate_exits_one_when_the_inchworm_directory_is_a_symlink_to_an_outside_dir
         .assert()
         .code(1)
         .stdout(predicate::str::contains("`.inchworm` is a symlink"));
+}
+
+#[test]
+fn list_prints_one_tab_separated_line_per_registered_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    let config = config(dir.path(), &repo);
+    inchworm()
+        .args(["list", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(format!("o/r\t{}\n", repo.display()));
+}
+
+#[test]
+fn list_exits_two_when_the_config_is_unreadable_and_prints_nothing_to_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    inchworm()
+        .args(["list", "--config"])
+        .arg(dir.path().join("missing.toml"))
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("cannot read"));
 }

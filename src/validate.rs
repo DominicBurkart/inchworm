@@ -2,10 +2,14 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::{FlowFile, GlobalConfig, Judge, OutcomeMode, RUBRIC_DIR, RepoEntry};
+use crate::config::{
+    GlobalConfig, Judge, LEGACY_FLOWS_FILE, Offramp, OutcomeMode, PROJECT_FILE, ProjectConfig,
+    ProjectError, RUBRIC_DIR, RepoEntry,
+};
 use crate::fsutil::{read_regular_text, read_text_following_symlinks};
 
 pub const PROTECTED_GLOB: &str = ".inchworm/**";
+pub const PROTECTED_GLOBS: [&str; 2] = [PROJECT_FILE, PROTECTED_GLOB];
 pub const MAX_FLOWS_BYTES: u64 = 256 * 1024;
 pub const MAX_PROTECTED_BYTES: u64 = 64 * 1024;
 pub const MAX_PROTECTED_ENTRIES: usize = 256;
@@ -206,6 +210,43 @@ pub fn validate(config: &GlobalConfig, path_var: Option<&OsStr>) -> Report {
     report
 }
 
+/// The first of `paths` that a step output must not touch: `inchworm.toml` or
+/// anything under `.inchworm/`, however it is spelled.
+///
+/// This is independent of `.nanna/protected.toml`: it is the check inchworm
+/// applies to a patch itself. Paths are normalised lexically, compared without
+/// regard to ASCII case (case-insensitive file systems), and a path that
+/// climbs out of the repository counts as touching it.
+///
+/// ```
+/// use inchworm::validate::protected_path_touched;
+///
+/// assert_eq!(protected_path_touched(["src/lib.rs", "inchworm.toml"]), Some("inchworm.toml"));
+/// assert_eq!(protected_path_touched(["./.inchworm/rubric.md"]), Some("./.inchworm/rubric.md"));
+/// assert_eq!(protected_path_touched(["src/lib.rs", "docs/inchworm.toml"]), None);
+/// ```
+pub fn protected_path_touched<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    paths.into_iter().find(|path| {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split(['/', '\\']) {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return true;
+                    }
+                }
+                other => parts.push(other),
+            }
+        }
+        match parts.as_slice() {
+            [first, ..] if first.eq_ignore_ascii_case(RUBRIC_DIR) => true,
+            [only] => only.eq_ignore_ascii_case(PROJECT_FILE),
+            _ => false,
+        }
+    })
+}
+
 fn is_git_repository(root: &Path) -> Result<(), &'static str> {
     let git = root.join(".git");
     let meta = std::fs::metadata(&git).map_err(|_| "path is not a git repository")?;
@@ -237,6 +278,9 @@ fn validate_repo(repo: &RepoEntry, report: &mut Report) {
         return;
     }
     if let Err(message) = is_git_repository(&repo.path) {
+        report.push(slug, Severity::Error, message);
+    }
+    if let Some(message) = symlink_message(&repo.path, RUBRIC_DIR) {
         report.push(slug, Severity::Error, message);
     }
     check_flows(repo, report);
@@ -313,34 +357,50 @@ fn rubric_problem(root: &Path, rubric: &Path) -> Option<String> {
 
 fn check_flows(repo: &RepoEntry, report: &mut Report) {
     let slug = Some(repo.slug.as_str());
-    if let Some(message) = symlink_message(&repo.path, ".inchworm/flows.toml") {
+    if let Some(message) = symlink_message(&repo.path, "inchworm.toml") {
         report.push(slug, Severity::Error, message);
         return;
     }
-    let path = repo.path.join(".inchworm/flows.toml");
+    let path = repo.path.join("inchworm.toml");
     let text = match read_regular_text(&path, MAX_FLOWS_BYTES) {
         Ok(text) => text,
         Err(err) => {
-            report.push(
-                slug,
-                Severity::Error,
-                format!("cannot read .inchworm/flows.toml: {err}"),
-            );
+            let moved = err.kind() == std::io::ErrorKind::NotFound
+                && symlink_component(&repo.path, Path::new(LEGACY_FLOWS_FILE)).is_none()
+                && repo.path.join(LEGACY_FLOWS_FILE).exists();
+            let message = if moved {
+                format!(
+                    "{LEGACY_FLOWS_FILE} has moved to {PROJECT_FILE} at the repository root, together with the new [auditor] table; it is no longer read"
+                )
+            } else {
+                format!("cannot read {PROJECT_FILE}: {err}")
+            };
+            report.push(slug, Severity::Error, message);
             return;
         }
     };
-    let file = match FlowFile::parse(&text) {
+    let file = match ProjectConfig::parse(&text) {
         Ok(file) => file,
         Err(err) => {
-            report.push(
-                slug,
-                Severity::Error,
-                format!(".inchworm/flows.toml: {err}"),
-            );
+            let message = match err {
+                ProjectError::Parse(_) => err.to_string(),
+                _ => format!("{PROJECT_FILE}: {err}"),
+            };
+            report.push(slug, Severity::Error, message);
             return;
         }
     };
     for flow in &file.flow {
+        if file.offramp.for_flow(&flow.name) == Offramp::Escalate {
+            report.push(
+                slug,
+                Severity::Warning,
+                format!(
+                    "flow `{}` uses the escalate offramp, the only path that may leave local models; it is not implemented yet",
+                    flow.name
+                ),
+            );
+        }
         for judge in &flow.judge {
             if let Judge::Llm { rubric, .. } = judge
                 && let Some(problem) = rubric_problem(&repo.path, rubric)
@@ -379,7 +439,7 @@ fn check_protected(repo: &RepoEntry, report: &mut Report) {
                 slug,
                 Severity::Error,
                 format!(
-                    "missing .nanna/protected.toml; {PROTECTED_GLOB} must be protected from agents"
+                    "missing .nanna/protected.toml; {PROJECT_FILE} and {PROTECTED_GLOB} must be protected from agents"
                 ),
             );
             return;
@@ -419,20 +479,24 @@ fn check_protected(repo: &RepoEntry, report: &mut Report) {
     if entries.len() > MAX_PROTECTED_ENTRIES {
         problems.push(format!("more than {MAX_PROTECTED_ENTRIES} entries"));
     }
-    let mut covered = false;
+    let mut covered = [false; PROTECTED_GLOBS.len()];
     for entry in &entries {
         match entry.as_str() {
             Some(text) => {
                 if let Some(problem) = protected_entry_problem(text) {
                     problems.push(format!("entry `{text}` {problem}"));
                 }
-                covered |= text == PROTECTED_GLOB;
+                for (done, required) in covered.iter_mut().zip(PROTECTED_GLOBS) {
+                    *done |= text == required;
+                }
             }
             None => problems.push("an `extra` entry is not a string".to_string()),
         }
     }
-    if !covered {
-        problems.push(format!("`extra` must contain \"{PROTECTED_GLOB}\""));
+    for (done, required) in covered.iter().zip(PROTECTED_GLOBS) {
+        if !done {
+            problems.push(format!("`extra` must contain \"{required}\""));
+        }
     }
     for problem in problems {
         report.push(
@@ -449,6 +513,9 @@ mod tests {
     use std::ffi::OsString;
 
     const FLOWS: &str = r#"
+[auditor]
+runs_in = { kind = "nanna", identity = "auditor" }
+
 [[flow]]
 name = "issue"
 trigger = { kind = "label", label = "inchworm" }
@@ -486,12 +553,12 @@ mode = "draft_pr"
 
     fn good_repo(root: &Path) {
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(root, ".inchworm/flows.toml", FLOWS);
+        write(root, "inchworm.toml", FLOWS);
         write(root, ".inchworm/rubric.md", "rubric");
         write(
             root,
             ".nanna/protected.toml",
-            "extra = [\".inchworm/**\", \"x\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\", \"x\"]\n",
         );
         write(root, ".nanna/prompt.md", "prompt");
     }
@@ -614,13 +681,18 @@ mode = "draft_pr"
         assert!(!run(&f).is_ok());
     }
 
+    fn run_with(f: &Fixture, project: &str) -> Report {
+        write(&f.root, "inchworm.toml", project);
+        run(f)
+    }
+
     #[test]
     fn missing_or_broken_flows_are_errors() {
         let f = fixture();
-        std::fs::remove_file(f.root.join(".inchworm/flows.toml")).unwrap();
-        assert!(has(&run(&f), "cannot read .inchworm/flows.toml"));
+        std::fs::remove_file(f.root.join("inchworm.toml")).unwrap();
+        assert!(has(&run(&f), "cannot read inchworm.toml"));
 
-        write(&f.root, ".inchworm/flows.toml", "flow = []");
+        write(&f.root, "inchworm.toml", "flow = []");
         assert!(has(&run(&f), "no flows"));
     }
 
@@ -629,7 +701,7 @@ mode = "draft_pr"
         let f = fixture();
         write(
             &f.root,
-            ".inchworm/flows.toml",
+            "inchworm.toml",
             &" ".repeat(MAX_FLOWS_BYTES as usize + 1),
         );
         let report = run(&f);
@@ -642,7 +714,7 @@ mode = "draft_pr"
         let f = fixture();
         let secret = f.root.join("secret.txt");
         std::fs::write(&secret, "TOP-SECRET-VALUE = [").unwrap();
-        for relative in [".inchworm/flows.toml", ".nanna/protected.toml"] {
+        for relative in ["inchworm.toml", ".nanna/protected.toml"] {
             let link = f.root.join(relative);
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&secret, &link).unwrap();
@@ -698,7 +770,7 @@ mode = "draft_pr"
         ] {
             write(
                 &f.root,
-                ".inchworm/flows.toml",
+                "inchworm.toml",
                 &FLOWS.replace(".inchworm/rubric.md", rubric),
             );
             let report = run(&f);
@@ -726,7 +798,7 @@ mode = "draft_pr"
         std::os::unix::fs::symlink(outside.path(), f.root.join(".inchworm/judges")).unwrap();
         write(
             &f.root,
-            ".inchworm/flows.toml",
+            "inchworm.toml",
             &FLOWS.replace(".inchworm/rubric.md", ".inchworm/judges/passwd"),
         );
         assert!(has(&run(&f), "is a symlink"));
@@ -739,14 +811,26 @@ mode = "draft_pr"
             ("extra = [\"other/**\"]\n", "must contain"),
             ("nothing = 1\n", "unknown key `nothing`"),
             (
-                "extra = [\".inchworm/**\", \"x\"]\nbogus = 1\n",
+                "extra = [\"inchworm.toml\", \".inchworm/**\", \"x\"]\nbogus = 1\n",
                 "unknown key `bogus`",
             ),
-            ("extra = [\".inchworm/**\", 5]\n", "is not a string"),
+            (
+                "extra = [\"inchworm.toml\", \".inchworm/**\", 5]\n",
+                "is not a string",
+            ),
             ("extra = \".inchworm/**\"\n", "must be an array"),
-            ("extra = [\".inchworm/**\", \"/abs\"]\n", "must be relative"),
-            ("extra = [\".inchworm/**\", \"a/../b\"]\n", "`..`"),
-            ("extra = [\".inchworm/**\", \"\"]\n", "is empty"),
+            (
+                "extra = [\"inchworm.toml\", \".inchworm/**\", \"/abs\"]\n",
+                "must be relative",
+            ),
+            (
+                "extra = [\"inchworm.toml\", \".inchworm/**\", \"a/../b\"]\n",
+                "`..`",
+            ),
+            (
+                "extra = [\"inchworm.toml\", \".inchworm/**\", \"\"]\n",
+                "is empty",
+            ),
             ("extra = [", "protected.toml"),
         ];
         for (text, expected) in cases {
@@ -756,8 +840,11 @@ mode = "draft_pr"
             assert!(!report.is_ok(), "{text:?}");
         }
         let entries = |count: usize| {
-            let mut all = vec!["\".inchworm/**\"".to_string()];
-            all.extend((1..count).map(|n| format!("\"d{n}\"")));
+            let mut all = vec![
+                "\"inchworm.toml\"".to_string(),
+                "\".inchworm/**\"".to_string(),
+            ];
+            all.extend((2..count).map(|n| format!("\"d{n}\"")));
             format!("extra = [{}]\n", all.join(","))
         };
         write(
@@ -892,7 +979,18 @@ mode = "draft_pr"
             "mode = \"draft_pr\"",
             "mode = \"merge_when\"\nrequired_checks = [\"Tests\"]",
         );
-        write(&f.root, ".inchworm/flows.toml", &merging);
+        let refused = run_with(&f, &merging);
+        assert!(
+            has(&refused, "[merge] allow is false"),
+            "{:?}",
+            messages(&refused)
+        );
+        assert!(!refused.is_ok());
+        write(
+            &f.root,
+            "inchworm.toml",
+            &format!("[merge]\nallow = true\n{merging}"),
+        );
         let report = run(&f);
         assert!(report.is_ok(), "{:?}", messages(&report));
         assert_eq!(report.warning_count(), 1);
@@ -976,17 +1074,7 @@ mode = "draft_pr"
     #[test]
     fn a_symlinked_inchworm_directory_is_refused_even_when_everything_inside_is_valid() {
         let f = fixture();
-        write(
-            &f.root,
-            ".inchworm/flows.toml",
-            &FLOWS.replace("llm", "nanna_clean"),
-        );
         let outside = outside_copy_of(&f, ".inchworm");
-        std::fs::write(
-            outside.join("flows.toml"),
-            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"x\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
-        )
-        .unwrap();
         std::os::unix::fs::symlink(&outside, f.root.join(".inchworm")).unwrap();
         let report = run(&f);
         assert!(!report.is_ok(), "{:?}", messages(&report));
@@ -1044,7 +1132,7 @@ mode = "draft_pr"
         std::os::unix::fs::symlink(&outside, f.root.join(".inchworm/judges")).unwrap();
         write(
             &f.root,
-            ".inchworm/flows.toml",
+            "inchworm.toml",
             &FLOWS.replace(".inchworm/rubric.md", ".inchworm/judges/r.md"),
         );
         let report = run(&f);
@@ -1068,10 +1156,7 @@ mode = "draft_pr"
     #[test]
     fn components_are_checked_from_the_repo_root_down_and_stop_at_a_missing_one() {
         let f = fixture();
-        assert_eq!(
-            symlink_component(&f.root, Path::new(".inchworm/flows.toml")),
-            None
-        );
+        assert_eq!(symlink_component(&f.root, Path::new("inchworm.toml")), None);
         assert_eq!(symlink_component(&f.root, Path::new(".nope/a/b")), None);
     }
 
@@ -1083,7 +1168,7 @@ mode = "draft_pr"
     #[test]
     fn the_protected_toml_cap_is_exactly_64_kib() {
         let f = fixture();
-        let base = "extra = [\".inchworm/**\"]\n";
+        let base = "extra = [\"inchworm.toml\", \".inchworm/**\"]\n";
         write(&f.root, ".nanna/protected.toml", &padded_to(base, 65_536));
         assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
         write(&f.root, ".nanna/protected.toml", &padded_to(base, 65_537));
@@ -1098,9 +1183,9 @@ mode = "draft_pr"
     #[test]
     fn the_flows_cap_is_exactly_256_kib() {
         let f = fixture();
-        write(&f.root, ".inchworm/flows.toml", &padded_to(FLOWS, 262_144));
+        write(&f.root, "inchworm.toml", &padded_to(FLOWS, 262_144));
         assert!(run(&f).is_ok(), "{:?}", messages(&run(&f)));
-        write(&f.root, ".inchworm/flows.toml", &padded_to(FLOWS, 262_145));
+        write(&f.root, "inchworm.toml", &padded_to(FLOWS, 262_145));
         let over = run(&f);
         assert!(
             has(&over, "larger than 262144 bytes"),
@@ -1149,9 +1234,143 @@ mode = "draft_pr"
         write(
             &f.root,
             ".nanna/protected.toml",
-            "extra = [\"x\", \".inchworm/**\"]\n",
+            "extra = [\"x\", \"inchworm.toml\", \".inchworm/**\"]\n",
         );
         assert!(run(&f).is_ok());
+    }
+
+    #[test]
+    fn inchworm_toml_and_the_inchworm_directory_must_each_be_protected() {
+        let f = fixture();
+        for (extra, missing, present) in [
+            ("\".inchworm/**\"", "inchworm.toml", ".inchworm/**"),
+            ("\"inchworm.toml\"", ".inchworm/**", "inchworm.toml"),
+        ] {
+            write(
+                &f.root,
+                ".nanna/protected.toml",
+                &format!("extra = [{extra}]\n"),
+            );
+            let report = run(&f);
+            assert!(!report.is_ok());
+            assert!(
+                has(&report, &format!("must contain \"{missing}\"")),
+                "{:?}",
+                messages(&report)
+            );
+            assert!(
+                !has(&report, &format!("must contain \"{present}\"")),
+                "{:?}",
+                messages(&report)
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_touching_inchworm_toml_or_the_inchworm_directory_is_rejected() {
+        for touched in [
+            "inchworm.toml",
+            "./inchworm.toml",
+            "src/../inchworm.toml",
+            "INCHWORM.TOML",
+            "inchworm.toml/",
+            ".inchworm/rubric.md",
+            ".inchworm",
+            "./.INCHWORM/x/y",
+            "a/../../outside",
+            "..",
+            ".inchworm\\rubric.md",
+            "//inchworm.toml",
+        ] {
+            assert_eq!(
+                protected_path_touched(["src/main.rs", touched]),
+                Some(touched),
+                "{touched}"
+            );
+        }
+        for fine in [
+            "src/main.rs",
+            "docs/inchworm.toml",
+            "inchworm.toml.bak",
+            "xinchworm.toml",
+            ".inchwormx/a",
+            "a/.inchworm/b",
+            "inchworm/inchworm.toml",
+            "",
+        ] {
+            assert_eq!(protected_path_touched([fine]), None, "{fine:?}");
+        }
+        assert_eq!(protected_path_touched([]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_inchworm_directory_is_an_error_even_when_no_rubric_is_used() {
+        let f = fixture();
+        let no_rubric = FLOWS.replace("llm", "nanna_clean").replace(
+            "rubric = \".inchworm/rubric.md\"\nmodel = \"gemma4:e4b\"\nmin_score = 7\n",
+            "",
+        );
+        write(&f.root, "inchworm.toml", &no_rubric);
+        let outside = outside_copy_of(&f, ".inchworm");
+        std::os::unix::fs::symlink(&outside, f.root.join(".inchworm")).unwrap();
+        let report = run(&f);
+        assert!(!report.is_ok());
+        assert!(
+            has(&report, "`.inchworm` is a symlink"),
+            "{:?}",
+            messages(&report)
+        );
+        assert_eq!(report.error_count(), 1, "{:?}", messages(&report));
+    }
+
+    #[test]
+    fn the_old_flows_file_gets_a_moved_error_and_is_never_read() {
+        let f = fixture();
+        std::fs::remove_file(f.root.join("inchworm.toml")).unwrap();
+        write(&f.root, ".inchworm/flows.toml", FLOWS);
+        let report = run(&f);
+        assert!(!report.is_ok());
+        assert!(
+            has(&report, ".inchworm/flows.toml has moved to inchworm.toml"),
+            "{:?}",
+            messages(&report)
+        );
+        assert!(!has(&report, "cannot read"));
+        std::fs::remove_file(f.root.join(".inchworm/flows.toml")).unwrap();
+        assert!(has(&run(&f), "cannot read inchworm.toml"));
+    }
+
+    #[test]
+    fn a_project_without_an_auditor_or_with_a_bad_offramp_is_an_error() {
+        let f = fixture();
+        let no_auditor = FLOWS.replace(
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n",
+            "",
+        );
+        let report = run_with(&f, &no_auditor);
+        assert!(
+            has(&report, "no [auditor] table"),
+            "{:?}",
+            messages(&report)
+        );
+        let bad = format!("[offramp]\ndefault = \"page\"\n{FLOWS}");
+        assert!(!run_with(&f, &bad).is_ok());
+    }
+
+    #[test]
+    fn the_escalate_offramp_is_a_warning_that_says_it_is_not_implemented() {
+        let f = fixture();
+        let report = run_with(
+            &f,
+            &format!("[offramp.flow]\nissue = \"escalate\"\n{FLOWS}"),
+        );
+        assert!(report.is_ok(), "{:?}", messages(&report));
+        assert_eq!(report.warning_count(), 1);
+        assert!(has(&report, "escalate offramp"));
+        assert!(has(&report, "not implemented"));
+        let quiet = run_with(&f, &format!("[offramp]\ndefault = \"issue\"\n{FLOWS}"));
+        assert_eq!(quiet.warning_count(), 0, "{:?}", messages(&quiet));
     }
 
     #[test]

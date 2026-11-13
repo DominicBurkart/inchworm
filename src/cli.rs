@@ -64,6 +64,11 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// List the registered directories (slug, then path, tab separated).
+    List {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// Runs the CLI and returns the process exit code: 0 when everything is
@@ -98,15 +103,15 @@ where
     };
     match cli.command {
         Command::Validate { config } => validate_command(config, env, out, err),
+        Command::List { config } => list_command(config, env, out, err),
     }
 }
 
-fn validate_command(
+fn load_config(
     config: Option<PathBuf>,
     env: &Env,
-    out: &mut dyn Write,
     err: &mut dyn Write,
-) -> u8 {
+) -> Result<GlobalConfig, u8> {
     let path = config.or_else(|| {
         GlobalConfig::default_path(env.xdg_config_home.as_deref(), env.home.as_deref())
     });
@@ -115,14 +120,39 @@ fn validate_command(
             err,
             "error: cannot find the config: pass --config, or set XDG_CONFIG_HOME or HOME"
         );
-        return EXIT_UNUSABLE;
+        return Err(EXIT_UNUSABLE);
     };
-    let config = match GlobalConfig::load(&path, env.home.as_deref()) {
+    GlobalConfig::load(&path, env.home.as_deref()).map_err(|error| {
+        let _ = writeln!(err, "error: {error}");
+        EXIT_UNUSABLE
+    })
+}
+
+fn list_command(
+    config: Option<PathBuf>,
+    env: &Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let config = match load_config(config, env, err) {
         Ok(config) => config,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return EXIT_UNUSABLE;
-        }
+        Err(code) => return code,
+    };
+    for repo in &config.repo {
+        let _ = writeln!(out, "{}\t{}", repo.slug, repo.path.display());
+    }
+    EXIT_VALID
+}
+
+fn validate_command(
+    config: Option<PathBuf>,
+    env: &Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let config = match load_config(config, env, err) {
+        Ok(config) => config,
+        Err(code) => return code,
     };
     let report = validate(&config, env.path.as_deref());
     let _ = write!(out, "{}", report.render());
@@ -165,13 +195,13 @@ mod tests {
         std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
         std::fs::create_dir_all(repo.join(".nanna")).unwrap();
         std::fs::write(
-            repo.join(".inchworm/flows.toml"),
-            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+            repo.join("inchworm.toml"),
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
         )
         .unwrap();
         std::fs::write(
             repo.join(".nanna/protected.toml"),
-            "extra = [\".inchworm/**\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
         )
         .unwrap();
         std::fs::write(repo.join(".nanna/prompt.md"), "prompt").unwrap();
@@ -261,6 +291,30 @@ mod tests {
         );
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("invalid config"), "{err}");
+    }
+
+    #[test]
+    fn list_prints_each_registered_directory_and_nothing_else() {
+        let s = setup();
+        let config = s.config.to_str().unwrap();
+        let (code, out, err) = exec(&["inchworm", "list", "--config", config], &Env::default());
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, format!("o/r\t{}\n", s.repo.display()));
+    }
+
+    #[test]
+    fn list_reports_an_unusable_config_like_validate_does() {
+        let s = setup();
+        let missing = s.dir.path().join("missing.toml");
+        let (code, out, err) = exec(
+            &["inchworm", "list", "--config", missing.to_str().unwrap()],
+            &Env::default(),
+        );
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert!(err.contains("cannot read"), "{err}");
+        let (code, out, err) = exec(&["inchworm", "list"], &Env::default());
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert!(err.contains("XDG_CONFIG_HOME or HOME"), "{err}");
     }
 
     #[test]
