@@ -221,8 +221,10 @@ pub struct MergeConfig {
     pub allow: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum MergeGrantSetting {
+    #[default]
     Denied,
     Granted,
 }

@@ -724,6 +724,20 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn a_forbid_paths_glob_the_matcher_rejects_is_an_error_before_any_agent_runs() {
+        let f = fixture();
+        let broken = FLOWS.replace(
+            "[flow.outcome]",
+            "[[flow.judge]]\nkind = \"diff\"\nmax_lines = 10\nforbid_paths = [\"[]\"]\n\n[flow.outcome]",
+        );
+        assert_ne!(broken, FLOWS);
+        write(&f.root, "inchworm.toml", &broken);
+        let report = run(&f);
+        assert!(!report.is_ok());
+        assert!(has(&report, "forbid_paths"), "{:?}", messages(&report));
+    }
+
+    #[test]
     fn oversized_flows_are_refused_without_being_parsed() {
         let f = fixture();
         write(

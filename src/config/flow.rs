@@ -531,6 +531,8 @@ impl Flow {
                                 ),
                             ));
                         }
+                        crate::judges::compile_forbid_paths(std::slice::from_ref(pattern))
+                            .map_err(|reason| invalid(self, reason))?;
                         if !seen.insert(pattern.as_str()) {
                             return Err(invalid(
                                 self,
@@ -1831,6 +1833,25 @@ mode = "draft_pr"
         }
         assert!(!valid_ref_name(&"a".repeat(201)));
         assert!(valid_ref_name(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn forbid_paths_globs_the_matcher_rejects_are_rejected_at_load() {
+        for bad in ["a\\\\", "[]", "[z-a]", "{a,b", "a/[b"] {
+            let text = FULL.replace(
+                "forbid_paths = [\"publish.sh\", \".github/**\"]",
+                &format!("forbid_paths = [\"publish.sh\", \"{bad}\"]"),
+            );
+            let message = err_text(&text);
+            assert!(message.contains("forbid_paths"), "{bad}: {message}");
+        }
+        for good in ["[!a]*", "{a,b}.rs", "a\\\\.rs", "**/x", ".github"] {
+            let text = FULL.replace(
+                "forbid_paths = [\"publish.sh\", \".github/**\"]",
+                &format!("forbid_paths = [\"{good}\"]"),
+            );
+            assert!(FlowFile::parse(&text).is_ok(), "{good}");
+        }
     }
 
     fn name_strategy() -> impl Strategy<Value = String> {
