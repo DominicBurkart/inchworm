@@ -460,9 +460,14 @@ pub async fn conclude(
                 &[DONE_LABEL],
                 &[RUNNING_LABEL, trigger_label(flow)],
                 &format!(
-                    "inchworm outcome `draft_pr` after attempt {}: {} stays a draft at `{sha}`. Required checks are green on that commit. Judges: {}.",
+                    "inchworm outcome `draft_pr` after attempt {}: {} stays a draft at `{sha}`. {} Judges: {}.",
                     published.attempt_n,
                     published.pr.url,
+                    if flow.outcome.required_checks.is_empty() {
+                        "No checks were required."
+                    } else {
+                        "Required checks are green on that commit."
+                    },
                     summarise(&verdicts)
                 ),
                 warnings,
@@ -1907,6 +1912,44 @@ mod round2_safety {
         assert!(
             matches!(concluded, Concluded::Rejected { .. }),
             "merged at another head, from a fork, into another base, yet recorded: {concluded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_draft_comment_does_not_claim_green_checks_when_none_were_required() {
+        let gh = proxy(SMALL);
+        let mut no_checks = flow("draft_pr");
+        no_checks.outcome.required_checks.clear();
+        let (concluded, _) = conclude_on(&gh, &no_checks).await;
+        assert_eq!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::PrOpen
+            }
+        );
+        let comments = gh.inner.comments();
+        assert!(
+            comments
+                .iter()
+                .all(|c| !c.2.contains("Required checks are green")),
+            "{comments:?}"
+        );
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.2.contains("No checks were required"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_draft_comment_reports_green_checks_when_some_were_required() {
+        let gh = proxy(SMALL);
+        let (_, _) = conclude_on(&gh, &flow("draft_pr")).await;
+        assert!(
+            gh.inner
+                .comments()
+                .iter()
+                .any(|c| c.2.contains("Required checks are green"))
         );
     }
 

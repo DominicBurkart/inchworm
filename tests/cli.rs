@@ -628,6 +628,7 @@ fn the_shipped_unit_keeps_rootless_podman_working_and_restarts_after_transient_f
         "ProtectControlGroups",
         "LockPersonality",
         "RestartPreventExitStatus",
+        "network-online",
     ] {
         assert!(!unit.contains(broken), "{broken} is still in the unit");
     }

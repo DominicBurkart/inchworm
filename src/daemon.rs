@@ -614,6 +614,7 @@ required_checks = ["build"]
         made: Mutex<usize>,
         failure: Option<String>,
         panics: bool,
+        delay: Duration,
     }
 
     impl ScriptedFactory {
@@ -629,6 +630,7 @@ required_checks = ["build"]
         fn make(&self) -> Result<Box<dyn Dispatcher>, String> {
             assert!(!self.panics, "factory panic");
             *self.made.lock().unwrap() += 1;
+            std::thread::sleep(self.delay);
             if let Some(message) = &self.failure {
                 return Err(message.clone());
             }
@@ -964,6 +966,49 @@ required_checks = ["build"]
     }
 
     #[test]
+    fn backoff_doubles_up_to_eight_times_the_poll_interval_and_is_capped() {
+        let poll = Duration::from_secs(10);
+        let delays: Vec<u64> = (0..6).map(|n| backoff(poll, n).as_secs()).collect();
+        assert_eq!(delays, [10, 20, 40, 80, 80, 80]);
+        assert_eq!(backoff(Duration::from_secs(600), 3), MAX_BACKOFF);
+        assert_eq!(backoff(Duration::from_secs(600), u32::MAX), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn shutdown_waits_for_an_in_flight_run_that_finishes_within_the_grace_period() {
+        let rig = Rig::new(FLOWS);
+        rig.green(77, 5, 1, SHA);
+        let mut settings = rig.settings();
+        settings.grace = Duration::from_secs(10);
+        let factory = ScriptedFactory {
+            delay: Duration::from_millis(500),
+            ..ScriptedFactory::with(vec![successes()])
+        };
+        let running = rig.start(settings, factory);
+        wait_for("the attempt to be dispatched", || {
+            rig.store()
+                .recent_runs(1)
+                .unwrap()
+                .first()
+                .is_some_and(|run| {
+                    rig.store()
+                        .attempts(run.id)
+                        .unwrap()
+                        .iter()
+                        .any(|a| a.state == AttemptState::Dispatched)
+                })
+        });
+        let started = Instant::now();
+        running.stop().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(states(&rig.store()), [(5, RunState::PrOpen)]);
+    }
+
+    #[test]
     fn shutdown_does_not_wait_for_an_in_flight_run_and_leaves_it_recoverable() {
         let rig = Rig::new(FLOWS);
         let running = rig.start(
@@ -1145,6 +1190,9 @@ required_checks = ["build"]
     #[test]
     fn a_queued_run_waits_out_an_unreadable_flows_file_instead_of_stalling_until_restart() {
         let rig = Rig::new("not toml at all [");
+        rig.github
+            .set_labels("o/r", 5, &["inchworm:running"], &["inchworm"])
+            .unwrap();
         let store = rig.store();
         store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
         drop(store);
@@ -1154,7 +1202,7 @@ required_checks = ["build"]
         assert_eq!(states(&rig.store()), [(5, RunState::Queued)]);
         std::fs::write(rig.dir.path().join("repo/.inchworm/flows.toml"), FLOWS).unwrap();
         wait_for("the run to finish once the file is readable", || {
-            states(&rig.store()).contains(&(5, RunState::PrOpen))
+            states(&rig.store()) == [(5, RunState::PrOpen)]
         });
         running.stop().unwrap();
     }
@@ -1314,6 +1362,7 @@ required_checks = ["build"]
     struct Flaky {
         inner: FakeGitHub,
         issue_failures: Mutex<u32>,
+        pr_failures: Mutex<u32>,
         label_ok_calls: Mutex<Option<u32>>,
     }
 
@@ -1358,6 +1407,14 @@ required_checks = ["build"]
             self.inner.pr_files(r, n)
         }
         fn pr(&self, r: &str, n: u64) -> Result<PullRequest, GitHubError> {
+            let mut left = self.pr_failures.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(GitHubError::Command {
+                    command: "gh pr view".into(),
+                    detail: "HTTP 502".into(),
+                });
+            }
             self.inner.pr(r, n)
         }
         fn pr_patch(&self, r: &str, n: u64) -> Result<String, GitHubError> {
@@ -1481,6 +1538,7 @@ required_checks = ["build"]
         let flaky = Arc::new(Flaky {
             inner: github_with_issue(),
             issue_failures: Mutex::new(2),
+            pr_failures: Mutex::new(0),
             label_ok_calls: Mutex::new(None),
         });
         green(&flaky.inner, "o/r", 77, 5);
@@ -1539,5 +1597,105 @@ required_checks = ["build"]
             b_done.is_some(),
             "o/b was starved for >30s while o/a waited on CI (a 2h wait in production)"
         );
+    }
+
+    fn seed_published(db: &std::path::Path, final_state: RunState) -> RunId {
+        let store = Store::open(db).unwrap();
+        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        store
+            .record_pr(attempt.id, "inchworm/5-a1", SHA, 77)
+            .unwrap();
+        store.mark_published(attempt.id, 0, Some(true)).unwrap();
+        store.set_run_state(run, RunState::AwaitingCi, 4).unwrap();
+        if final_state == RunState::Judging {
+            store.set_run_state(run, RunState::Judging, 5).unwrap();
+        }
+        run
+    }
+
+    fn flaky_pr(failures: u32) -> Arc<Flaky> {
+        let flaky = Arc::new(Flaky {
+            inner: github_with_issue(),
+            issue_failures: Mutex::new(0),
+            pr_failures: Mutex::new(failures),
+            label_ok_calls: Mutex::new(None),
+        });
+        flaky
+            .inner
+            .set_labels("o/r", 5, &["inchworm:running"], &["inchworm"])
+            .unwrap();
+        green(&flaky.inner, "o/r", 77, 5);
+        flaky
+    }
+
+    fn wait_state(db: &std::path::Path, want: RunState) -> Option<RunState> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut state = None;
+        while Instant::now() < deadline {
+            state = Store::open(db)
+                .unwrap()
+                .recent_runs(5)
+                .unwrap()
+                .first()
+                .map(|r| r.state);
+            if state == Some(want) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        state
+    }
+
+    #[test]
+    fn a_retried_published_run_resumes_through_legal_edges_and_never_dispatches_again() {
+        let (_dir, settings) = setup(&["o/r"]);
+        let run = seed_published(&settings.state_db, RunState::AwaitingCi);
+        let db = settings.state_db.clone();
+        let (stop, handle) = start(settings, flaky_pr(2), vec![]);
+        let state = wait_state(&db, RunState::PrOpen);
+        stop.notify_one();
+        handle.join().unwrap().unwrap();
+        assert_eq!(state, Some(RunState::PrOpen));
+        let store = Store::open(&db).unwrap();
+        let attempts = store.attempts(run).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].state, crate::store::AttemptState::Succeeded);
+    }
+
+    #[test]
+    fn a_judging_run_is_resumed_after_a_restart() {
+        let (_dir, settings) = setup(&["o/r"]);
+        let run = seed_published(&settings.state_db, RunState::Judging);
+        let db = settings.state_db.clone();
+        let (stop, handle) = start(settings, flaky_pr(0), vec![]);
+        let state = wait_state(&db, RunState::PrOpen);
+        stop.notify_one();
+        handle.join().unwrap().unwrap();
+        assert_eq!(state, Some(RunState::PrOpen));
+        assert_eq!(Store::open(&db).unwrap().attempts(run).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transient_error_retry_dispatches_exactly_once() {
+        let (_dir, settings) = setup(&["o/r"]);
+        let flaky = Arc::new(Flaky {
+            inner: github_with_issue(),
+            issue_failures: Mutex::new(3),
+            pr_failures: Mutex::new(0),
+            label_ok_calls: Mutex::new(None),
+        });
+        green(&flaky.inner, "o/r", 77, 5);
+        let db = settings.state_db.clone();
+        let (stop, handle) = start(settings, flaky, vec![ok()]);
+        let state = wait_state(&db, RunState::PrOpen);
+        stop.notify_one();
+        handle.join().unwrap().unwrap();
+        assert_eq!(state, Some(RunState::PrOpen));
+        let store = Store::open(&db).unwrap();
+        let run = store.recent_runs(5).unwrap().remove(0);
+        assert_eq!(store.recent_runs(5).unwrap().len(), 1);
+        assert_eq!(store.attempts(run.id).unwrap().len(), 1);
     }
 }

@@ -10,7 +10,7 @@ Not done or deliberately off:
 
 - `merge_when` is built and tested but no shipped config enables it. Every repo should start at `draft_pr`.
 - Merging is unreachable in production: every entry point passes `MergeGrant::Denied`, so `merge_when` degrades to `draft_pr` until nanna-coder#1043 defines the capability and a later change wires the grant to it.
-- Nothing in the test suite talks to a real nanna, GitHub or Ollama. Run `inchworm validate --online` and one foreground `inchworm run` on a throwaway issue before trusting the daemon.
+- Apart from one `#[ignore]` test that needs a real nanna, nothing in the test suite talks to a real nanna, GitHub or Ollama. Run `inchworm validate --online` and one foreground `inchworm run` on a throwaway issue before trusting the daemon.
 
 ## Install
 
@@ -82,6 +82,8 @@ The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH
 - Stopping the daemon waits up to 20 seconds for the in-flight run; a run still in flight is marked `orchestrator_lost` on the next start and counts as one attempt. This is a known limitation: there is no cooperative cancel of a dispatched nanna task on shutdown.
 - Every `gh` call is bounded by 60 seconds and runs in its own process group that is killed with it and the poll cycle runs on its own thread, so SIGTERM stops the daemon even while `gh` hangs. The SIGTERM and SIGINT handlers are installed before the daemon starts.
 - A failed dispatch drops the nanna client and the next attempt starts a fresh `nanna mcp-serve`.
+- A foreground `inchworm run` that is killed while waiting for CI leaves an open run in the store; only `inchworm daemon` resumes it, on its next start.
+- `GH_TOKEN` from the unit's `EnvironmentFile` is inherited by `nanna mcp-serve` as well as by `gh`. Whether nanna forwards it into its containers is unverified; give the token only the scopes the flows need.
 - Re-adding the trigger label to an issue whose run finished (`pr_open`, `merged` or `failed`) starts a new run on purpose; remove the label when the work is done.
 - If the initial label swap on an issue fails, the daemon remembers that only in memory; after a restart a stale trigger label next to a finished run can start another run until the label is removed by hand. Known limitation.
 - Text from nanna, `gh` and judges has control characters and bidirectional override characters replaced and is capped before it is printed by `failures`, `run` or the daemon log, or posted to an issue.
