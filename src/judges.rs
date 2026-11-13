@@ -146,6 +146,14 @@ fn parse_git_header(rest: &str, stats: &mut PatchStats) -> bool {
     }
 }
 
+fn is_git_version(line: &str) -> bool {
+    line.starts_with(|c: char| c.is_ascii_digit())
+        && line.contains('.')
+        && line.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '~' | ' ' | '(' | ')')
+        })
+}
+
 fn range_len(spec: &str) -> Option<usize> {
     match spec.split_once(',') {
         Some((start, count)) => {
@@ -191,10 +199,9 @@ pub fn patch_stats(patch: &str) -> PatchStats {
         }
         if awaiting_version {
             awaiting_version = false;
-            if line.is_empty() || line.starts_with(['+', '-']) {
+            if !is_git_version(line) {
                 stats.unparsable_header = true;
             }
-            continue;
         }
         if let Some((old, new)) = hunk.as_mut() {
             match line.as_bytes().first() {
@@ -281,6 +288,10 @@ pub fn compile_forbid_paths(patterns: &[String]) -> Result<globset::GlobSet, Str
         .map_err(|err| format!("invalid forbid_paths globs: {err}"))
 }
 
+/// The input must be exactly one patch: the output of `git diff`, or of a single-commit
+/// `git format-patch` (its `-- ` and version trailer is accepted). A multi-commit mbox is
+/// rejected because the second message's `---` separator is not a valid patch line.
+///
 /// ```
 /// use inchworm::judges::diff_judge;
 ///
@@ -1661,6 +1672,52 @@ mod tests {
         let verdict = diff_judge(&later, 100, &["secrets/**".to_string()]);
         assert!(!verdict.passed);
         assert!(verdict.detail.contains("secrets/k"), "{verdict:?}");
+    }
+
+    #[test]
+    fn only_a_git_version_line_is_accepted_after_the_signature_marker() {
+        for version in [
+            "2.54.0",
+            "2.54.0.windows.1",
+            "2.43.0-rc1",
+            "2.39.5 (Apple Git-154)",
+            "2.30.2+really2.30",
+        ] {
+            let text = format!("{MBOX_BODY}-- \n{version}\n");
+            assert!(diff_judge(&text, 100, &[]).passed, "{version}");
+        }
+        for version in [
+            "",
+            "evil",
+            "2",
+            "see below",
+            "@@ -1 +1 @@",
+            "2.54.0; rm",
+            "GIT binary patch",
+            "v2.54.0",
+            "evil.sh",
+            "-2.54.0",
+        ] {
+            let text = format!("{MBOX_BODY}-- \n{version}\n");
+            assert!(!diff_judge(&text, 100, &[]).passed, "{version:?}");
+        }
+        let lookalike = format!("{MBOX_BODY}-- x\n2.54.0\n");
+        assert!(patch_stats(&lookalike).unparsable_header);
+        assert!(!diff_judge(&lookalike, 100, &[]).passed);
+    }
+
+    #[test]
+    fn a_multi_commit_format_patch_mbox_is_rejected_as_more_than_one_patch() {
+        let first = format!("{MBOX_HEAD}{MBOX_BODY}-- \n2.54.0\n\n\n");
+        let second = "From 883c40610814ece3863932ccc43c1cd2c1bbe100 Mon Sep 17 00:00:00 2001\nFrom: t <t@e>\nSubject: [PATCH 2/2] c3\n\n---\n new.txt | 1 +\n 1 file changed, 1 insertion(+)\n\ndiff --git a/secrets/k b/secrets/k\nnew file mode 100644\n--- /dev/null\n+++ b/secrets/k\n@@ -0,0 +1 @@\n+n\n-- \n2.54.0\n";
+        let text = format!("{first}{second}");
+        assert!(diff_judge(&first, 100, &[]).passed);
+        let verdict = diff_judge(&text, 100, &["secrets/**".to_string()]);
+        assert!(!verdict.passed);
+        assert!(
+            verdict.detail.starts_with("patch could not be parsed"),
+            "{verdict:?}"
+        );
     }
 
     #[test]
