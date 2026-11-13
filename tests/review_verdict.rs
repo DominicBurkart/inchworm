@@ -124,6 +124,9 @@ fn saying_the_change_is_not_safe_blocks_but_similar_words_do_not() {
         b"VERDICT: SAFE\nThe handling is not safely wrapped but harmless.\n",
         b"VERDICT: SAFE\nNothing here is a safe-guard issue.\n",
         b"VERDICT: SAFE\nnot-safe-looking names are fine\n",
+        b"VERDICT: SAFE\nA knot safe in the vault.\n",
+        b"VERDICT: SAFE\nxnot safe\n",
+        b"VERDICT: SAFE\ncannot safely say more, but nothing found\n",
         b"VERDICT: SAFE\nThe diff is safe, and the notes say nothing unsafe was found.\n",
     ];
     for output in passing {
