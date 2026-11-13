@@ -170,6 +170,10 @@ pub enum StoreError {
         "{0} no longer names the file the daemon lock was taken on: it was removed or replaced while the lock was held, so the lock does not protect it; restart the daemon"
     )]
     DatabaseMoved(PathBuf),
+    #[error(
+        "the database stayed in {0} journal mode instead of switching to wal; the file system may not support the shared memory wal needs"
+    )]
+    WalNotEnabled(String),
     #[error("cannot use lock file {path}: {source}")]
     LockIo {
         path: PathBuf,
@@ -688,6 +692,10 @@ thread_local! {
     static WAL_TIMEOUT_SEEN: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
+fn wal_mode_reached(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("wal")
+}
+
 fn enable_wal(conn: &Connection, timeout: Duration) -> Result<(), StoreError> {
     #[cfg(test)]
     WAL_TIMEOUT_SEEN.with(|seen| seen.set(Some(timeout)));
@@ -697,7 +705,8 @@ fn enable_wal(conn: &Connection, timeout: Duration) -> Result<(), StoreError> {
         let switched = conn
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0));
         match switched {
-            Ok(_) => return Ok(()),
+            Ok(mode) if wal_mode_reached(&mode) => return Ok(()),
+            Ok(mode) => return Err(StoreError::WalNotEnabled(mode)),
             Err(err) if is_busy(&err) && Instant::now() < deadline => {
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(Duration::from_millis(100));
@@ -1729,6 +1738,30 @@ CREATE TABLE attempts (
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn only_the_wal_answer_counts_as_having_switched_to_wal() {
+        for mode in ["wal", "WAL", "Wal"] {
+            assert!(wal_mode_reached(mode), "{mode}");
+        }
+        for mode in [
+            "memory", "delete", "truncate", "persist", "off", "", "wal2", " wal",
+        ] {
+            assert!(!wal_mode_reached(mode), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn switching_to_wal_fails_when_sqlite_answers_with_another_mode() {
+        let conn = Connection::open_in_memory().unwrap();
+        match enable_wal(&conn, Duration::from_millis(50)) {
+            Err(StoreError::WalNotEnabled(mode)) => assert_eq!(mode, "memory"),
+            other => panic!("expected WalNotEnabled, got {other:?}"),
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("wal.db")).unwrap();
+        enable_wal(&conn, Duration::from_millis(50)).unwrap();
     }
 
     #[test]
