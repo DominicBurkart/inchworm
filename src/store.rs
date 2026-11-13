@@ -1041,7 +1041,12 @@ impl Store {
         }
         check_text("branch", branch, MAX_BRANCH_BYTES)?;
         check_text("head sha", head_sha, MAX_HEAD_SHA_BYTES)?;
-        let pr = i64::try_from(pr_number).map_err(corrupt("pr number"))?;
+        let pr = i64::try_from(pr_number).map_err(|_| {
+            StoreError::InvalidPullRequest(format!(
+                "the pull request number must be at most {}",
+                i64::MAX
+            ))
+        })?;
         let changed = self.conn.execute(
             "UPDATE attempts SET branch = ?1, head_sha = ?2, pr_number = ?3
              WHERE id = ?4 AND state = 'dispatched'",
@@ -2439,6 +2444,25 @@ CREATE TABLE attempts (
         store
             .record_pr(attempt.id, "feat/x y", "abc", u64::MAX >> 1)
             .unwrap();
+    }
+
+    #[test]
+    fn record_pr_numbers_beyond_what_sqlite_stores_are_an_invalid_pull_request() {
+        let (store, run) = running_store();
+        let attempt = store.start_attempt(run, 11).unwrap();
+        let largest = i64::MAX as u64;
+        store
+            .record_pr(attempt.id, "feature", "abc", largest)
+            .unwrap();
+        assert_eq!(store.attempt(attempt.id).unwrap().pr_number, Some(largest));
+        for number in [largest + 1, (1u64 << 63) + 5, u64::MAX] {
+            let detail = invalid_pr(store.record_pr(attempt.id, "other", "def", number));
+            assert!(detail.contains("pull request number"), "{number}: {detail}");
+            assert!(detail.contains(&i64::MAX.to_string()), "{number}: {detail}");
+            let unchanged = store.attempt(attempt.id).unwrap();
+            assert_eq!(unchanged.branch.as_deref(), Some("feature"));
+            assert_eq!(unchanged.pr_number, Some(largest));
+        }
     }
 
     #[test]
