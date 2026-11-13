@@ -74,6 +74,7 @@ impl<T> RepoQueues<T> {
 struct Probes {
     after_claim: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     wake_log: Mutex<Vec<BTreeSet<String>>>,
+    gate: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct Shared<T> {
@@ -92,6 +93,10 @@ impl<T> Shared<T> {
             let hook = self.probes.after_claim.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
+            }
+            let gate = self.probes.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate();
             }
         }
         claimed
@@ -462,6 +467,46 @@ mod tests {
         s.enqueue("q", 2);
         let log = s.shared.probes.wake_log.lock().unwrap().clone();
         assert_eq!(log.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn two_waiters_between_a_failed_claim_and_the_wait_are_both_woken_by_two_events() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let s: Scheduler<u8> = Scheduler::new(1);
+        let entered = Arc::new(Barrier::new(3));
+        let released = Arc::new(Barrier::new(3));
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        {
+            let (entered, released, arrivals) =
+                (entered.clone(), released.clone(), arrivals.clone());
+            *s.shared.probes.gate.lock().unwrap() = Some(Arc::new(move || {
+                if arrivals.fetch_add(1, Ordering::SeqCst) < 2 {
+                    entered.wait();
+                    released.wait();
+                }
+            }));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..2 {
+            let (s, tx) = (s.clone(), tx.clone());
+            tokio::spawn(async move {
+                let lease = s.next().await;
+                tx.send(lease).unwrap();
+            });
+        }
+        entered.wait();
+        s.enqueue("a", 1);
+        s.enqueue("b", 2);
+        released.wait();
+        let mut leases = Vec::new();
+        while leases.len() < 2 {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(lease)) => leases.push(lease),
+                _ => break,
+            }
+        }
+        assert_eq!(leases.len(), 2, "a waiter sleeps while repo b is claimable");
     }
 
     async fn settle() {
