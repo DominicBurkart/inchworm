@@ -175,6 +175,7 @@ pub fn patch_stats(patch: &str) -> PatchStats {
     let mut stats = PatchStats::default();
     let mut hunk: Option<(usize, usize)> = None;
     let mut awaiting_target = false;
+    let mut awaiting_version = false;
     if !patch.is_empty() && !patch.ends_with('\n') {
         stats.unparsable_header = true;
     }
@@ -184,7 +185,15 @@ pub fn patch_stats(patch: &str) -> PatchStats {
                 stats.unparsable_header = true;
             }
             stats.git_format = true;
+            awaiting_version = false;
             awaiting_target = parse_git_header(rest, &mut stats);
+            continue;
+        }
+        if awaiting_version {
+            awaiting_version = false;
+            if line.is_empty() || line.starts_with(['+', '-']) {
+                stats.unparsable_header = true;
+            }
             continue;
         }
         if let Some((old, new)) = hunk.as_mut() {
@@ -232,11 +241,13 @@ pub fn patch_stats(patch: &str) -> PatchStats {
                 awaiting_target = false;
             }
             header_path(rest, false, &mut stats);
+        } else if stats.git_format && line == "-- " {
+            awaiting_version = true;
         } else if stats.git_format && (line.starts_with('+') || line.starts_with('-')) {
             stats.unparsable_header = true;
         }
     }
-    if hunk.is_some() || awaiting_target {
+    if hunk.is_some() || awaiting_target || awaiting_version {
         stats.unparsable_header = true;
     }
     stats
@@ -1612,6 +1623,68 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    const MBOX_HEAD: &str = "From 294e173f437b7d46775a09af6246e1f8bec7727d Mon Sep 17 00:00:00 2001\nFrom: t <t@e>\nDate: Fri, 13 Nov 2026 08:40:02 +0100\nSubject: [PATCH] second\n\n--- a note in the body\nmore\n---\n g.txt          | 1 +\n f.txt => h.txt | 1 +\n 2 files changed, 2 insertions(+)\n rename f.txt => h.txt (75%)\n\n";
+    const MBOX_BODY: &str = "diff --git a/g.txt b/g.txt\nindex b77b4eb..04ec35a 100644\n--- a/g.txt\n+++ b/g.txt\n@@ -1,2 +1,3 @@\n x\n y\n+z\ndiff --git a/f.txt b/h.txt\nsimilarity index 75%\nrename from f.txt\nrename to h.txt\nindex de98044..d68dd40 100644\n--- a/f.txt\n+++ b/h.txt\n@@ -1,3 +1,4 @@\n a\n b\n c\n+d\n";
+
+    #[test]
+    fn git_format_patch_output_with_its_default_signature_trailer_is_accepted() {
+        for trailer in [
+            "-- \n2.54.0\n\n",
+            "-- \n2.54.0\n",
+            "-- \n2.54.0.windows.1\n\n",
+        ] {
+            let text = format!("{MBOX_HEAD}{MBOX_BODY}{trailer}");
+            let stats = patch_stats(&text);
+            assert!(!stats.unparsable_header, "{trailer:?}");
+            assert_eq!(stats.changed_lines, 2);
+            assert!(stats.paths.contains("h.txt") && stats.paths.contains("g.txt"));
+            assert!(diff_judge(&text, 10, &[]).passed, "{trailer:?}");
+            assert!(!diff_judge(&text, 10, &["h.txt".to_string()]).passed);
+            let crlf = text.replace('\n', "\r\n");
+            assert!(diff_judge(&crlf, 10, &[]).passed, "{trailer:?}");
+        }
+        let nosig = format!("{MBOX_HEAD}{MBOX_BODY}");
+        assert!(diff_judge(&nosig, 10, &[]).passed);
+    }
+
+    #[test]
+    fn a_signature_trailer_never_hides_a_truncated_hunk_or_a_later_file() {
+        let open = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,5 +1,5 @@\n-a\n+b\n";
+        let text = format!("{open}-- \n2.54.0\n");
+        assert!(patch_stats(&text).unparsable_header);
+        assert!(!diff_judge(&text, 100, &[]).passed);
+        let later = format!(
+            "{MBOX_BODY}-- \n2.54.0\ndiff --git a/secrets/k b/secrets/k\n--- a/secrets/k\n+++ b/secrets/k\n@@ -1 +1 @@\n-a\n+b\n"
+        );
+        let verdict = diff_judge(&later, 100, &["secrets/**".to_string()]);
+        assert!(!verdict.passed);
+        assert!(verdict.detail.contains("secrets/k"), "{verdict:?}");
+    }
+
+    #[test]
+    fn change_lines_after_a_signature_trailer_still_fail_closed() {
+        for tail in [
+            "-- \n+evil\n",
+            "-- \n2.54.0\n+evil\n",
+            "-- \n-evil\n",
+            "-- \n2.54.0\n-- \n+evil\n",
+        ] {
+            let text = format!("{MBOX_BODY}{tail}");
+            assert!(patch_stats(&text).unparsable_header, "{tail:?}");
+            assert!(!diff_judge(&text, 100, &[]).passed, "{tail:?}");
+        }
+        for tail in ["-- \n", "-- \n\n", "-- \r\n\r\n"] {
+            let text = format!("{MBOX_BODY}{tail}");
+            assert!(patch_stats(&text).unparsable_header, "{tail:?}");
+        }
+        let swallowed =
+            format!("{MBOX_BODY}-- \ndiff --git a/x.png b/x.png\nGIT binary patch\nliteral 1\n");
+        let verdict = diff_judge(&swallowed, 100, &[]);
+        assert!(verdict.detail.contains("binary"), "{verdict:?}");
+        let bare = format!("{MBOX_BODY}-- x\n");
+        assert!(!diff_judge(&bare, 100, &[]).passed);
     }
 
     #[test]
