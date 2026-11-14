@@ -14,6 +14,7 @@ use crate::model::{FailureClass, RunState};
 use crate::policy::{CheckConclusion, CheckRun, Decision, MergeGrant, PolicyInput, decide};
 use crate::run::{RUNNING_LABEL, trigger_label};
 use crate::store::{AttemptId, RunId, Store, StoreError};
+use crate::verifier::{Evidence, verifier_judge};
 
 pub const DONE_LABEL: &str = "inchworm:done";
 
@@ -145,12 +146,14 @@ pub struct Published<'a> {
     pub pr: &'a PullRequest,
     pub judged_sha: &'a str,
     pub report: NannaReport,
+    pub verifier: Option<Evidence>,
 }
 
 pub struct JudgeInputs<'a> {
     pub repo_path: &'a Path,
     pub patch: &'a str,
     pub report: &'a NannaReport,
+    pub verifier: Option<&'a Evidence>,
 }
 
 pub async fn run_judges(
@@ -166,6 +169,7 @@ pub async fn run_judges(
                 forbid_paths,
             } => diff_judge(inputs.patch, *max_lines, forbid_paths),
             Judge::NannaClean {} => nanna_clean_judge(inputs.report),
+            Judge::Verifier { checks, .. } => verifier_judge(checks, inputs.verifier),
             Judge::Llm {
                 rubric,
                 model,
@@ -424,6 +428,7 @@ pub async fn conclude(
             repo_path: ctx.repo_path,
             patch: &patch,
             report: &published.report,
+            verifier: published.verifier.as_ref(),
         },
     )
     .await;
@@ -993,6 +998,7 @@ mod tests {
                     denial_count: 0,
                     qa_ok: Some(true),
                 },
+                verifier: None,
             },
         )
         .await;
@@ -1020,6 +1026,7 @@ mod tests {
                             denial_count: denials,
                             qa_ok,
                         },
+                        verifier: None,
                     },
                 )
                 .await[0]
@@ -1350,6 +1357,17 @@ mod tests {
         judged: &str,
         issue: u64,
     ) -> (Concluded, Vec<String>) {
+        conclude_with_evidence(rig, flow, pr, judged, issue, None).await
+    }
+
+    async fn conclude_with_evidence(
+        rig: &Rig,
+        flow: &Flow,
+        pr: &PullRequest,
+        judged: &str,
+        issue: u64,
+        verifier: Option<Evidence>,
+    ) -> (Concluded, Vec<String>) {
         let run = rig
             .store
             .enqueue_run("o/r", 5, "issue", 1)
@@ -1379,6 +1397,7 @@ mod tests {
                 denial_count: 0,
                 qa_ok: Some(true),
             },
+            verifier,
         };
         let mut warnings = Vec::new();
         let concluded = conclude(&ctx, &env(&rig.scorer), flow, &published, &mut warnings)
@@ -1445,6 +1464,83 @@ mod tests {
             raw.contains("last github error") && raw.contains("HTTP 503"),
             "{raw}"
         );
+    }
+
+    fn verifier_draft_flow() -> Flow {
+        let extra = format!(
+            "{}[[flow.judge]]\nkind = \"verifier\"\nchecks = [\"coverage\"]\n{}",
+            diff_judge_toml(50),
+            outcome_toml("draft_pr", &[])
+        );
+        flow_with(1, "", &extra)
+    }
+
+    fn reported(name: &str, status: crate::verifier::CheckStatus) -> Evidence {
+        Evidence::Checks(vec![crate::verifier::ReportedCheck {
+            name: name.to_string(),
+            status,
+            exit_code: Some(0),
+        }])
+    }
+
+    async fn conclude_verifier(evidence: Option<Evidence>) -> (Concluded, Rig) {
+        let rig = rig();
+        rig.github.add_pr("o/r", "b", pr_at(77, SHA));
+        rig.github.set_pr_patch("o/r", 77, &patch(2));
+        let (concluded, _) = conclude_with_evidence(
+            &rig,
+            &verifier_draft_flow(),
+            &pr_at(77, SHA),
+            SHA,
+            5,
+            evidence,
+        )
+        .await;
+        (concluded, rig)
+    }
+
+    #[tokio::test]
+    async fn a_passing_verifier_with_a_passing_diff_leaves_a_draft() {
+        use crate::verifier::CheckStatus;
+        let (concluded, rig) =
+            conclude_verifier(Some(reported("coverage", CheckStatus::Passed))).await;
+        assert!(matches!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::PrOpen
+            }
+        ));
+        assert!(
+            rig.github
+                .comments()
+                .iter()
+                .any(|c| c.2.contains("diff pass, verifier pass"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_verifier_is_judge_rejected_even_when_the_diff_passes() {
+        use crate::verifier::CheckStatus;
+        let (concluded, _) =
+            conclude_verifier(Some(reported("coverage", CheckStatus::Failed))).await;
+        assert!(matches!(
+            concluded,
+            Concluded::Rejected { class: FailureClass::JudgeRejected, raw } if raw.contains("verifier: coverage failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_unavailable_verifier_evidence_is_a_model_error() {
+        for evidence in [None, Some(Evidence::Unavailable("nanna is down".into()))] {
+            let (concluded, _) = conclude_verifier(evidence).await;
+            assert!(matches!(
+                concluded,
+                Concluded::Rejected {
+                    class: FailureClass::ModelError,
+                    ..
+                }
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1851,6 +1947,7 @@ mod round2_safety {
                 denial_count: 0,
                 qa_ok: Some(true),
             },
+            verifier: None,
         };
         let mut warnings = Vec::new();
         let concluded = conclude(&ctx, &env(&scorer), flow, &published, &mut warnings)
