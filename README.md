@@ -176,7 +176,54 @@ mode = "draft_pr"
 required_checks = ["Tests"]
 ```
 
+```toml
+[[flow.judge]]
+kind = "verifier"
+checks = ["fmt", "tests", "coverage"]
+```
+
 `mode = "merge_when"` additionally requires at least one judge and a non-empty `required_checks`. Unknown keys are rejected everywhere.
+
+## Verifier judge
+
+`kind = "verifier"` passes only when nanna's `verifier` identity reports every named check as `passed`. Inchworm never runs a repository command on the host: after the steps and the pull request exist, and before judging, it dispatches one nanna task with `identity = "verifier"` and `branch` set to the attempt's pull request branch (`inchworm/<issue>-a<n>`, not the flow base). The verifier runs the checks declared in `.nanna/verify.toml` inside nanna's dev container and returns structured per-check results. The retry loop is the loop: a failed verifier verdict is `judge_rejected`, so a flow that lists `judge_rejected` in `retry_on` retries with the previous failure in the prompt, and there is no other loop construct.
+
+```toml
+[[flow.judge]]
+kind = "verifier"
+checks = ["coverage", "patch-coverage"]
+```
+
+With this in `.nanna/verify.toml`, a marigold flow gates on the repository's own coverage script before and during the close-coverage loop:
+
+```toml
+[[check]]
+name = "coverage"
+command = "python3 .nanna/inchworm/gate.py coverage"
+timeout_secs = 1800
+
+[[check]]
+name = "patch-coverage"
+command = "python3 .nanna/inchworm/gate.py patch-coverage"
+timeout_secs = 1800
+```
+
+Configuration: `checks` is required, non-empty, at most 32 entries, unique, each 1 to 64 ASCII letters, digits, `_`, `-` or `.` (nanna's own check-name grammar, so no control characters). At most one verifier judge per flow. `require_all` defaults to `true`; `false` is rejected because no weaker semantics are defined. Unknown keys are rejected, so a `command` key is an error: commands live only in the protected `.nanna/verify.toml`. `inchworm validate` reports configuration errors and warns, from a size-capped read-only look at `.nanna/verify.toml`, when a named check is not declared there.
+
+Verdicts:
+
+- Pass: every named check is reported once with status `passed`. Other reported checks are ignored.
+- Plain failure (`judge_rejected`): a named check is missing, `failed`, `timed_out` or `skipped`, or nanna reports `VerificationFailed` without per-check records. The detail names only the configured check, the status and the exit code.
+- Infrastructure failure (`model_error`, like Ollama being down): nanna unreachable, refusing, cancelling or timing out the task, `VerifierChecksInvalid`, `VerifierRequiresContainer`, `VerifierExecFailed`, any other task failure, a result over 512 KiB, a result that does not match the schema, an unknown status, unknown or missing fields, duplicate keys (in the result text and in each check record), duplicate or invalid check names, more than 32 checks, no checks at all, or a task that produced changes (a card named `verifier` that is really an agent never passes). If another judge also failed for a real reason the class is `judge_rejected`.
+
+The result is untrusted input. It is parsed from its exact text with a strict schema and size caps, check `output` and `command` are parsed and dropped, and verdict text, which can reach the next attempt's prompt, is built only from configured check names, status labels and integer exit codes with control characters replaced, so no model ever sees nanna-supplied text and no delimiter scheme is needed. `policy::decide` still requires exactly one passing verdict per configured judge by (kind, index), so a failed verifier can never be overridden by a passing `diff`, `nanna_clean` or `llm` verdict, nor the reverse, and judges take precedence over CI. `[auditor]` stays mandatory and `draft_pr` stays the only reachable outcome.
+
+JSON contract consumed from nanna (nanna-coder#1032, head `9e647bda`, a draft; the shape is taken from its ARCHITECTURE.md and tests, not from a running nanna):
+
+- All checks passed: task `completed`, result text is a JSON object whose `qa_summary.checks` is an array of `{name, command, status, exit_code, timeout_secs, duration_ms, output, output_truncated}` with `status` in `passed | failed | timed_out | skipped`. Other top-level and `qa_summary` keys are ignored; the check objects must have exactly these eight keys.
+- Any check failed or timed out: task `failed` with `error_type = "VerificationFailed"` (or `failure_kind = "verification_failed"`), and the diagnostics JSON after the blank line in the error text has `tool_call_history` entries with `tool_name = "run_check"` whose `result` is a string holding that check's object. When those records are absent the verdict is a plain failure; when they are present, named checks that passed still pass, so a flow naming only `coverage` is not failed by an unrelated failing check.
+
+Known gaps: the result carries no commit SHA, so the binding is the branch at dispatch plus the live head equalling the judged head after verification returns (a head that moved is `merge_blocked`); whether nanna resolves `branch` against a local ref in `repo_path` for a branch a step pushed is unverified. A duplicate key in the already-parsed MCP envelope (`structuredContent`) cannot be detected. Exhausting retries relies on offramps (#6 D2), which are not executed yet.
 
 ## LLM judge safety
 
