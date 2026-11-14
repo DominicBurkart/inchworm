@@ -117,6 +117,7 @@ pub struct NannaFailure {
     pub failure_kind: Option<String>,
     pub error_type: Option<String>,
     pub message: String,
+    pub diagnostics_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +130,7 @@ pub struct TaskDone {
     pub iterations: u64,
     pub model_used: String,
     pub raw: Value,
+    pub result_text: String,
 }
 
 impl TaskDone {
@@ -162,7 +164,7 @@ impl TaskDone {
             || !self.files_modified.is_empty()
     }
 
-    fn from_wire(raw: Value) -> TaskDone {
+    fn from_wire(raw: Value, result_text: String) -> TaskDone {
         let text = |key: &str| {
             raw.get(key)
                 .and_then(Value::as_str)
@@ -193,6 +195,7 @@ impl TaskDone {
             iterations: raw.get("iterations").and_then(Value::as_u64).unwrap_or(0),
             model_used: text("model_used").unwrap_or_default(),
             raw,
+            result_text,
         }
     }
 }
@@ -380,6 +383,7 @@ impl NannaClient {
                 failure_kind,
                 error_type: None,
                 message,
+                diagnostics_text: None,
             })),
             Err(other) => Err(other),
         }
@@ -516,7 +520,11 @@ fn parse_failure(value: &Value) -> NannaFailure {
         Some((head, tail)) => (head.to_string(), Some(tail)),
         None => (text.clone(), None),
     };
-    let diagnostics_type = tail
+    let diagnostics_text = tail
+        .filter(|tail| serde_json::from_str::<Value>(tail).is_ok())
+        .map(str::to_string);
+    let diagnostics_type = diagnostics_text
+        .as_deref()
         .and_then(|tail| serde_json::from_str::<Value>(tail).ok())
         .and_then(|d| {
             d.get("error_type")
@@ -527,6 +535,7 @@ fn parse_failure(value: &Value) -> NannaFailure {
         failure_kind: string_at("/failure_kind"),
         error_type: string_at("/error_type").or(diagnostics_type),
         message: string_at("/error").unwrap_or(head),
+        diagnostics_text,
     }
 }
 
@@ -558,7 +567,7 @@ pub fn parse_result(state: TaskState, value: &Value) -> Result<TaskOutcome, Clie
     let text = result_text(value);
     let raw: Value = serde_json::from_str(&text)
         .map_err(|e| ClientError::Protocol(format!("task result is not JSON: {e}")))?;
-    Ok(TaskOutcome::Completed(TaskDone::from_wire(raw)))
+    Ok(TaskOutcome::Completed(TaskDone::from_wire(raw, text)))
 }
 
 #[cfg(test)]

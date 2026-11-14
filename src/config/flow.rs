@@ -92,6 +92,15 @@ pub enum Judge {
         model: String,
         min_score: u8,
     },
+    Verifier {
+        checks: Vec<String>,
+        #[serde(default = "default_require_all")]
+        require_all: bool,
+    },
+}
+
+fn default_require_all() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +135,7 @@ impl Judge {
             Judge::Diff { .. } => "diff",
             Judge::NannaClean {} => "nanna_clean",
             Judge::Llm { .. } => "llm",
+            Judge::Verifier { .. } => "verifier",
         }
     }
 }
@@ -234,8 +244,35 @@ impl Flow {
                     crate::judges::compile_forbid_paths(forbid_paths)
                         .map_err(|reason| invalid(self, reason))?;
                 }
-                _ => {}
+                Judge::Verifier {
+                    checks,
+                    require_all,
+                } => {
+                    if !*require_all {
+                        return Err(invalid(
+                            self,
+                            "verifier judge require_all = false is not supported; every named check must pass",
+                        ));
+                    }
+                    crate::verifier::validate_checks(checks)
+                        .map_err(|reason| invalid(self, reason))?;
+                }
+                Judge::NannaClean {} => {}
             }
+        }
+        let verifiers = self
+            .judge
+            .iter()
+            .filter(|judge| matches!(judge, Judge::Verifier { .. }))
+            .count();
+        if verifiers > crate::verifier::MAX_VERIFIERS_PER_FLOW {
+            return Err(invalid(
+                self,
+                format!(
+                    "at most {} verifier judge is allowed per flow",
+                    crate::verifier::MAX_VERIFIERS_PER_FLOW
+                ),
+            ));
         }
         if self.outcome.mode == OutcomeMode::MergeWhen {
             if self.judge.is_empty() {
@@ -510,6 +547,77 @@ mode = "draft_pr"
         }
     }
 
+    const VERIFIER: &str = "[[flow.judge]]\nkind = \"verifier\"\nchecks = [\"fmt\", \"tests\"]\n";
+
+    fn with_judges(extra: &str) -> String {
+        minimal().replace("[flow.outcome]", &format!("{extra}\n[flow.outcome]"))
+    }
+
+    #[test]
+    fn a_verifier_judge_parses_with_require_all_defaulting_to_true() {
+        let file = FlowFile::parse(&with_judges(VERIFIER)).unwrap();
+        assert_eq!(
+            file.flow[0].judge,
+            [Judge::Verifier {
+                checks: vec!["fmt".into(), "tests".into()],
+                require_all: true
+            }]
+        );
+        assert_eq!(file.flow[0].judge[0].kind_name(), "verifier");
+        let explicit = VERIFIER.to_string() + "require_all = true\n";
+        assert!(FlowFile::parse(&with_judges(&explicit)).is_ok());
+    }
+
+    #[test]
+    fn verifier_judges_reject_unknown_keys_and_repo_commands() {
+        for key in ["command = \"rm -rf /\"", "surprise = 1", "timeout_secs = 5"] {
+            let text = with_judges(&format!("{VERIFIER}{key}\n"));
+            assert!(FlowFile::parse(&text).is_err(), "{key}");
+        }
+        let no_checks = "[[flow.judge]]\nkind = \"verifier\"\n";
+        assert!(FlowFile::parse(&with_judges(no_checks)).is_err());
+    }
+
+    #[test]
+    fn verifier_validation_errors_are_specific() {
+        let cases = [
+            ("checks = []", "at least one"),
+            ("checks = [\"a\", \"a\"]", "twice"),
+            ("checks = [\"a b\"]", "must be 1 to"),
+            ("checks = [\"a\\u0000\"]", "must be 1 to"),
+            ("checks = [\"\"]", "must be 1 to"),
+            ("checks = [\"fmt\"]\nrequire_all = false", "require_all"),
+        ];
+        for (body, needle) in cases {
+            let text = with_judges(&format!("[[flow.judge]]\nkind = \"verifier\"\n{body}\n"));
+            let message = err_text(&text);
+            assert!(message.contains(needle), "{body}: {message}");
+        }
+        let many: Vec<String> = (0..=crate::verifier::MAX_CHECKS)
+            .map(|n| format!("\"c{n}\""))
+            .collect();
+        let text = with_judges(&format!(
+            "[[flow.judge]]\nkind = \"verifier\"\nchecks = [{}]\n",
+            many.join(", ")
+        ));
+        assert!(err_text(&text).contains("more than"));
+    }
+
+    #[test]
+    fn at_most_one_verifier_judge_per_flow() {
+        let text = with_judges(&format!("{VERIFIER}{VERIFIER}"));
+        assert!(err_text(&text).contains("at most 1 verifier"));
+    }
+
+    #[test]
+    fn a_verifier_judge_counts_for_merge_when_but_does_not_enable_merging() {
+        let text = with_judges(VERIFIER).replace(
+            "mode = \"draft_pr\"",
+            "mode = \"merge_when\"\nrequired_checks = [\"build\"]",
+        );
+        assert!(FlowFile::parse(&text).is_ok());
+    }
+
     fn name_strategy() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_-]{0,10}".prop_map(String::from)
     }
@@ -525,6 +633,12 @@ mode = "draft_pr"
                     forbid_paths
                 }),
             Just(Judge::NannaClean {}),
+            prop::collection::btree_set("[a-z][a-z0-9_.-]{0,15}", 1..5).prop_map(|checks| {
+                Judge::Verifier {
+                    checks: checks.into_iter().collect(),
+                    require_all: true,
+                }
+            }),
             ("[a-z./]{1,12}", name_strategy(), 0u8..=10).prop_map(|(rubric, model, min_score)| {
                 Judge::Llm {
                     rubric: PathBuf::from(rubric),
@@ -567,6 +681,14 @@ mode = "draft_pr"
                     merge,
                     method,
                 )| {
+                    let mut verifier_seen = false;
+                    let judge = judge
+                        .into_iter()
+                        .filter(|judge| {
+                            !matches!(judge, Judge::Verifier { .. })
+                                || !std::mem::replace(&mut verifier_seen, true)
+                        })
+                        .collect();
                     let mut seen = HashSet::new();
                     let step = steps
                         .into_iter()

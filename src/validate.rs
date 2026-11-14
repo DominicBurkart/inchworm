@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::config::{FlowFile, GlobalConfig, Judge, RepoEntry};
 
@@ -153,8 +154,13 @@ fn check_flows(repo: &RepoEntry, report: &mut Report) {
             return;
         }
     };
+    let mut declared: Option<Result<Vec<String>, String>> = None;
     for flow in &file.flow {
         for judge in &flow.judge {
+            if let Judge::Verifier { checks, .. } = judge {
+                let declared = declared.get_or_insert_with(|| declared_checks(&repo.path));
+                check_verifier_names(slug, &flow.name, checks, declared, report);
+            }
             if let Judge::Llm { rubric, .. } = judge
                 && !repo.path.join(rubric).is_file()
             {
@@ -165,6 +171,64 @@ fn check_flows(repo: &RepoEntry, report: &mut Report) {
                         "flow `{}`: rubric {} does not exist",
                         flow.name,
                         rubric.display()
+                    ),
+                );
+            }
+        }
+    }
+}
+
+const MAX_VERIFY_FILE_BYTES: u64 = 64 * 1024;
+
+fn declared_checks(repo: &Path) -> Result<Vec<String>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(repo.join(".nanna/verify.toml"))
+        .map_err(|err| format!("cannot read .nanna/verify.toml: {err}"))?;
+    let mut text = String::new();
+    file.take(MAX_VERIFY_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|err| format!("cannot read .nanna/verify.toml: {err}"))?;
+    if text.len() as u64 > MAX_VERIFY_FILE_BYTES {
+        return Err(format!(
+            ".nanna/verify.toml is larger than {MAX_VERIFY_FILE_BYTES} bytes"
+        ));
+    }
+    let table: toml::Table = text
+        .parse()
+        .map_err(|err| format!(".nanna/verify.toml: {err}"))?;
+    Ok(table
+        .get("check")
+        .and_then(toml::Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .filter_map(|check| check.get("name").and_then(toml::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn check_verifier_names(
+    slug: Option<&str>,
+    flow: &str,
+    checks: &[String],
+    declared: &Result<Vec<String>, String>,
+    report: &mut Report,
+) {
+    match declared {
+        Err(reason) => report.push(
+            slug,
+            Severity::Warning,
+            format!("flow `{flow}`: the verifier judge cannot be checked: {reason}"),
+        ),
+        Ok(names) => {
+            for check in checks.iter().filter(|check| !names.contains(check)) {
+                report.push(
+                    slug,
+                    Severity::Warning,
+                    format!(
+                        "flow `{flow}`: verifier check `{check}` is not declared in .nanna/verify.toml"
                     ),
                 );
             }
@@ -392,6 +456,79 @@ mode = "draft_pr"
                 .iter()
                 .any(|m| m.contains("missing .nanna/protected.toml"))
         );
+    }
+
+    fn verifier_flows(checks: &str) -> String {
+        FLOWS.replace(
+            "[flow.outcome]",
+            &format!("[[flow.judge]]\nkind = \"verifier\"\nchecks = [{checks}]\n\n[flow.outcome]"),
+        )
+    }
+
+    #[test]
+    fn verifier_checks_must_be_declared_in_the_repository_but_only_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        write(
+            dir.path(),
+            ".inchworm/flows.toml",
+            &verifier_flows("\"fmt\", \"coverage\""),
+        );
+        write(
+            dir.path(),
+            ".nanna/verify.toml",
+            "[[check]]\nname = \"fmt\"\ncommand = \"cargo fmt --check\"\n",
+        );
+        let report = validate(&config_for(dir.path()));
+        assert!(report.is_ok());
+        assert_eq!(report.warning_count(), 1);
+        assert!(messages(&report)[0].contains("`coverage` is not declared"));
+
+        write(
+            dir.path(),
+            ".nanna/verify.toml",
+            "[[check]]\nname = \"fmt\"\ncommand = \"a\"\n[[check]]\nname = \"coverage\"\ncommand = \"b\"\n",
+        );
+        assert_eq!(validate(&config_for(dir.path())).warning_count(), 0);
+    }
+
+    #[test]
+    fn a_missing_oversized_or_malformed_verify_file_is_a_warning_not_an_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        write(
+            dir.path(),
+            ".inchworm/flows.toml",
+            &verifier_flows("\"fmt\""),
+        );
+        let report = validate(&config_for(dir.path()));
+        assert!(report.is_ok());
+        assert!(messages(&report)[0].contains("cannot read .nanna/verify.toml"));
+
+        write(dir.path(), ".nanna/verify.toml", &"#".repeat(70_000));
+        assert!(messages(&validate(&config_for(dir.path())))[0].contains("larger than"));
+
+        write(dir.path(), ".nanna/verify.toml", "[[check");
+        let report = validate(&config_for(dir.path()));
+        assert!(report.is_ok());
+        assert!(messages(&report)[0].contains(".nanna/verify.toml:"));
+
+        write(dir.path(), ".nanna/verify.toml", "check = 3\n");
+        assert!(messages(&validate(&config_for(dir.path())))[0].contains("`fmt` is not declared"));
+    }
+
+    #[test]
+    fn invalid_verifier_judge_configuration_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        write(
+            dir.path(),
+            ".inchworm/flows.toml",
+            &verifier_flows("\"a b\""),
+        );
+        let report = validate(&config_for(dir.path()));
+        assert!(!report.is_ok());
+        assert!(messages(&report).iter().any(|m| m.contains("must be 1 to")));
     }
 
     #[test]

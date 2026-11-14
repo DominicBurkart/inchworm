@@ -52,6 +52,53 @@ impl Scenario {
         Scenario::Success { result }
     }
 
+    pub fn verifier_completed(checks: &[(&str, &str)]) -> Scenario {
+        let records: Vec<Value> = checks.iter().map(|(n, s)| check_record(n, s)).collect();
+        let body = json!({
+            "result_summary": "checks ran",
+            "changes_patch": null,
+            "files_modified": [],
+            "denial_count": 0,
+            "iterations": 0,
+            "qa_summary": {"endpoint_runs": 0, "checks": records},
+        });
+        Scenario::Success {
+            result: json!({
+                "isError": false,
+                "content": [{"type": "text", "text": body.to_string()}],
+            }),
+        }
+    }
+
+    pub fn verifier_failed(checks: &[(&str, &str)]) -> Scenario {
+        let history: Vec<Value> = checks
+            .iter()
+            .map(|(n, s)| json!({"tool_name": "run_check", "result": check_record(n, s).to_string()}))
+            .collect();
+        let diagnostics = json!({"error_type": "VerificationFailed", "tool_call_history": history});
+        Scenario::Failed {
+            result: json!({
+                "isError": true,
+                "content": [{"type": "text", "text": format!("check failed\n\n{diagnostics}")}],
+                "structuredContent": {
+                    "failure_kind": "verification_failed",
+                    "error_type": "VerificationFailed",
+                    "error": "check failed",
+                },
+            }),
+        }
+    }
+
+    pub fn verifier_infra_failure(error_type: &str) -> Scenario {
+        Scenario::Failed {
+            result: json!({
+                "isError": true,
+                "content": [{"type": "text", "text": "could not run"}],
+                "structuredContent": {"error_type": error_type, "error": "could not run"},
+            }),
+        }
+    }
+
     pub fn failed(fixture_name: &str) -> Scenario {
         Scenario::Failed {
             result: fixture(fixture_name),
@@ -63,6 +110,19 @@ impl Scenario {
             error: fixture(fixture_name),
         }
     }
+}
+
+fn check_record(name: &str, status: &str) -> Value {
+    json!({
+        "name": name,
+        "command": "true",
+        "status": status,
+        "exit_code": if status == "passed" { json!(0) } else { json!(1) },
+        "timeout_secs": 900,
+        "duration_ms": 5,
+        "output": "",
+        "output_truncated": false,
+    })
 }
 
 pub type Requests = Arc<Mutex<Vec<Value>>>;

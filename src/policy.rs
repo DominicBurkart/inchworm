@@ -303,6 +303,126 @@ mod tests {
         }
     }
 
+    fn with_verifier(verdicts: Vec<Verdict>) -> Case {
+        let mut case = Case::merge_ready();
+        case.expected = names(&["diff", "verifier", "llm"]);
+        case.verdicts = verdicts;
+        case
+    }
+
+    #[test]
+    fn a_passing_verifier_alongside_passing_judges_still_merges() {
+        let case = with_verifier(vec![
+            passed("diff", 0),
+            passed("verifier", 1),
+            passed("llm", 2),
+        ]);
+        assert_eq!(case.decide(), merged());
+    }
+
+    #[test]
+    fn a_failing_verifier_is_not_overridden_by_a_passing_diff_or_llm_verdict() {
+        let case = with_verifier(vec![
+            passed("diff", 0),
+            failed("verifier", 1),
+            passed("llm", 2),
+        ]);
+        assert_eq!(case.decide(), Decision::Reject(FailureClass::JudgeRejected));
+    }
+
+    #[test]
+    fn a_passing_verifier_does_not_override_a_failing_diff_or_llm_verdict() {
+        for failing in [0, 2] {
+            let mut verdicts = vec![passed("diff", 0), passed("verifier", 1), passed("llm", 2)];
+            verdicts[failing] = failed(&verdicts[failing].judge.clone(), failing);
+            assert_eq!(
+                with_verifier(verdicts).decide(),
+                Decision::Reject(FailureClass::JudgeRejected)
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_infrastructure_failure_alone_is_a_model_error() {
+        let case = with_verifier(vec![
+            passed("diff", 0),
+            failed("verifier", 1).with_model_error(),
+            passed("llm", 2),
+        ]);
+        assert_eq!(case.decide(), Decision::Reject(FailureClass::ModelError));
+    }
+
+    #[test]
+    fn verifier_infrastructure_failure_next_to_a_real_failure_is_judge_rejected() {
+        let case = with_verifier(vec![
+            failed("diff", 0),
+            failed("verifier", 1).with_model_error(),
+            passed("llm", 2),
+        ]);
+        assert_eq!(case.decide(), Decision::Reject(FailureClass::JudgeRejected));
+    }
+
+    #[test]
+    fn a_verifier_verdict_cannot_stand_in_for_another_kind_or_be_duplicated() {
+        let swapped = with_verifier(vec![
+            passed("verifier", 0),
+            passed("diff", 1),
+            passed("llm", 2),
+        ]);
+        assert_eq!(
+            swapped.decide(),
+            Decision::Reject(FailureClass::JudgeRejected)
+        );
+        let duplicated = with_verifier(vec![
+            passed("diff", 0),
+            passed("verifier", 1),
+            passed("verifier", 1),
+            passed("llm", 2),
+        ]);
+        assert_eq!(
+            duplicated.decide(),
+            Decision::Reject(FailureClass::JudgeRejected)
+        );
+        let missing = with_verifier(vec![passed("diff", 0), passed("llm", 2)]);
+        assert_eq!(
+            missing.decide(),
+            Decision::Reject(FailureClass::JudgeRejected)
+        );
+    }
+
+    #[test]
+    fn a_failing_verifier_takes_precedence_over_red_ci_and_blocks_merging() {
+        let mut case = with_verifier(vec![
+            passed("diff", 0),
+            failed("verifier", 1),
+            passed("llm", 2),
+        ]);
+        case.checks = vec![
+            check("build", SHA, CheckConclusion::Failure),
+            check("test", SHA, CheckConclusion::Success),
+        ];
+        assert_eq!(case.decide(), Decision::Reject(FailureClass::JudgeRejected));
+        case.checks = vec![
+            check("build", SHA, CheckConclusion::Success),
+            check("test", SHA, CheckConclusion::Success),
+        ];
+        assert_ne!(case.decide(), merged());
+    }
+
+    #[test]
+    fn a_passing_verifier_does_not_hide_red_ci() {
+        let mut case = with_verifier(vec![
+            passed("diff", 0),
+            passed("verifier", 1),
+            passed("llm", 2),
+        ]);
+        case.checks = vec![
+            check("build", SHA, CheckConclusion::Failure),
+            check("test", SHA, CheckConclusion::Success),
+        ];
+        assert_eq!(case.decide(), Decision::Reject(FailureClass::CiRed));
+    }
+
     #[test]
     fn merge_when_with_everything_green_merges_on_the_exact_head() {
         assert_eq!(Case::merge_ready().decide(), merged());

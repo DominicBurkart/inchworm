@@ -19,3 +19,4 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod validate;
+pub mod verifier;
