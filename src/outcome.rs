@@ -202,7 +202,7 @@ pub struct ConcludeContext<'a> {
     pub clock: &'a dyn Clock,
     pub slug: &'a str,
     pub repo_path: &'a Path,
-    pub issue: u64,
+    pub issue: Option<u64>,
 }
 
 fn failed_verdicts(verdicts: &[Verdict]) -> String {
@@ -232,10 +232,13 @@ fn warn_label_comment(
     body: &str,
     warnings: &mut Vec<String>,
 ) {
-    if let Err(err) = ctx.github.set_labels(ctx.slug, ctx.issue, add, remove) {
+    let Some(issue) = ctx.issue else {
+        return;
+    };
+    if let Err(err) = ctx.github.set_labels(ctx.slug, issue, add, remove) {
         warnings.push(format!("could not update labels: {err}"));
     }
-    if let Err(err) = ctx.github.comment(ctx.slug, ctx.issue, body) {
+    if let Err(err) = ctx.github.comment(ctx.slug, issue, body) {
         warnings.push(format!("could not comment on the issue: {err}"));
     }
 }
@@ -1367,7 +1370,7 @@ mod tests {
             clock: &rig.clock,
             slug: "o/r",
             repo_path: rig.dir.path(),
-            issue,
+            issue: Some(issue),
         };
         let published = Published {
             run_id: run,
@@ -1838,7 +1841,7 @@ mod round2_safety {
             clock: &clock,
             slug: "o/r",
             repo_path: dir.path(),
-            issue: 5,
+            issue: Some(5),
         };
         let pr = pr_at(77, SHA);
         let published = Published {

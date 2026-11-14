@@ -96,6 +96,13 @@ impl Trigger {
     /// assert!(Trigger::Schedule { cron: "nope".into() }.cron().unwrap().is_err());
     /// assert!(Trigger::Label { label: "x".into() }.cron().is_none());
     /// ```
+    pub fn cron_text(&self) -> Option<&str> {
+        match self {
+            Trigger::Label { .. } => None,
+            Trigger::Schedule { cron } => Some(cron),
+        }
+    }
+
     pub fn cron(&self) -> Option<Result<crate::cron::Cron, crate::cron::CronError>> {
         match self {
             Trigger::Label { .. } => None,
