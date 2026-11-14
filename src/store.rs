@@ -54,7 +54,21 @@ CREATE TABLE verdicts (
 CREATE INDEX verdicts_by_attempt ON verdicts (attempt_id);
 CREATE INDEX attempts_by_failure ON attempts (failure_class);
 ",
+    "
+ALTER TABLE runs ADD COLUMN fire_at INTEGER;
+CREATE UNIQUE INDEX runs_one_per_fire
+    ON runs (repo, flow, fire_at)
+    WHERE fire_at IS NOT NULL;
+CREATE TABLE schedule_seen (
+    repo TEXT NOT NULL,
+    flow TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    PRIMARY KEY (repo, flow)
+);
+",
 ];
+
+pub const SCHEDULED_SUBJECT: u64 = 0;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -110,6 +124,19 @@ pub struct Run {
     pub state: RunState,
     pub created_at: i64,
     pub updated_at: i64,
+    pub fire_at: Option<i64>,
+}
+
+impl Run {
+    pub fn is_scheduled(&self) -> bool {
+        self.fire_at.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleState {
+    pub first_seen: i64,
+    pub last_fire: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +210,7 @@ fn run_from_row(row: &Row<'_>) -> Result<Run, StoreError> {
         state: state.parse().map_err(corrupt("run state"))?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        fire_at: row.get("fire_at")?,
     })
 }
 
@@ -298,6 +326,73 @@ impl Store {
             params![repo, issue, flow, RunState::Queued.as_str(), now],
         )?;
         Ok((changed == 1).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// ```
+    /// use inchworm::store::Store;
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let run = store.enqueue_scheduled("o/r", "weekly", 3600, 3700).unwrap().unwrap();
+    /// assert_eq!(store.run(run).unwrap().fire_at, Some(3600));
+    /// assert!(store.enqueue_scheduled("o/r", "weekly", 3600, 3800).unwrap().is_none());
+    /// assert!(store.enqueue_scheduled("o/r", "weekly", 7200, 7300).unwrap().is_none());
+    /// ```
+    pub fn enqueue_scheduled(
+        &self,
+        repo: &str,
+        flow: &str,
+        fire_at: i64,
+        now: i64,
+    ) -> Result<Option<RunId>, StoreError> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO runs (repo, issue, flow, state, created_at, updated_at, fire_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            params![
+                repo,
+                i64::try_from(SCHEDULED_SUBJECT).map_err(corrupt("subject"))?,
+                flow,
+                RunState::Queued.as_str(),
+                now,
+                fire_at
+            ],
+        )?;
+        Ok((changed == 1).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// ```
+    /// use inchworm::store::Store;
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let first = store.schedule_state("o/r", "weekly", 100).unwrap();
+    /// assert_eq!((first.first_seen, first.last_fire), (100, None));
+    /// store.enqueue_scheduled("o/r", "weekly", 150, 160).unwrap();
+    /// let later = store.schedule_state("o/r", "weekly", 999).unwrap();
+    /// assert_eq!((later.first_seen, later.last_fire), (100, Some(150)));
+    /// ```
+    pub fn schedule_state(
+        &self,
+        repo: &str,
+        flow: &str,
+        now: i64,
+    ) -> Result<ScheduleState, StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schedule_seen (repo, flow, first_seen) VALUES (?1, ?2, ?3)",
+            params![repo, flow, now],
+        )?;
+        let first_seen = self.conn.query_row(
+            "SELECT first_seen FROM schedule_seen WHERE repo = ?1 AND flow = ?2",
+            params![repo, flow],
+            |row| row.get(0),
+        )?;
+        let last_fire = self.conn.query_row(
+            "SELECT MAX(fire_at) FROM runs WHERE repo = ?1 AND flow = ?2",
+            params![repo, flow],
+            |row| row.get(0),
+        )?;
+        Ok(ScheduleState {
+            first_seen,
+            last_fire,
+        })
     }
 
     pub fn last_finished(
@@ -715,6 +810,156 @@ mod tests {
     }
 
     #[test]
+    fn a_scheduled_run_is_keyed_by_flow_and_fire_time_across_all_states() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .enqueue_scheduled("o/r", "weekly", 1000, 1001)
+            .unwrap()
+            .unwrap();
+        let run = store.run(id).unwrap();
+        assert_eq!(
+            (run.issue, run.fire_at, run.is_scheduled()),
+            (SCHEDULED_SUBJECT, Some(1000), true)
+        );
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "weekly", 1000, 1002)
+                .unwrap()
+                .is_none()
+        );
+        for terminal in [RunState::Running, RunState::Failed] {
+            store.set_run_state(id, terminal, 1003).unwrap();
+        }
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "weekly", 1000, 1004)
+                .unwrap()
+                .is_none(),
+            "a finished bucket is never fired again"
+        );
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "weekly", 2000, 2001)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "other", 1000, 1005)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .enqueue_scheduled("o/x", "weekly", 1000, 1006)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn at_most_one_scheduled_run_per_flow_is_open() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store
+            .enqueue_scheduled("o/r", "weekly", 1000, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "weekly", 2000, 2)
+                .unwrap()
+                .is_none()
+        );
+        for step in [RunState::Running, RunState::Failed] {
+            store.set_run_state(first, step, 3).unwrap();
+        }
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "weekly", 2000, 4)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_scheduled_run_does_not_collide_with_an_issue_run_of_the_same_flow_name() {
+        let store = Store::open_in_memory().unwrap();
+        store.enqueue_run("o/r", 7, "weekly", 1).unwrap().unwrap();
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "weekly", 1000, 2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn schedule_state_remembers_first_sight_and_the_last_fire() {
+        let store = Store::open_in_memory().unwrap();
+        let state = store.schedule_state("o/r", "weekly", 50).unwrap();
+        assert_eq!(
+            state,
+            ScheduleState {
+                first_seen: 50,
+                last_fire: None
+            }
+        );
+        assert_eq!(
+            store
+                .schedule_state("o/r", "weekly", 90)
+                .unwrap()
+                .first_seen,
+            50
+        );
+        assert_eq!(
+            store.schedule_state("o/r", "other", 90).unwrap().first_seen,
+            90
+        );
+        store.enqueue_scheduled("o/r", "weekly", 100, 101).unwrap();
+        store.enqueue_run("o/r", 1, "weekly", 102).unwrap();
+        assert_eq!(
+            store
+                .schedule_state("o/r", "weekly", 200)
+                .unwrap()
+                .last_fire,
+            Some(100)
+        );
+        assert_eq!(
+            store.schedule_state("o/r", "other", 200).unwrap().last_fire,
+            None
+        );
+    }
+
+    #[test]
+    fn a_database_from_before_scheduling_upgrades_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..2] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute(
+                "INSERT INTO runs (repo, issue, flow, state, created_at, updated_at)
+                 VALUES ('o/r', 5, 'issue', 'queued', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+        let run = store.runs_in_states(&[RunState::Queued]).unwrap().remove(0);
+        assert_eq!((run.issue, run.fire_at), (5, None));
+        assert!(
+            store
+                .enqueue_scheduled("o/r", "issue", 60, 2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn migrations_set_the_version_and_are_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
@@ -794,6 +1039,7 @@ mod tests {
                 state: RunState::Queued,
                 created_at: 10,
                 updated_at: 10,
+                fire_at: None,
             }
         );
     }
