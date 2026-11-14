@@ -2,6 +2,7 @@ pub mod classify;
 pub mod cli;
 pub mod clock;
 pub mod config;
+pub mod cron;
 pub mod daemon;
 pub mod exec;
 pub mod flow;
