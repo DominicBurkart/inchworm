@@ -298,6 +298,20 @@ impl Cron {
     /// use inchworm::cron::Cron;
     ///
     /// let hourly = Cron::parse("30 * * * *").unwrap();
+    /// assert_eq!(hourly.due(5400, 0, None), Some(5400));
+    /// assert_eq!(hourly.due(5400, 0, Some(5400)), None);
+    /// assert_eq!(hourly.due(9000, 0, Some(1800)), Some(9000));
+    /// assert_eq!(hourly.due(9000, 9001, None), None);
+    /// ```
+    pub fn due(&self, now: i64, first_seen: i64, last_fired: Option<i64>) -> Option<i64> {
+        let tick = self.latest_at_or_before(now)?;
+        (tick >= first_seen && last_fired.is_none_or(|last| tick > last)).then_some(tick)
+    }
+
+    /// ```
+    /// use inchworm::cron::Cron;
+    ///
+    /// let hourly = Cron::parse("30 * * * *").unwrap();
     /// assert_eq!(hourly.latest_at_or_before(5400), Some(5400));
     /// assert_eq!(hourly.latest_at_or_before(5399), Some(1800));
     /// assert_eq!(hourly.latest_at_or_before(1799), None);
@@ -635,6 +649,24 @@ mod tests {
             cron("0 0 2 1 *").latest_at_or_before(at(1970, 1, 1, 12, 0)),
             None
         );
+    }
+
+    #[test]
+    fn due_fires_the_latest_tick_once_and_never_backfills() {
+        let scout = cron("0 3 * * 6");
+        let saturday = at(2026, 11, 14, 3, 0);
+        let seen = saturday - 3 * 86_400;
+        assert_eq!(scout.due(saturday - 1, seen, None), None);
+        assert_eq!(scout.due(saturday, seen, None), Some(saturday));
+        assert_eq!(scout.due(saturday + 5 * 86_400, seen, None), Some(saturday));
+        assert_eq!(scout.due(saturday + 5 * 86_400, seen, Some(saturday)), None);
+        let three_weeks = saturday + 21 * 86_400;
+        assert_eq!(
+            scout.due(three_weeks + 100, seen, Some(saturday)),
+            Some(three_weeks)
+        );
+        assert_eq!(scout.due(saturday + 60, saturday + 30, None), None);
+        assert_eq!(scout.due(saturday, saturday, None), Some(saturday));
     }
 
     #[test]

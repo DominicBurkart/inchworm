@@ -376,6 +376,47 @@ async fn worker(
 
 type Unswapped = HashSet<(String, u64)>;
 
+fn fire_schedule(
+    repo: &RepoEntry,
+    flow: &crate::config::Flow,
+    store: &Store,
+    deps: &DaemonDeps,
+    scheduler: &Scheduler<Job>,
+) -> Result<(), String> {
+    let Some(cron) = flow.trigger.cron() else {
+        return Ok(());
+    };
+    let cron = cron.map_err(|err| err.to_string())?;
+    let now = deps.clock.now();
+    let state = store
+        .schedule_state(&repo.slug, &flow.name, now)
+        .map_err(|err| err.to_string())?;
+    let Some(tick) = cron.due(now, state.first_seen, state.last_fire) else {
+        return Ok(());
+    };
+    let queued = store
+        .enqueue_scheduled(&repo.slug, &flow.name, tick, now)
+        .map_err(|err| err.to_string())?;
+    if let Some(run_id) = queued {
+        log(&format!(
+            "{}: queued run {run_id} for schedule `{}` at {}",
+            repo.slug,
+            flow.name,
+            crate::cron::UtcStamp(tick)
+        ));
+        scheduler.enqueue(
+            &repo.slug,
+            Job {
+                run_id,
+                flow: flow.name.clone(),
+                repo: repo.clone(),
+                failures: 0,
+            },
+        );
+    }
+    Ok(())
+}
+
 fn poll_repo(
     repo: &RepoEntry,
     store: &Store,
@@ -392,8 +433,14 @@ fn poll_repo(
         clock: deps.clock.as_ref(),
     };
     for flow in &file.flow {
-        let Trigger::Label { label } = &flow.trigger else {
-            continue;
+        let label = match &flow.trigger {
+            Trigger::Label { label } => label,
+            Trigger::Schedule { .. } => {
+                if let Err(err) = fire_schedule(repo, flow, store, deps, scheduler) {
+                    log(&format!("{}: schedule `{}`: {err}", repo.slug, flow.name));
+                }
+                continue;
+            }
         };
         let issues = deps
             .github
@@ -1789,5 +1836,310 @@ required_checks = ["build"]
         poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
         assert_eq!(unswapped.len(), 1);
         assert_eq!(scheduler.queued_len("o/r"), 1);
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use crate::clock::FakeClock;
+    use crate::cron::days_from_civil;
+    use crate::testing::{FakeScorer, github_with_issue};
+
+    const SCOUT: &str = r#"
+[[flow]]
+name = "scout"
+trigger = { kind = "schedule", cron = "0 3 * * 6" }
+[[flow.step]]
+name = "scout"
+identity = "scout"
+[flow.outcome]
+mode = "draft_pr"
+"#;
+
+    const SCHEDULED: &str = r#"
+[[flow]]
+name = "scout"
+trigger = { kind = "schedule", cron = "0 3 * * 6" }
+[[flow.step]]
+name = "scout"
+identity = "scout"
+[flow.outcome]
+mode = "draft_pr"
+
+[[flow]]
+name = "prover"
+trigger = { kind = "schedule", cron = "0 3 * * 0" }
+[[flow.step]]
+name = "prove"
+identity = "prover"
+[flow.outcome]
+mode = "draft_pr"
+"#;
+
+    const LABELLED: &str = r#"
+[[flow]]
+name = "issue"
+trigger = { kind = "label", label = "inchworm" }
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+[flow.outcome]
+mode = "draft_pr"
+"#;
+
+    struct NoDispatch;
+
+    impl DispatcherFactory for NoDispatch {
+        fn make(&self) -> Result<Box<dyn Dispatcher>, String> {
+            Err("no dispatcher in this test".into())
+        }
+    }
+
+    fn at(day: i64, hour: i64, minute: i64) -> i64 {
+        (days_from_civil(2026, 11, day)) * 86_400 + hour * 3600 + minute * 60
+    }
+
+    struct Rig {
+        _dir: tempfile::TempDir,
+        db: PathBuf,
+        entry: RepoEntry,
+        clock: Arc<FakeClock>,
+        deps: DaemonDeps,
+    }
+
+    impl Rig {
+        fn new(flows: &str, start: i64) -> Rig {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().join("repo");
+            std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
+            std::fs::write(repo.join(".inchworm/flows.toml"), flows).unwrap();
+            let clock = Arc::new(FakeClock::new(start));
+            let deps = DaemonDeps {
+                github: Arc::new(crate::github::FakeGitHub::new()),
+                clock: clock.clone(),
+                dispatchers: Arc::new(NoDispatch),
+                scorer: Arc::new(FakeScorer::new()),
+            };
+            Rig {
+                db: dir.path().join("state.db"),
+                entry: RepoEntry {
+                    slug: "o/r".into(),
+                    path: repo,
+                },
+                _dir: dir,
+                clock,
+                deps,
+            }
+        }
+
+        fn poll(&self) -> Scheduler<Job> {
+            let scheduler: Scheduler<Job> = Scheduler::new(1);
+            let store = Store::open(&self.db).unwrap();
+            let mut unswapped = Unswapped::new();
+            poll_repo(&self.entry, &store, &self.deps, &scheduler, &mut unswapped).unwrap();
+            scheduler
+        }
+
+        fn store(&self) -> Store {
+            Store::open(&self.db).unwrap()
+        }
+
+        fn go_to(&self, timestamp: i64) {
+            self.clock.advance(timestamp - self.clock.now());
+        }
+
+        fn runs(&self, flow: &str) -> Vec<crate::store::Run> {
+            let mut runs: Vec<_> = self
+                .store()
+                .recent_runs(100)
+                .unwrap()
+                .into_iter()
+                .filter(|run| run.flow == flow)
+                .collect();
+            runs.sort_by_key(|run| run.id);
+            runs
+        }
+
+        fn finish(&self, run: RunId) {
+            let store = self.store();
+            for state in [RunState::Running, RunState::Failed] {
+                if store.run(run).unwrap().state.can_transition_to(state) {
+                    store.set_run_state(run, state, self.clock.now()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_due_tick_queues_exactly_one_run_with_no_github_issue() {
+        let rig = Rig::new(SCHEDULED, at(14, 2, 59));
+        assert_eq!(rig.poll().queued_len("o/r"), 0);
+        rig.clock.advance(60);
+        let scheduler = rig.poll();
+        assert_eq!(scheduler.queued_len("o/r"), 1);
+        let runs = rig.runs("scout");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].fire_at, Some(at(14, 3, 0)));
+        assert_eq!(runs[0].state, RunState::Queued);
+        assert_eq!(runs[0].issue, crate::store::SCHEDULED_SUBJECT);
+        assert!(rig.runs("prover").is_empty());
+    }
+
+    #[test]
+    fn polling_again_in_the_same_bucket_never_adds_a_second_run() {
+        let rig = Rig::new(SCHEDULED, at(14, 3, 0));
+        rig.poll();
+        let before = rig.runs("scout");
+        for _ in 0..3 {
+            rig.clock.advance(120);
+            assert_eq!(rig.poll().queued_len("o/r"), 0);
+        }
+        assert_eq!(rig.runs("scout"), before);
+    }
+
+    #[test]
+    fn a_finished_bucket_is_not_fired_again_after_a_restart() {
+        let rig = Rig::new(SCHEDULED, at(14, 3, 0));
+        rig.poll();
+        let run = rig.runs("scout")[0].id;
+        rig.finish(run);
+        rig.clock.advance(3600);
+        assert_eq!(rig.poll().queued_len("o/r"), 0);
+        assert_eq!(rig.runs("scout").len(), 1);
+    }
+
+    #[test]
+    fn a_flow_first_seen_after_its_last_tick_waits_for_the_next_one() {
+        let rig = Rig::new(SCHEDULED, at(16, 12, 0));
+        assert_eq!(rig.poll().queued_len("o/r"), 0);
+        assert!(rig.runs("scout").is_empty());
+        rig.clock.advance(3600);
+        assert_eq!(rig.poll().queued_len("o/r"), 0);
+        rig.go_to(at(21, 3, 0));
+        assert_eq!(rig.poll().queued_len("o/r"), 1);
+        assert_eq!(rig.runs("scout")[0].fire_at, Some(at(21, 3, 0)));
+        assert!(rig.runs("prover").is_empty());
+    }
+
+    #[test]
+    fn downtime_across_many_ticks_fires_the_latest_one_once() {
+        let rig = Rig::new(SCHEDULED, at(14, 3, 0));
+        rig.poll();
+        rig.finish(rig.runs("scout")[0].id);
+        rig.go_to(at(14, 3, 0) + 22 * 86_400 + 5 * 3600);
+        let scheduler = rig.poll();
+        let runs = rig.runs("scout");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].fire_at, Some(at(14, 3, 0) + 21 * 86_400));
+        assert!(scheduler.queued_len("o/r") >= 1);
+        rig.finish(runs[1].id);
+        rig.clock.advance(60);
+        rig.poll();
+        assert_eq!(rig.runs("scout").len(), 2);
+    }
+
+    #[test]
+    fn a_first_start_after_a_missed_tick_catches_it_up_once() {
+        let rig = Rig::new(SCHEDULED, at(11, 12, 0));
+        assert_eq!(rig.poll().queued_len("o/r"), 0);
+        rig.go_to(at(30, 12, 0));
+        rig.poll();
+        let runs = rig.runs("scout");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].fire_at, Some(at(28, 3, 0)));
+    }
+
+    #[test]
+    fn a_new_tick_does_not_start_while_the_previous_run_is_still_open() {
+        let rig = Rig::new(SCOUT, at(14, 3, 0));
+        rig.poll();
+        let first = rig.runs("scout")[0].id;
+        rig.go_to(at(21, 3, 0));
+        assert_eq!(rig.poll().queued_len("o/r"), 0);
+        assert_eq!(rig.runs("scout").len(), 1);
+        rig.finish(first);
+        rig.clock.advance(60);
+        rig.poll();
+        let runs = rig.runs("scout");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].fire_at, Some(at(21, 3, 0)));
+        let open = rig
+            .store()
+            .runs_in_states(&[RunState::Queued, RunState::Running])
+            .unwrap();
+        assert_eq!(open.iter().filter(|run| run.flow == "scout").count(), 1);
+    }
+
+    #[test]
+    fn saturday_and_sunday_flows_fire_independently() {
+        let rig = Rig::new(SCHEDULED, at(14, 3, 0));
+        rig.poll();
+        rig.finish(rig.runs("scout")[0].id);
+        rig.go_to(at(15, 3, 0));
+        rig.poll();
+        assert_eq!(rig.runs("scout").len(), 1);
+        assert_eq!(rig.runs("prover").len(), 1);
+        assert_eq!(rig.runs("prover")[0].fire_at, Some(at(15, 3, 0)));
+    }
+
+    #[test]
+    fn label_and_schedule_flows_coexist_in_one_file() {
+        let rig = Rig::new(&format!("{LABELLED}{SCHEDULED}"), at(14, 3, 0));
+        let github = github_with_issue();
+        let store = rig.store();
+        let deps = DaemonDeps {
+            github: Arc::new(github),
+            clock: rig.clock.clone(),
+            dispatchers: Arc::new(NoDispatch),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        let mut unswapped = Unswapped::new();
+        poll_repo(&rig.entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
+        assert_eq!(rig.runs("issue").len(), 1);
+        assert_eq!(rig.runs("issue")[0].fire_at, None);
+        assert_eq!(rig.runs("scout").len(), 1);
+        assert_eq!(scheduler.queued_len("o/r"), 2);
+    }
+
+    #[test]
+    fn resume_requeues_an_open_scheduled_run_without_creating_another() {
+        let rig = Rig::new(SCHEDULED, at(14, 3, 0));
+        rig.poll();
+        let settings = DaemonSettings {
+            repos: vec![rig.entry.clone()],
+            state_db: rig.db.clone(),
+            poll: Duration::from_millis(10),
+            concurrency: 1,
+            ci: CiPolicy::default(),
+            grace: Duration::from_secs(1),
+        };
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        resume(&settings, &rig.store(), &rig.deps, &scheduler).unwrap();
+        assert_eq!(scheduler.queued_len("o/r"), 1);
+        rig.poll();
+        assert_eq!(rig.runs("scout").len(), 1);
+    }
+
+    #[test]
+    fn a_never_firing_cron_in_a_hand_built_flow_is_logged_not_fatal() {
+        let rig = Rig::new(SCHEDULED, at(14, 3, 0));
+        let flow = crate::config::FlowFile::parse(SCHEDULED)
+            .unwrap()
+            .flow
+            .remove(0);
+        let mut broken = flow.clone();
+        broken.trigger = Trigger::Schedule {
+            cron: "0 0 30 2 *".into(),
+        };
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        let err =
+            fire_schedule(&rig.entry, &broken, &rig.store(), &rig.deps, &scheduler).unwrap_err();
+        assert!(err.contains("never fires"), "{err}");
+        let mut labelled = flow;
+        labelled.trigger = Trigger::Label { label: "x".into() };
+        assert!(fire_schedule(&rig.entry, &labelled, &rig.store(), &rig.deps, &scheduler).is_ok());
+        assert_eq!(scheduler.queued_len("o/r"), 0);
     }
 }
