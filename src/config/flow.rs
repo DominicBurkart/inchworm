@@ -69,6 +69,46 @@ fn default_attempt_timeout_secs() -> u64 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Trigger {
     Label { label: String },
+    Schedule { cron: String },
+}
+
+impl Trigger {
+    /// ```
+    /// use inchworm::config::Trigger;
+    ///
+    /// let label = Trigger::Label { label: "inchworm".into() };
+    /// let schedule = Trigger::Schedule { cron: "0 3 * * 6".into() };
+    /// assert_eq!(label.label(), Some("inchworm"));
+    /// assert_eq!(schedule.label(), None);
+    /// ```
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Trigger::Label { label } => Some(label),
+            Trigger::Schedule { .. } => None,
+        }
+    }
+
+    /// ```
+    /// use inchworm::config::Trigger;
+    ///
+    /// let schedule = Trigger::Schedule { cron: "0 3 * * 6".into() };
+    /// assert!(schedule.cron().unwrap().is_ok());
+    /// assert!(Trigger::Schedule { cron: "nope".into() }.cron().unwrap().is_err());
+    /// assert!(Trigger::Label { label: "x".into() }.cron().is_none());
+    /// ```
+    pub fn cron_text(&self) -> Option<&str> {
+        match self {
+            Trigger::Label { .. } => None,
+            Trigger::Schedule { cron } => Some(cron),
+        }
+    }
+
+    pub fn cron(&self) -> Option<Result<crate::cron::Cron, crate::cron::CronError>> {
+        match self {
+            Trigger::Label { .. } => None,
+            Trigger::Schedule { cron } => Some(crate::cron::Cron::parse(cron)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,9 +219,22 @@ impl FlowFile {
 
 impl Flow {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let Trigger::Label { label } = &self.trigger;
-        if label.trim().is_empty() {
-            return Err(invalid(self, "trigger label must not be empty"));
+        match &self.trigger {
+            Trigger::Label { label } => {
+                if label.trim().is_empty() {
+                    return Err(invalid(self, "trigger label must not be empty"));
+                }
+            }
+            Trigger::Schedule { cron } => {
+                crate::cron::Cron::parse(cron)
+                    .map_err(|err| invalid(self, format!("trigger cron `{cron}`: {err}")))?;
+                if self.outcome.mode != OutcomeMode::DraftPr {
+                    return Err(invalid(
+                        self,
+                        "a schedule flow must use outcome mode draft_pr; merge_when is not allowed",
+                    ));
+                }
+            }
         }
         if self.base.trim().is_empty() {
             return Err(invalid(self, "base must not be empty"));
@@ -397,9 +450,100 @@ mode = "draft_pr"
     fn unknown_trigger_kind_is_rejected() {
         let text = minimal().replace(
             "kind = \"label\", label = \"inchworm\"",
-            "kind = \"schedule\", cron = \"* * * * *\"",
+            "kind = \"webhook\", url = \"x\"",
         );
         assert!(FlowFile::parse(&text).is_err());
+    }
+
+    fn scheduled(cron: &str) -> String {
+        minimal().replace(
+            "kind = \"label\", label = \"inchworm\"",
+            &format!("kind = \"schedule\", cron = \"{cron}\""),
+        )
+    }
+
+    #[test]
+    fn a_schedule_trigger_parses_without_a_label() {
+        let file = FlowFile::parse(&scheduled("0 3 * * 6")).unwrap();
+        let flow = &file.flow[0];
+        assert_eq!(
+            flow.trigger,
+            Trigger::Schedule {
+                cron: "0 3 * * 6".into()
+            }
+        );
+        assert_eq!(flow.trigger.label(), None);
+        assert_eq!(flow.outcome.mode, OutcomeMode::DraftPr);
+        assert!(flow.trigger.cron().unwrap().is_ok());
+    }
+
+    #[test]
+    fn two_schedule_flows_and_a_label_flow_may_coexist() {
+        let second = scheduled("0 3 * * 0").replace("name = \"issue\"", "name = \"prover\"");
+        let third = scheduled("0 3 * * 6").replace("name = \"issue\"", "name = \"scout\"");
+        let text = format!("{}{second}{third}", minimal());
+        assert_eq!(FlowFile::parse(&text).unwrap().flow.len(), 3);
+    }
+
+    #[test]
+    fn an_invalid_cron_is_rejected_with_the_flow_and_expression() {
+        for bad in [
+            "",
+            "* * * *",
+            "61 * * * *",
+            "0 0 30 2 *",
+            "@daily",
+            "*/0 * * * *",
+        ] {
+            let message = err_text(&scheduled(bad));
+            assert!(message.contains("flow `issue`"), "{bad}: {message}");
+            assert!(message.contains("trigger cron"), "{bad}: {message}");
+        }
+    }
+
+    #[test]
+    fn schedule_trigger_keys_are_strict() {
+        let missing = minimal().replace(
+            "kind = \"label\", label = \"inchworm\"",
+            "kind = \"schedule\"",
+        );
+        assert!(FlowFile::parse(&missing).is_err());
+        let extra = minimal().replace(
+            "kind = \"label\", label = \"inchworm\"",
+            "kind = \"schedule\", cron = \"* * * * *\", label = \"inchworm\"",
+        );
+        assert!(FlowFile::parse(&extra).is_err());
+        let unknown = minimal().replace(
+            "kind = \"label\", label = \"inchworm\"",
+            "kind = \"schedule\", cron = \"* * * * *\", timezone = \"UTC\"",
+        );
+        assert!(FlowFile::parse(&unknown).is_err());
+        let cron_on_label = minimal().replace(
+            "label = \"inchworm\"",
+            "label = \"inchworm\", cron = \"* * * * *\"",
+        );
+        assert!(FlowFile::parse(&cron_on_label).is_err());
+    }
+
+    #[test]
+    fn a_schedule_flow_cannot_merge() {
+        let text = FULL.replace(
+            "trigger = { kind = \"label\", label = \"inchworm\" }",
+            "trigger = { kind = \"schedule\", cron = \"0 3 * * 0\" }",
+        );
+        let message = err_text(&text);
+        assert!(message.contains("draft_pr"), "{message}");
+        let drafted = text.replace("mode = \"merge_when\"", "mode = \"draft_pr\"");
+        assert!(FlowFile::parse(&drafted).is_ok());
+    }
+
+    #[test]
+    fn a_schedule_flow_still_needs_steps_like_any_other() {
+        let text = scheduled("0 3 * * 6").replace(
+            "[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n",
+            "",
+        );
+        assert!(err_text(&text).contains("at least one step"));
     }
 
     #[test]
@@ -535,10 +679,25 @@ mode = "draft_pr"
         ]
     }
 
+    fn trigger_strategy() -> impl Strategy<Value = Trigger> {
+        prop_oneof![
+            name_strategy().prop_map(|label| Trigger::Label { label }),
+            prop::sample::select(vec![
+                "0 3 * * 6",
+                "0 3 * * 0",
+                "*/15 * * * *",
+                "0 0 1 jan,jul *",
+                "30 2 29 2 *",
+                "0 0 13 * fri",
+            ])
+            .prop_map(|cron| Trigger::Schedule { cron: cron.into() }),
+        ]
+    }
+
     fn flow_strategy() -> impl Strategy<Value = Flow> {
         (
             name_strategy(),
-            name_strategy(),
+            trigger_strategy(),
             name_strategy(),
             1u32..10,
             prop::collection::vec(0..FailureClass::ALL.len(), 0..4),
@@ -556,7 +715,7 @@ mode = "draft_pr"
             .prop_map(
                 |(
                     name,
-                    label,
+                    trigger,
                     base,
                     max_attempts,
                     retry,
@@ -573,9 +732,10 @@ mode = "draft_pr"
                         .filter(|(n, _)| seen.insert(n.clone()))
                         .map(|(name, identity)| Step { name, identity })
                         .collect();
+                    let scheduled = matches!(trigger, Trigger::Schedule { .. });
                     Flow {
                         name,
-                        trigger: Trigger::Label { label },
+                        trigger,
                         base,
                         max_attempts,
                         retry_on: retry.into_iter().map(|i| FailureClass::ALL[i]).collect(),
@@ -583,7 +743,7 @@ mode = "draft_pr"
                         step,
                         judge,
                         outcome: Outcome {
-                            mode: if merge {
+                            mode: if merge && !scheduled {
                                 OutcomeMode::MergeWhen
                             } else {
                                 OutcomeMode::DraftPr
@@ -616,6 +776,14 @@ mode = "draft_pr"
         fn merge_when_without_judges_is_always_rejected(mut flow in flow_strategy()) {
             flow.outcome.mode = OutcomeMode::MergeWhen;
             flow.judge.clear();
+            let file = FlowFile { flow: vec![flow] };
+            prop_assert!(file.validate().is_err());
+        }
+
+        #[test]
+        fn a_schedule_flow_that_merges_is_always_rejected(mut flow in flow_strategy()) {
+            flow.trigger = Trigger::Schedule { cron: "0 3 * * 6".into() };
+            flow.outcome.mode = OutcomeMode::MergeWhen;
             let file = FlowFile { flow: vec![flow] };
             prop_assert!(file.validate().is_err());
         }

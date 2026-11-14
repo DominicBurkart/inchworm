@@ -4,10 +4,10 @@ use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::clock::Clock;
-use crate::config::{Flow, Trigger};
+use crate::config::Flow;
 use crate::flow::{
     Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, branch_name, nanna_report,
-    protected_paths_in, run_flow,
+    protected_paths_in, run_flow, scheduled_branch_name,
 };
 use crate::github::PrState;
 use crate::github::{GitHub, GitHubError, PullRequest};
@@ -27,6 +27,8 @@ pub enum RunError {
         issue: u64,
         flow: String,
     },
+    #[error("flow `{flow}` has a schedule trigger and cannot be run against an issue")]
+    NotLabelTriggered { flow: String },
     #[error("run {run} is already {state} and cannot be executed")]
     NotRunnable { run: RunId, state: RunState },
     #[error(transparent)]
@@ -53,9 +55,24 @@ pub struct RunContext<'a> {
     pub clock: &'a dyn Clock,
 }
 
-pub(crate) fn trigger_label(flow: &Flow) -> &str {
-    let Trigger::Label { label } = &flow.trigger;
-    label
+pub(crate) fn labels_to_clear(flow: &Flow) -> Vec<&str> {
+    let mut labels = vec![RUNNING_LABEL];
+    labels.extend(flow.trigger.label());
+    labels
+}
+
+fn scheduled_task(flow: &Flow, run: &crate::store::Run) -> (String, String) {
+    let cron = flow.trigger.cron_text().unwrap_or_default();
+    let fired = run
+        .fire_at
+        .map(|at| crate::cron::UtcStamp(at).to_string())
+        .unwrap_or_default();
+    (
+        format!("Flow `{}`, scheduled for {fired}", flow.name),
+        format!(
+            "This run was started by the schedule `{cron}` (UTC), not by an issue. There is no issue text: the step instructions of the flow are the whole task."
+        ),
+    )
 }
 
 fn describe_failure(class: FailureClass, raw: &str, attempt: u32) -> String {
@@ -64,17 +81,23 @@ fn describe_failure(class: FailureClass, raw: &str, attempt: u32) -> String {
 
 fn relabel(
     ctx: &RunContext<'_>,
-    issue: u64,
+    issue: Option<u64>,
     add: &[&str],
     remove: &[&str],
     warnings: &mut Vec<String>,
 ) {
+    let Some(issue) = issue else {
+        return;
+    };
     if let Err(err) = ctx.github.set_labels(ctx.slug, issue, add, remove) {
         warnings.push(format!("could not update labels: {err}"));
     }
 }
 
-fn note(ctx: &RunContext<'_>, issue: u64, body: &str, warnings: &mut Vec<String>) {
+fn note(ctx: &RunContext<'_>, issue: Option<u64>, body: &str, warnings: &mut Vec<String>) {
+    let Some(issue) = issue else {
+        return;
+    };
     if let Err(err) = ctx.github.comment(ctx.slug, issue, body) {
         warnings.push(format!("could not comment on the issue: {err}"));
     }
@@ -116,9 +139,9 @@ pub fn enqueue_issue(
     if run_id.is_some() {
         relabel(
             ctx,
-            issue_number,
+            Some(issue_number),
             &[RUNNING_LABEL],
-            &[trigger_label(flow)],
+            &flow.trigger.label().into_iter().collect::<Vec<_>>(),
             warnings,
         );
     }
@@ -129,7 +152,7 @@ fn give_up(
     ctx: &RunContext<'_>,
     flow: &Flow,
     run_id: RunId,
-    issue: u64,
+    issue: Option<u64>,
     attempts: u32,
     failure: (FailureClass, String, u32),
     mut warnings: Vec<String>,
@@ -141,7 +164,7 @@ fn give_up(
         ctx,
         issue,
         &[FAILED_LABEL],
-        &[RUNNING_LABEL, trigger_label(flow)],
+        &labels_to_clear(flow),
         &mut warnings,
     );
     note(
@@ -177,7 +200,7 @@ fn settle_resumed(
     ctx: &RunContext<'_>,
     flow: &Flow,
     run_id: RunId,
-    issue: u64,
+    issue: Option<u64>,
     attempt: &crate::store::Attempt,
     warnings: &mut Vec<String>,
 ) -> Result<Option<(RunState, PullRequest)>, RunError> {
@@ -204,13 +227,7 @@ fn settle_resumed(
     } else {
         ctx.store.set_run_state(run_id, target, ctx.clock.now())?;
     }
-    relabel(
-        ctx,
-        issue,
-        &[DONE_LABEL],
-        &[RUNNING_LABEL, trigger_label(flow)],
-        warnings,
-    );
+    relabel(ctx, issue, &[DONE_LABEL], &labels_to_clear(flow), warnings);
     note(
         ctx,
         issue,
@@ -227,7 +244,7 @@ async fn settle_published(
     ctx: &RunContext<'_>,
     env: &OutcomeEnv<'_>,
     flow: &Flow,
-    issue: u64,
+    issue: Option<u64>,
     attempt: &crate::store::Attempt,
     pr: &PullRequest,
     warnings: &mut Vec<String>,
@@ -324,6 +341,11 @@ pub async fn run_issue(
     issue_number: u64,
     dispatcher: &mut dyn Dispatcher,
 ) -> Result<RunSummary, RunError> {
+    if flow.trigger.label().is_none() {
+        return Err(RunError::NotLabelTriggered {
+            flow: flow.name.clone(),
+        });
+    }
     ctx.github.issue(ctx.slug, issue_number)?;
     let mut warnings = Vec::new();
     let run_id = enqueue_issue(ctx, flow, issue_number, &mut warnings)?.ok_or_else(|| {
@@ -348,8 +370,14 @@ pub async fn execute_run(
     mut permit: Option<OwnedSemaphorePermit>,
 ) -> Result<RunSummary, RunError> {
     let run = ctx.store.run(run_id)?;
-    let issue_number = run.issue;
-    let issue = ctx.github.issue(ctx.slug, issue_number)?;
+    let subject = (!run.is_scheduled()).then_some(run.issue);
+    let (task_title, task_body) = match subject {
+        Some(number) => {
+            let issue = ctx.github.issue(ctx.slug, number)?;
+            (issue.title, issue.body)
+        }
+        None => scheduled_task(flow, &run),
+    };
     let mut warnings = Vec::new();
     match run.state {
         RunState::Queued => ctx
@@ -376,8 +404,7 @@ pub async fn execute_run(
     }
 
     if let Some(last) = existing.last()
-        && let Some((state, pr)) =
-            settle_resumed(ctx, flow, run_id, issue_number, last, &mut warnings)?
+        && let Some((state, pr)) = settle_resumed(ctx, flow, run_id, subject, last, &mut warnings)?
     {
         return Ok(RunSummary {
             run_id,
@@ -402,7 +429,7 @@ pub async fn execute_run(
                 let retry = flow.retry_on.contains(class) && attempts < flow.max_attempts;
                 if !retry {
                     let failure = (*class, raw.clone(), *n);
-                    return give_up(ctx, flow, run_id, issue_number, attempts, failure, warnings);
+                    return give_up(ctx, flow, run_id, subject, attempts, failure, warnings);
                 }
                 if matches!(
                     ctx.store.run(run_id)?.state,
@@ -417,10 +444,12 @@ pub async fn execute_run(
                 .map(|(class, raw, n)| describe_failure(*class, raw, *n));
             attempts += 1;
             let attempt = ctx.store.start_attempt(run_id, ctx.clock.now())?;
-            let branch = branch_name(
-                issue_number,
-                ctx.store.issue_attempt_count(ctx.slug, issue_number)?,
-            );
+            let branch = match subject {
+                Some(number) => {
+                    branch_name(number, ctx.store.issue_attempt_count(ctx.slug, number)?)
+                }
+                None => scheduled_branch_name(run_id, attempt.n),
+            };
             let held = match permit.take() {
                 Some(held) => held,
                 None => match std::sync::Arc::clone(&env.model_permit)
@@ -440,7 +469,7 @@ pub async fn execute_run(
                             ctx,
                             flow,
                             run_id,
-                            issue_number,
+                            subject,
                             attempts,
                             (FailureClass::OrchestratorLost, raw, attempt.n),
                             warnings,
@@ -450,9 +479,9 @@ pub async fn execute_run(
             };
             let input = FlowInput {
                 repo_path: ctx.repo_path,
-                issue_number,
-                issue_title: &issue.title,
-                issue_body: &issue.body,
+                issue_number: subject,
+                issue_title: &task_title,
+                issue_body: &task_body,
                 attempt: attempt.n,
                 branch: &branch,
                 previous_failure: previous_failure.as_deref(),
@@ -484,7 +513,7 @@ pub async fn execute_run(
                                 )?;
                                 note(
                                     ctx,
-                                    issue_number,
+                                    subject,
                                     &format!(
                                         "inchworm opened {} for this issue from `{branch}` at `{}`.",
                                         pr.url, pr.head_sha
@@ -522,7 +551,7 @@ pub async fn execute_run(
         };
 
         let concluded =
-            settle_published(ctx, env, flow, issue_number, &attempt, &pr, &mut warnings).await?;
+            settle_published(ctx, env, flow, subject, &attempt, &pr, &mut warnings).await?;
         match concluded {
             Concluded::Accepted { state } => {
                 return Ok(RunSummary {
@@ -590,6 +619,149 @@ mod tests {
             clock,
         };
         run_issue(&context, &env(&scorer), flow, 5, client).await
+    }
+
+    fn scheduled_flow(max_attempts: u32) -> Flow {
+        let mut scheduled = flow(max_attempts, "");
+        scheduled.trigger = crate::config::Trigger::Schedule {
+            cron: "0 3 * * 6".into(),
+        };
+        scheduled
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_needs_no_issue_and_never_touches_one() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = FakeGitHub::new();
+        let run = store
+            .enqueue_scheduled("o/r", "issue", 1_795_057_200, 1)
+            .unwrap()
+            .unwrap();
+        github.add_pr("o/r", &format!("inchworm/sched-{run}-a1"), pr("deadbeef"));
+        let scorer = FakeScorer::new();
+        let (mut client, fake) = connect(vec![Scenario::success(), Scenario::success()]);
+        client.initialize().unwrap();
+        let summary = execute_run(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &scheduled_flow(1),
+            run,
+            &mut client,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::PrOpen);
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert!(github.comments().is_empty());
+        let attempt = &store.attempts(run).unwrap()[0];
+        assert_eq!(
+            attempt.branch.as_deref(),
+            Some(format!("inchworm/sched-{run}-a1").as_str())
+        );
+        let task = fake.assigned()[0]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            task.starts_with("Scheduled run: Flow `issue`, scheduled for 2026-11-19 03:00 UTC"),
+            "{task}"
+        );
+        assert!(task.contains("0 3 * * 6"), "{task}");
+        assert!(!task.contains("Issue #"), "{task}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_scheduled_run_gives_up_without_an_issue_to_label() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = FakeGitHub::new();
+        let run = store
+            .enqueue_scheduled("o/r", "issue", 600, 1)
+            .unwrap()
+            .unwrap();
+        let scorer = FakeScorer::new();
+        let (mut client, _fake) = connect(vec![Scenario::failed("result_failed_structured")]);
+        client.initialize().unwrap();
+        let summary = execute_run(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &scheduled_flow(1),
+            run,
+            &mut client,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert!(github.comments().is_empty());
+        assert_eq!(store.run(run).unwrap().state, RunState::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_resumed_after_its_pr_merged_settles_quietly() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = FakeGitHub::new();
+        let run = store
+            .enqueue_scheduled("o/r", "issue", 600, 1)
+            .unwrap()
+            .unwrap();
+        store.set_run_state(run, RunState::Running, 2).unwrap();
+        let attempt = store.start_attempt(run, 3).unwrap();
+        let merged = PullRequest {
+            state: PrState::Merged,
+            ..pr("cafe")
+        };
+        github.add_pr("o/r", "inchworm/sched-1-a1", merged);
+        store
+            .record_pr(attempt.id, "inchworm/sched-1-a1", "cafe", 77)
+            .unwrap();
+        store.mark_published(attempt.id, 0, None).unwrap();
+        let scorer = FakeScorer::new();
+        let (mut client, _fake) = connect(vec![]);
+        let summary = execute_run(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &scheduled_flow(1),
+            run,
+            &mut client,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::Merged);
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert!(github.comments().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_schedule_flow_cannot_be_run_by_hand_against_an_issue() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        let scorer = FakeScorer::new();
+        let (mut client, _fake) = connect(vec![]);
+        let err = run_issue(
+            &ctx(&store, &github, &clock),
+            &env(&scorer),
+            &scheduled_flow(1),
+            5,
+            &mut client,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RunError::NotLabelTriggered { .. }), "{err}");
+        assert!(err.to_string().contains("flow `issue`"));
+        assert!(
+            store
+                .runs_in_states(&[RunState::Queued])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(github.comments().is_empty());
     }
 
     #[tokio::test]
@@ -925,8 +1097,8 @@ mod tests {
         let ghost = FakeGitHub::new();
         let mut warnings = Vec::new();
         let context = ctx(&store, &ghost, &clock);
-        relabel(&context, 9, &["a"], &[], &mut warnings);
-        note(&context, 9, "x", &mut warnings);
+        relabel(&context, Some(9), &["a"], &[], &mut warnings);
+        note(&context, Some(9), "x", &mut warnings);
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0].starts_with("could not update labels"));
         assert!(warnings[1].starts_with("could not comment"));

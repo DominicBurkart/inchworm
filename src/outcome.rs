@@ -12,7 +12,7 @@ use crate::github::{GitHub, PrState, PullRequest};
 use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
 use crate::policy::{CheckConclusion, CheckRun, Decision, MergeGrant, PolicyInput, decide};
-use crate::run::{RUNNING_LABEL, trigger_label};
+use crate::run::labels_to_clear;
 use crate::store::{AttemptId, RunId, Store, StoreError};
 
 pub const DONE_LABEL: &str = "inchworm:done";
@@ -202,7 +202,7 @@ pub struct ConcludeContext<'a> {
     pub clock: &'a dyn Clock,
     pub slug: &'a str,
     pub repo_path: &'a Path,
-    pub issue: u64,
+    pub issue: Option<u64>,
 }
 
 fn failed_verdicts(verdicts: &[Verdict]) -> String {
@@ -232,10 +232,13 @@ fn warn_label_comment(
     body: &str,
     warnings: &mut Vec<String>,
 ) {
-    if let Err(err) = ctx.github.set_labels(ctx.slug, ctx.issue, add, remove) {
+    let Some(issue) = ctx.issue else {
+        return;
+    };
+    if let Err(err) = ctx.github.set_labels(ctx.slug, issue, add, remove) {
         warnings.push(format!("could not update labels: {err}"));
     }
-    if let Err(err) = ctx.github.comment(ctx.slug, ctx.issue, body) {
+    if let Err(err) = ctx.github.comment(ctx.slug, issue, body) {
         warnings.push(format!("could not comment on the issue: {err}"));
     }
 }
@@ -317,7 +320,7 @@ fn settle_merged(
     warn_label_comment(
         ctx,
         &[DONE_LABEL],
-        &[RUNNING_LABEL, trigger_label(flow)],
+        &labels_to_clear(flow),
         &format!(
             "inchworm found {} already merged after attempt {} (judged head `{sha}`).",
             published.pr.url, published.attempt_n
@@ -458,7 +461,7 @@ pub async fn conclude(
             warn_label_comment(
                 ctx,
                 &[DONE_LABEL],
-                &[RUNNING_LABEL, trigger_label(flow)],
+                &labels_to_clear(flow),
                 &format!(
                     "inchworm outcome `draft_pr` after attempt {}: {} stays a draft at `{sha}`. {} Judges: {}.",
                     published.attempt_n,
@@ -495,7 +498,7 @@ pub async fn conclude(
                     warn_label_comment(
                         ctx,
                         &[DONE_LABEL],
-                        &[RUNNING_LABEL, trigger_label(flow)],
+                        &labels_to_clear(flow),
                         &format!(
                             "inchworm outcome `merge` after attempt {}: merged {} at `{head_sha}` (--match-head-commit). Judges: {}.",
                             published.attempt_n,
@@ -1367,7 +1370,7 @@ mod tests {
             clock: &rig.clock,
             slug: "o/r",
             repo_path: rig.dir.path(),
-            issue,
+            issue: Some(issue),
         };
         let published = Published {
             run_id: run,
@@ -1838,7 +1841,7 @@ mod round2_safety {
             clock: &clock,
             slug: "o/r",
             repo_path: dir.path(),
-            issue: 5,
+            issue: Some(5),
         };
         let pr = pr_at(77, SHA);
         let published = Published {

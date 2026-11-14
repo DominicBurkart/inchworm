@@ -31,7 +31,7 @@ impl Dispatcher for NannaClient {
 #[derive(Debug, Clone)]
 pub struct FlowInput<'a> {
     pub repo_path: &'a Path,
-    pub issue_number: u64,
+    pub issue_number: Option<u64>,
     pub issue_title: &'a str,
     pub issue_body: &'a str,
     pub attempt: u32,
@@ -96,6 +96,15 @@ pub enum FlowOutcome {
 /// ```
 pub fn branch_name(issue: u64, attempt: u32) -> String {
     format!("inchworm/{issue}-a{attempt}")
+}
+
+/// ```
+/// use inchworm::flow::scheduled_branch_name;
+///
+/// assert_eq!(scheduled_branch_name(9, 2), "inchworm/sched-9-a2");
+/// ```
+pub fn scheduled_branch_name(run_id: i64, attempt: u32) -> String {
+    format!("inchworm/sched-{run_id}-a{attempt}")
 }
 
 /// ```
@@ -188,9 +197,13 @@ fn describe_step(
     previous: Option<(&StepRecord, Option<&str>)>,
 ) -> String {
     let step = &flow.step[index];
+    let subject = match input.issue_number {
+        Some(number) => format!("Issue #{number}"),
+        None => "Scheduled run".to_string(),
+    };
     let mut text = format!(
-        "Issue #{}: {}\n\n{}\n\n---\nInchworm step {} of {}: {}\nAttempt: {}\nBranch for any pull request: {}\nBase branch: {}\nNever modify anything under {}/.",
-        input.issue_number,
+        "{}: {}\n\n{}\n\n---\nInchworm step {} of {}: {}\nAttempt: {}\nBranch for any pull request: {}\nBase branch: {}\nNever modify anything under {}/.",
+        subject,
         input.issue_title,
         input.issue_body,
         index + 1,
@@ -266,7 +279,7 @@ fn failed(
 /// "#).unwrap();
 /// let input = FlowInput {
 ///     repo_path: Path::new("/repo"),
-///     issue_number: 1,
+///     issue_number: Some(1),
 ///     issue_title: "t",
 ///     issue_body: "b",
 ///     attempt: 1,
@@ -436,7 +449,7 @@ mod tests {
     fn input<'a>(failure: Option<&'a str>) -> FlowInput<'a> {
         FlowInput {
             repo_path: Path::new("/repo"),
-            issue_number: 12,
+            issue_number: Some(12),
             issue_title: "Fix the thing",
             issue_body: "It is broken.",
             attempt: 2,

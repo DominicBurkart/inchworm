@@ -107,6 +107,7 @@ Exit codes: `0` ok, `1` the repos have errors or the run failed, `2` the config 
 
 - the path is a git repository
 - `.inchworm/flows.toml` parses and passes its rules
+- every `schedule` trigger has a valid five-field cron expression that fires on some date within nine years (an expression such as `0 0 30 2 *` is an error)
 - every rubric file referenced by an `llm` judge exists
 - `.nanna/protected.toml` lists `.inchworm/**` so agents cannot edit their own flows or judges
 - `.nanna/prompt.md` exists (warning only)
@@ -178,6 +179,43 @@ required_checks = ["Tests"]
 
 `mode = "merge_when"` additionally requires at least one judge and a non-empty `required_checks`. Unknown keys are rejected everywhere.
 
+### Schedule trigger
+
+A flow can start on a clock instead of a label: `trigger = { kind = "schedule", cron = "<5-field cron>" }`. Weekly flows for a scout (Saturday) and a prover (Sunday), both at 03:00 UTC:
+
+```toml
+[[flow]]
+name = "scout"
+trigger = { kind = "schedule", cron = "0 3 * * 6" }
+
+[[flow.step]]
+name = "scout"
+identity = "scout"
+
+[flow.outcome]
+mode = "draft_pr"
+
+[[flow]]
+name = "prover"
+trigger = { kind = "schedule", cron = "0 3 * * 0" }
+
+[[flow.step]]
+name = "prove"
+identity = "prover"
+
+[flow.outcome]
+mode = "draft_pr"
+```
+
+- A schedule flow needs steps, may have judges, and its outcome must be `draft_pr`: `merge_when` is rejected for a schedule flow. It has no label, so it adds no required label to `validate --online` and shares no label with another flow. Label and schedule flows can sit in one file.
+- Cron syntax is parsed offline by a small built-in parser (no dependency): minute, hour, day-of-month, month, day-of-week; `*`, values, ranges `a-b`, lists `a,b`, steps `*/n` and `a-b/n`; month names `jan`-`dec` and day names `sun`-`sat`, case-insensitive; day-of-week `0` and `7` are both Sunday. When both day-of-month and day-of-week are restricted, either one matching is enough (as in Vixie cron). Not supported, and rejected: `@daily` style macros, six fields, `?`, `L`, `#`, `W`, a step on a single value (`5/10`), step 0, reversed ranges, empty list items and expressions that never fire.
+- All times are UTC. There is no time-zone setting and no daylight saving.
+- The daemon checks on every poll (`poll_secs`, default 120) using its clock, so a run starts up to one poll interval after the tick, not on the second. Minute resolution is the finest a cron can express.
+- Each firing creates one run keyed by flow and fire time (the tick, in epoch seconds). The key is permanent: a bucket that already has a run in any state, including a finished one, is never fired again, so a repeated poll or a restart cannot create a second run. A scheduled run has no GitHub issue, so it stores subject `0`, never touches issue labels or comments, and works on the branch `inchworm/sched-<run id>-a<attempt>`. The agent prompt says it is a scheduled run and carries only the flow's steps, so a schedule flow's steps must carry the whole task. The one-open-run rule still holds: at most one run of a schedule flow is open at a time.
+- Catch-up policy: after downtime (or a run that overran) the daemon fires at most once, for the latest tick that has passed, and does not backfill the ticks in between. A flow the daemon sees for the first time fires only for a tick at or after the moment it was first seen; the first-seen time is stored per repo and flow, so a restart does not forget it. Consequence: deploying a Saturday flow on a Wednesday waits for the next Saturday, but a daemon that was down across a Saturday fires that Saturday's run once when it comes back.
+- If the previous run of the flow is still open when a new tick passes, the new tick is not queued behind it. When the old run finishes, the latest tick fires once if it is still the latest, otherwise it is skipped. Removing a schedule flow from the file leaves an open run unexecuted (as for any removed flow).
+- `inchworm run <repo> <issue>` refuses a schedule flow. `inchworm stats` and failure lists show a scheduled run's issue as `0`.
+
 ## LLM judge safety
 
 The `llm` judge fails closed. Ollama being down, refusing the connection, answering with a non-2xx status, hanging past the timeout, returning a body that is not the expected envelope, or returning a reply that is not exactly `{"score": <integer 0-10>, "reason": <string>}` (extra keys, duplicate keys, prose, code fences, trailing text, out-of-range or non-integer scores, a response body over 1 MiB, replies over 8 KiB) all produce a failed verdict with no score. Patches over 64 KiB are not judged and fail. Every model call is bounded by a timeout and holds the global model permit only while it runs.
@@ -197,7 +235,7 @@ Residual risk: this reduces but does not eliminate prompt injection. A small loc
 - CI: a required check must be green on the exact judged SHA. A failed run followed by a green rerun with the same name and SHA stays `ci_red`. GitHub conclusions map fail closed: only `success` is green, `skipped`, `neutral`, `cancelled`, `timed_out`, `action_required`, `stale` and anything unknown are red, and anything not `completed` is pending.
 - `policy::decide` takes a caller-supplied `MergeGrant` (`Denied` by default, `Granted`) meaning that a repository-declared rule currently grants this orchestrator the right to merge there. `Merge` is returned only when the mode is `merge_when`, the grant is `Granted` and every safety condition holds; otherwise the result is a draft pull request. Nothing reads a repository file to decide the grant, so merging is unreachable in production until nanna-coder#1043 defines the capability and a later change wires `Granted` to it. Every shipped default and example uses `draft_pr`; nothing enables `merge_when`.
 - The scheduler gives each repo one active run at a time. The global `concurrency` limit is a semaphore around model calls (dispatch and the LLM judge), not around leases, so runs in different repos wait on CI in parallel and a run that holds its lease can still judge.
-- Not implemented: per-directory configuration, offramps and a per-step auditor (D1 to D3). `Verdict` carries an optional `step` and is `non_exhaustive`; `config::Judge` and `config::Trigger` are not, so adding a variant is a breaking change for code that matches them exhaustively. A per-step verdict (D3) additionally needs a policy change: `policy::decide` matches verdicts by (kind, index) and requires exactly one per configured judge, so a second verdict with the same kind and index and a different `step` is currently rejected as a duplicate.
+- Not implemented: per-directory configuration, offramps and a per-step auditor (D1 to D3). `Verdict` carries an optional `step` and is `non_exhaustive`; `config::Judge` and `config::Trigger` are not, so adding a variant is a breaking change for code that matches them exhaustively (`Trigger::Schedule` was added this way). A per-step verdict (D3) additionally needs a policy change: `policy::decide` matches verdicts by (kind, index) and requires exactly one per configured judge, so a second verdict with the same kind and index and a different `step` is currently rejected as a duplicate.
 
 ## Development
 
