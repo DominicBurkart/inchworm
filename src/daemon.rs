@@ -392,7 +392,9 @@ fn poll_repo(
         clock: deps.clock.as_ref(),
     };
     for flow in &file.flow {
-        let Trigger::Label { label } = &flow.trigger;
+        let Trigger::Label { label } = &flow.trigger else {
+            continue;
+        };
         let issues = deps
             .github
             .open_issues_with_label(&repo.slug, label)

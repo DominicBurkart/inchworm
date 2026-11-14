@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn the_marigold_weekly_schedules_fire_on_saturday_and_sunday_at_0300_utc() {
+    fn weekly_saturday_and_sunday_schedules_fire_on_saturday_and_sunday_at_0300_utc() {
         let scout = cron("0 3 * * 6");
         let prover = cron("0 3 * * 0");
         let saturday = at(2026, 11, 14, 3, 0);

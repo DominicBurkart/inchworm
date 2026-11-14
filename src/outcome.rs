@@ -12,7 +12,7 @@ use crate::github::{GitHub, PrState, PullRequest};
 use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
 use crate::policy::{CheckConclusion, CheckRun, Decision, MergeGrant, PolicyInput, decide};
-use crate::run::{RUNNING_LABEL, trigger_label};
+use crate::run::labels_to_clear;
 use crate::store::{AttemptId, RunId, Store, StoreError};
 
 pub const DONE_LABEL: &str = "inchworm:done";
@@ -317,7 +317,7 @@ fn settle_merged(
     warn_label_comment(
         ctx,
         &[DONE_LABEL],
-        &[RUNNING_LABEL, trigger_label(flow)],
+        &labels_to_clear(flow),
         &format!(
             "inchworm found {} already merged after attempt {} (judged head `{sha}`).",
             published.pr.url, published.attempt_n
@@ -458,7 +458,7 @@ pub async fn conclude(
             warn_label_comment(
                 ctx,
                 &[DONE_LABEL],
-                &[RUNNING_LABEL, trigger_label(flow)],
+                &labels_to_clear(flow),
                 &format!(
                     "inchworm outcome `draft_pr` after attempt {}: {} stays a draft at `{sha}`. {} Judges: {}.",
                     published.attempt_n,
@@ -495,7 +495,7 @@ pub async fn conclude(
                     warn_label_comment(
                         ctx,
                         &[DONE_LABEL],
-                        &[RUNNING_LABEL, trigger_label(flow)],
+                        &labels_to_clear(flow),
                         &format!(
                             "inchworm outcome `merge` after attempt {}: merged {} at `{head_sha}` (--match-head-commit). Judges: {}.",
                             published.attempt_n,

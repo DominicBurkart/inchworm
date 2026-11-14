@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::clock::Clock;
-use crate::config::{Flow, Trigger};
+use crate::config::Flow;
 use crate::flow::{
     Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, branch_name, nanna_report,
     protected_paths_in, run_flow,
@@ -53,9 +53,10 @@ pub struct RunContext<'a> {
     pub clock: &'a dyn Clock,
 }
 
-pub(crate) fn trigger_label(flow: &Flow) -> &str {
-    let Trigger::Label { label } = &flow.trigger;
-    label
+pub(crate) fn labels_to_clear(flow: &Flow) -> Vec<&str> {
+    let mut labels = vec![RUNNING_LABEL];
+    labels.extend(flow.trigger.label());
+    labels
 }
 
 fn describe_failure(class: FailureClass, raw: &str, attempt: u32) -> String {
@@ -118,7 +119,7 @@ pub fn enqueue_issue(
             ctx,
             issue_number,
             &[RUNNING_LABEL],
-            &[trigger_label(flow)],
+            &flow.trigger.label().into_iter().collect::<Vec<_>>(),
             warnings,
         );
     }
@@ -141,7 +142,7 @@ fn give_up(
         ctx,
         issue,
         &[FAILED_LABEL],
-        &[RUNNING_LABEL, trigger_label(flow)],
+        &labels_to_clear(flow),
         &mut warnings,
     );
     note(
@@ -204,13 +205,7 @@ fn settle_resumed(
     } else {
         ctx.store.set_run_state(run_id, target, ctx.clock.now())?;
     }
-    relabel(
-        ctx,
-        issue,
-        &[DONE_LABEL],
-        &[RUNNING_LABEL, trigger_label(flow)],
-        warnings,
-    );
+    relabel(ctx, issue, &[DONE_LABEL], &labels_to_clear(flow), warnings);
     note(
         ctx,
         issue,
