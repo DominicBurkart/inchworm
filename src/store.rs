@@ -1046,6 +1046,45 @@ impl Store {
         attempt_in(&self.conn, id)
     }
 
+    /// ```
+    /// use inchworm::store::{Store, Subject};
+    ///
+    /// let store = Store::open_in_memory().unwrap();
+    /// let run = store.enqueue_run("o/r", &Subject::issue(1).unwrap(), "issue", 0).unwrap().unwrap();
+    /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 0);
+    /// store.set_run_state(run, inchworm::model::RunState::Running, 1).unwrap();
+    /// store.start_attempt(run, 1).unwrap();
+    /// assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 1);
+    /// assert_eq!(store.issue_attempt_count("o/r", 2).unwrap(), 0);
+    /// assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(run));
+    /// ```
+    pub fn open_run(
+        &self,
+        repo: &str,
+        issue: u64,
+        flow: &str,
+    ) -> Result<Option<RunId>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM runs WHERE repo = ?1 AND subject_kind = 'issue' AND subject_ref = ?2
+                 AND flow = ?3 AND state IN ('queued', 'running', 'awaiting_ci', 'judging') LIMIT 1",
+                params![repo, issue.to_string(), flow],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn issue_attempt_count(&self, repo: &str, issue: u64) -> Result<u32, StoreError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts a JOIN runs r ON r.id = a.run_id
+             WHERE r.repo = ?1 AND r.subject_kind = 'issue' AND r.subject_ref = ?2",
+            params![repo, issue.to_string()],
+            |row| row.get(0),
+        )?;
+        u32::try_from(count).map_err(corrupt("attempt count"))
+    }
+
     pub fn attempts(&self, run_id: RunId) -> Result<Vec<Attempt>, StoreError> {
         let mut statement = self
             .conn
@@ -2164,6 +2203,79 @@ CREATE TABLE attempts (
                 "{good}"
             );
         }
+    }
+
+    #[test]
+    fn the_attempt_count_ignores_pull_request_subjects_with_the_same_number() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = store
+            .enqueue_run("o/r", &issue(5), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let pull = store
+            .enqueue_run("o/r", &Subject::pr(5).unwrap(), "issue", 1)
+            .unwrap()
+            .unwrap();
+        for run in [mine, pull, pull] {
+            store.set_run_state(run, RunState::Running, 2).ok();
+            store.start_attempt(run, 2).unwrap();
+        }
+        assert_eq!(store.issue_attempt_count("o/r", 5).unwrap(), 1);
+    }
+
+    #[test]
+    fn open_run_sees_every_open_state_including_judging() {
+        let (store, id) = store_with_run();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));
+        for state in [RunState::Running, RunState::AwaitingCi, RunState::Judging] {
+            store.set_run_state(id, state, 11).unwrap();
+            assert_eq!(
+                store.open_run("o/r", 1, "issue").unwrap(),
+                Some(id),
+                "{state:?}"
+            );
+        }
+        store.set_run_state(id, RunState::PrOpen, 12).unwrap();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), None);
+    }
+
+    #[test]
+    fn the_attempt_count_is_scoped_to_one_repo_and_one_issue() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = store
+            .enqueue_run("o/r", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let other_issue = store
+            .enqueue_run("o/r", &issue(2), "issue", 1)
+            .unwrap()
+            .unwrap();
+        let other_repo = store
+            .enqueue_run("o/x", &issue(1), "issue", 1)
+            .unwrap()
+            .unwrap();
+        for run in [mine, mine, other_issue, other_repo, other_repo, other_repo] {
+            let _ = store.set_run_state(run, RunState::Running, 2);
+            store.start_attempt(run, 2).unwrap();
+        }
+        assert_eq!(store.issue_attempt_count("o/r", 1).unwrap(), 2);
+        assert_eq!(store.issue_attempt_count("o/r", 2).unwrap(), 1);
+        assert_eq!(store.issue_attempt_count("o/x", 1).unwrap(), 3);
+        assert_eq!(store.issue_attempt_count("o/r", 3).unwrap(), 0);
+        assert_eq!(store.issue_attempt_count("o/none", 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn open_run_finds_a_live_run_for_the_exact_issue_and_flow_only() {
+        let (store, id) = store_with_run();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));
+        assert_eq!(store.open_run("o/r", 2, "issue").unwrap(), None);
+        assert_eq!(store.open_run("o/r", 1, "other").unwrap(), None);
+        assert_eq!(store.open_run("o/x", 1, "issue").unwrap(), None);
+        store.set_run_state(id, RunState::Running, 11).unwrap();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), Some(id));
+        store.set_run_state(id, RunState::Failed, 12).unwrap();
+        assert_eq!(store.open_run("o/r", 1, "issue").unwrap(), None);
     }
 
     #[test]

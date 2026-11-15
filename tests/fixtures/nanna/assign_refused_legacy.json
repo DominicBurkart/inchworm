@@ -1,0 +1,5 @@
+{
+  "_provenance": "CAPTURED from the real installed nanna (built 2026-11-09) on 2026-11-11: real shape of a synchronous refusal; identity names differ from the capture day. Only this `_provenance` key was added afterwards.",
+  "code": -32602,
+  "message": "spawn refused: block: unknown_identity: no identity `nonexistent` in the catalog (known: auditor, pr-shepherd, rust-implementer)"
+}

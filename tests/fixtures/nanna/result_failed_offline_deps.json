@@ -1,0 +1,15 @@
+{
+  "_provenance": "RECONSTRUCTED, not captured: OfflineDependenciesFailed label from nanna-coder #1031 (draft).",
+  "content": [
+    {
+      "type": "text",
+      "text": "offline dependencies could not be vendored\n\n{\n  \"error_type\": \"OfflineDependenciesFailed\",\n  \"iterations_completed\": 0,\n  \"last_tool_call\": null,\n  \"partial_changes\": null,\n  \"tool_call_history\": [],\n  \"last_agent_state\": null,\n  \"conversation_snapshot\": null,\n  \"action_audit\": [],\n  \"denials\": []\n}"
+    }
+  ],
+  "isError": true,
+  "_meta": {
+    "io.modelcontextprotocol/related-task": {
+      "taskId": "task-1"
+    }
+  }
+}

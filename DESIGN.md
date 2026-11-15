@@ -99,24 +99,24 @@ Everything above this line is the project's design as written by the maintainer.
 
 ## Implementation status
 
-Status values: **implemented** (code and tests on `main`), **config only** (parsed and validated, nothing executes it), **not implemented**, **open** (a decision is pending). Nothing in the daemon, dispatch or GitHub layer exists on `main` yet.
+Status values: **implemented** (code and tests on `main`), **config only** (parsed and validated, nothing executes it), **not implemented**, **open** (a decision is pending). The daemon does not exist yet. Dispatch exists as `inchworm run` (one flow for one issue, in the foreground; PR #4) and the judges, policy and scheduler exist as library code (PR #3), but `run` calls neither, and no auditor or offramp is ever run.
 
 | Design concept | Where | Status |
 |---|---|---|
-| One daemon per user | not built; `poll_secs` and `concurrency` exist in the global config | not implemented (PR #4) |
+| One daemon per user | not built; `poll_secs` and `concurrency` exist in the global config | not implemented (PR #5) |
 | Registered directories with an `inchworm.toml` | `config::ProjectConfig`, `PROJECT_FILE`; `validate`; the global `[[repo]]` list is the registry and `inchworm list` prints it | implemented; `register` / `unregister` are a non-goal until a TOML-editing dependency is accepted |
-| Golden path: a sequence of steps | `config::Flow`, `Step` (an ordered list of nanna identities) | config only |
-| Journey 1: issue RPE agents | `Trigger::Label`, one `[[flow]]`; research, plan and execute are the user's three steps | config only; no dispatch |
+| Golden path: a sequence of steps | `config::Flow`, `Step` (an ordered list of nanna identities); `flow`, `run` (PR #4) dispatch the steps to nanna in order | implemented for one issue in the foreground; publishing a pull request is not supported by nanna yet |
+| Journey 1: issue RPE agents | `Trigger::Label`, one `[[flow]]`; research, plan and execute are the user's three steps | `inchworm run` runs it for one issue; no daemon and no auditor |
 | Journey 2: CI failure root cause | the tagged `Trigger` enum is the extension point (issue #13 for a schedule trigger) | not implemented |
 | Journey 3: merge conflict resolution | same extension point | not implemented |
 | Journeys 4 and 5: code review, review addressers | flows with other identities; nothing specific | not implemented |
 | Offramps `noop` / `issue` / `escalate` | `config::Offramp`, `OfframpConfig` (default plus per-flow); `validate` warns on `escalate` | config only. `noop` is the default and `escalate` must be named. Whether `issue` reuses nanna's escalation sink is **open**; `escalate` hands nothing anywhere |
 | 100% local intelligence | the only setting that can leave local models is `escalate`, which is off | config only |
 | Agents are fallible; auditors after every step | `config::AuditorConfig`, `AuditorPlace`, `StepAudit`, `AuditorConfig::plan_for` and `decide` | config only. The auditor is mandatory, cannot be skipped and cannot be the audited step's own identity; an auditor error halts the step. Where it runs is a nanna identity; `host` is rejected everywhere (project default or per step) because no host check exists. Every step needs at least one check, either the flow's judges or a named subset; a flow with no judges is an error because its auditor would verify nothing. Auditor design (same model, other prompt, other model) is **open** |
-| Judges after a run | `config::Judge` (`diff`, `nanna_clean`, `llm`) | config only |
-| Nanna only for coding agents | step identities are nanna identities; `validate` checks only their syntax | config only; identity existence is an online check, not built |
-| Merging | `[merge] allow` (default `false`), `MergeConfig::grant` giving `MergeGrantSetting::{Denied, Granted}`; a `merge_when` flow with `allow = false` is rejected | config only. This is the single mapping point for the later policy code's `MergeGrant` (PR #3): `allow = false` is `Denied`, `true` is `Granted`, and there is no second concept. Aligns with nanna-coder #1043, where the capability is still being designed |
-| Agents cannot edit their own configuration | `validate` requires `inchworm.toml` and `.inchworm/**` in `.nanna/protected.toml`; `validate::protected_path_touched` is inchworm's own check of a patch | implemented as checks; nothing applies the patch check yet |
+| Judges after a run | `config::Judge` (`diff`, `nanna_clean`, `llm`); `judges`, `policy::decide` (PR #3) | implemented as library code; `inchworm run` does not call them yet |
+| Nanna only for coding agents | step identities are nanna identities; `validate` checks their syntax and `validate --online` (PR #4) asks nanna whether they exist and checks the labels | implemented |
+| Merging | `[merge] allow` (default `false`), `MergeConfig::grant` giving `MergeGrantSetting::{Denied, Granted}`; a `merge_when` flow with `allow = false` is rejected | config only. This is the single mapping point for `policy::MergeGrant` (PR #3 re-exports `MergeGrantSetting` under that name): `allow = false` is `Denied`, `true` is `Granted`, and there is no second concept. Aligns with nanna-coder #1043, where the capability is still being designed |
+| Agents cannot edit their own configuration | `validate` requires `inchworm.toml` and `.inchworm/**` in `.nanna/protected.toml`; `validate::protected_path_touched` is inchworm's own check of a patch | implemented as checks. `inchworm run` applies `flow::touches_protected` (PR #4, any depth) to the pull request's files; `validate::protected_path_touched` (repository root only, issue #26) is not called by anything; `run` does not read `.nanna/protected.toml`, only `validate` does |
 | State per journey and capability | `store` (SQLite runs and attempts, `DaemonLock`) | implemented for runs and attempts; per-capability state is **open** |
 | Failure taxonomy and rates | `model::FailureClass`, `store` | implemented as data; no reporting command yet |
 | Onboarding and research agents | none | not implemented |

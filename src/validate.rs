@@ -53,7 +53,12 @@ impl Report {
             .count()
     }
 
-    fn push(&mut self, repo: Option<&str>, severity: Severity, message: impl Into<String>) {
+    pub(crate) fn push(
+        &mut self,
+        repo: Option<&str>,
+        severity: Severity,
+        message: impl Into<String>,
+    ) {
         self.findings.push(Finding {
             repo: repo.map(str::to_string),
             severity,
