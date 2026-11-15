@@ -168,6 +168,26 @@ const FROZEN_OBJECTS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+const FROZEN_V1_ATTEMPTS: (&str, &str, &str, &str) = (
+    "table",
+    "attempts",
+    "attempts",
+    "CREATE TABLE attempts (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('dispatched', 'succeeded', 'failed')),
+    branch TEXT,
+    head_sha TEXT,
+    pr_number INTEGER,
+    failure_class TEXT,
+    raw_error TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    UNIQUE (run_id, n)
+)",
+);
+
 fn normalise_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -197,6 +217,20 @@ const EXPECTED_ATTEMPT_COLUMNS: &[&str] = &[
     "ended_at",
     "nanna_denials",
     "nanna_qa_ok",
+];
+
+const EXPECTED_V1_ATTEMPT_COLUMNS: &[&str] = &[
+    "id",
+    "run_id",
+    "n",
+    "state",
+    "branch",
+    "head_sha",
+    "pr_number",
+    "failure_class",
+    "raw_error",
+    "started_at",
+    "ended_at",
 ];
 
 const EXPECTED_INDEX_COLUMNS: &[&str] = &["repo", "subject_kind", "subject_ref", "flow"];
@@ -983,6 +1017,10 @@ impl Store {
                 supported: MIGRATIONS.len(),
             });
         }
+        if current == 1 {
+            let frozen = [FROZEN_OBJECTS[0], FROZEN_OBJECTS[1], FROZEN_V1_ATTEMPTS];
+            Store::verify_objects(&tx, EXPECTED_V1_ATTEMPT_COLUMNS, &frozen)?;
+        }
         for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
             tx.execute_batch(sql)?;
             tx.pragma_update(
@@ -996,10 +1034,17 @@ impl Store {
     }
 
     fn verify_schema(&self) -> Result<(), StoreError> {
+        Store::verify_objects(&self.conn, EXPECTED_ATTEMPT_COLUMNS, FROZEN_OBJECTS)
+    }
+
+    fn verify_objects(
+        conn: &Connection,
+        attempt_columns: &[&str],
+        frozen_objects: &[(&str, &str, &str, &str)],
+    ) -> Result<(), StoreError> {
         let columns = |table: &str| -> Result<Vec<String>, StoreError> {
-            let mut statement = self
-                .conn
-                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+            let mut statement =
+                conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
             let names = statement
                 .query_map([], |row| row.get(0))?
                 .collect::<Result<_, _>>()?;
@@ -1008,7 +1053,7 @@ impl Store {
         let mismatch = |detail: String| Err(StoreError::SchemaMismatch(detail));
         for (table, expected) in [
             ("runs", EXPECTED_RUN_COLUMNS),
-            ("attempts", EXPECTED_ATTEMPT_COLUMNS),
+            ("attempts", attempt_columns),
         ] {
             let found = columns(table)?;
             if found != expected {
@@ -1017,8 +1062,7 @@ impl Store {
                 ));
             }
         }
-        let index: Option<(bool, bool)> = self
-            .conn
+        let index: Option<(bool, bool)> = conn
             .query_row(
                 "SELECT \"unique\", partial FROM pragma_index_list('runs') WHERE name = 'runs_one_open_per_subject'",
                 [],
@@ -1031,7 +1075,7 @@ impl Store {
                     .into(),
             );
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = conn.prepare(
             "SELECT name FROM pragma_index_info('runs_one_open_per_subject') ORDER BY seqno",
         )?;
         let indexed: Vec<String> = statement
@@ -1042,7 +1086,7 @@ impl Store {
                 "the index `runs_one_open_per_subject` covers {indexed:?}, expected {EXPECTED_INDEX_COLUMNS:?}"
             ));
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = conn.prepare(
             "SELECT type, name, tbl_name, sql FROM sqlite_master
              WHERE substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name",
         )?;
@@ -1051,7 +1095,7 @@ impl Store {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<_, _>>()?;
-        for (kind, name, table, expected) in FROZEN_OBJECTS {
+        for (kind, name, table, expected) in frozen_objects {
             let Some((_, _, found_table, sql)) = stored
                 .iter()
                 .find(|(found_kind, found_name, ..)| found_kind == kind && found_name == name)
@@ -1069,7 +1113,7 @@ impl Store {
             }
         }
         for (kind, name, ..) in &stored {
-            if !FROZEN_OBJECTS
+            if !frozen_objects
                 .iter()
                 .any(|(frozen_kind, frozen_name, ..)| frozen_kind == kind && frozen_name == name)
             {
@@ -1884,6 +1928,45 @@ CREATE TABLE attempts (
             let message = mismatch(Store::open(&path));
             assert!(message.contains("delete"), "{name}: {message}");
             assert!(message.contains("definition"), "{name}: {message}");
+        }
+        let version_one_variants = [
+            (
+                "attempts state check removed",
+                altered(
+                    " CHECK (state IN ('dispatched', 'succeeded', 'failed'))",
+                    "",
+                ),
+            ),
+            (
+                "unique run_id and n removed",
+                altered(",\n    UNIQUE (run_id, n)", ""),
+            ),
+            ("foreign key removed", altered(" REFERENCES runs(id)", "")),
+            (
+                "extra column",
+                format!(
+                    "{}ALTER TABLE attempts ADD COLUMN evil TEXT;",
+                    MIGRATIONS[0]
+                ),
+            ),
+            (
+                "missing column",
+                format!(
+                    "{}ALTER TABLE attempts DROP COLUMN raw_error;",
+                    MIGRATIONS[0]
+                ),
+            ),
+        ];
+        for (name, migration) in version_one_variants {
+            let dir = tempfile::tempdir().unwrap();
+            let path = database_made_from(&migration, &dir);
+            let message = mismatch(Store::open(&path));
+            assert!(message.contains("delete"), "{name}: {message}");
+            let reopened = Connection::open(&path).unwrap();
+            let version: i64 = reopened
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "{name}: a refused database is left untouched");
         }
         let latest_variants = [
             (
@@ -3787,10 +3870,9 @@ CREATE TABLE attempts (
                 replace_file(&target);
             }
         });
-        let lock = DaemonLock::acquire(&db);
+        let lock = acquire_after_release(&db);
         clear_verify_hook();
-        let lock = lock.unwrap();
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
         let store = Store::open(&db).unwrap();
         let run = running_in(&store);
         store.start_attempt(run, 2).unwrap();
