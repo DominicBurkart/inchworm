@@ -1399,15 +1399,19 @@ required_checks = ["build"]
             "read line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nread line\nsleep 5\n",
         );
         assert!(
-            NannaFactory::new(SpawnOptions::new(ok, dir.path().join("state")))
-                .make()
-                .is_ok()
+            NannaFactory::new(
+                SpawnOptions::new(ok, dir.path().join("state")).with_home(dir.path())
+            )
+            .make()
+            .is_ok()
         );
         let dead = crate::testing::shim_script(dir.path(), "dead", "exit 3\n");
-        let err = NannaFactory::new(SpawnOptions::new(dead, dir.path().join("state")))
-            .make()
-            .err()
-            .unwrap();
+        let err = NannaFactory::new(
+            SpawnOptions::new(dead, dir.path().join("state")).with_home(dir.path()),
+        )
+        .make()
+        .err()
+        .unwrap();
         assert!(err.contains("initialize failed"), "{err}");
     }
 

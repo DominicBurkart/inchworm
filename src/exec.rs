@@ -626,7 +626,7 @@ mod tests {
         let pidfile = dir.path().join("pid");
         let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
         let spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()])
-            .with_timeout(Duration::from_millis(300))
+            .with_timeout(Duration::from_millis(2500))
             .in_own_process_group();
         let err = SystemRunner.run(&spec).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
