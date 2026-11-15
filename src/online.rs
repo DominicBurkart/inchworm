@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{FlowFile, GlobalConfig, RepoEntry, Trigger};
+use crate::config::{FlowFile, GlobalConfig, RepoEntry};
 use crate::exec::{CmdSpec, Runner, SystemRunner};
 use crate::github::GitHub;
 use crate::validate::{Report, Severity, validate};
@@ -150,8 +150,9 @@ pub fn validate_online(config: &GlobalConfig, online: &Online<'_>) -> Report {
 fn required_labels(file: &FlowFile) -> BTreeSet<String> {
     let mut labels: BTreeSet<String> = STATUS_LABELS.iter().map(|l| l.to_string()).collect();
     for flow in &file.flow {
-        let Trigger::Label { label } = &flow.trigger;
-        labels.insert(label.clone());
+        if let Some(label) = flow.trigger.label() {
+            labels.insert(label.to_string());
+        }
     }
     labels
 }

@@ -312,6 +312,42 @@ mode = "draft_pr"
         assert!(validate(&config_for(dir.path())).is_ok());
     }
 
+    const SCHEDULED: &str = r#"
+[[flow]]
+name = "scout"
+trigger = { kind = "schedule", cron = "0 3 * * 6" }
+
+[[flow.step]]
+name = "scout"
+identity = "scout"
+
+[flow.outcome]
+mode = "draft_pr"
+"#;
+
+    #[test]
+    fn a_valid_schedule_flow_passes_and_a_bad_cron_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        write(dir.path(), ".inchworm/flows.toml", SCHEDULED);
+        let report = validate(&config_for(dir.path()));
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+
+        for bad in ["0 3 * *", "0 3 * * 9", "0 0 31 2 *", "@weekly"] {
+            let text = SCHEDULED.replace("0 3 * * 6", bad);
+            write(dir.path(), ".inchworm/flows.toml", &text);
+            let report = validate(&config_for(dir.path()));
+            assert!(!report.is_ok(), "{bad}");
+            assert!(
+                messages(&report)
+                    .iter()
+                    .any(|m| m.contains("flow `scout`") && m.contains("trigger cron")),
+                "{bad}: {:?}",
+                messages(&report)
+            );
+        }
+    }
+
     #[test]
     fn missing_or_broken_flows_are_errors() {
         let dir = tempfile::tempdir().unwrap();
