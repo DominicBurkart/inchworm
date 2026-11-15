@@ -89,6 +89,8 @@ pub fn github_with_issue() -> FakeGitHub {
             body: "please".into(),
             labels: vec!["inchworm".into()],
             url: "https://github.com/o/r/issues/5".into(),
+            open: true,
+            author_association: "OWNER".into(),
         },
     );
     github
@@ -118,12 +120,4 @@ pub(crate) fn shim_script(dir: &std::path::Path, name: &str, body: &str) -> std:
     )
     .unwrap();
     path
-}
-
-pub(crate) fn link_fixture(dir: &std::path::Path, name: &str) {
-    std::os::unix::fs::symlink(
-        format!("{}/tests/fixtures/bin/{name}", env!("CARGO_MANIFEST_DIR")),
-        dir.join(name),
-    )
-    .unwrap();
 }

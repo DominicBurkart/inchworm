@@ -35,6 +35,8 @@ pub struct Issue {
     pub body: String,
     pub labels: Vec<String>,
     pub url: String,
+    pub open: bool,
+    pub author_association: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,8 @@ pub struct PullRequest {
     pub base_ref: String,
     pub is_cross_repository: bool,
 }
+
+pub const PR_FILES_LIMIT: usize = 3000;
 
 pub trait GitHub {
     fn open_issues_with_label(&self, repo: &str, label: &str) -> Result<Vec<Issue>, GitHubError>;
@@ -83,6 +87,11 @@ pub trait GitHub {
     ) -> Result<(), GitHubError>;
     fn required_checks(&self, repo: &str, branch: &str)
     -> Result<Option<Vec<String>>, GitHubError>;
+    fn open_prs_for_issue(
+        &self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<Vec<(String, PullRequest)>, GitHubError>;
 }
 
 #[derive(Deserialize)]
@@ -107,6 +116,30 @@ pub fn check_conclusion(status: &str, conclusion: Option<&str>) -> CheckConclusi
     CheckConclusion::from_github(status, conclusion)
 }
 
+/// ```
+/// use inchworm::github::{is_issue_branch, issue_branch_attempt};
+///
+/// assert!(is_issue_branch("inchworm/5-a1", 5));
+/// assert!(is_issue_branch("inchworm/5-a12", 5));
+/// assert!(!is_issue_branch("inchworm/50-a1", 5));
+/// assert!(!is_issue_branch("inchworm/5-a", 5));
+/// assert!(!is_issue_branch("inchworm/5-abc", 5));
+/// assert!(!is_issue_branch("feature/5-a1", 5));
+/// assert_eq!(issue_branch_attempt("inchworm/5-a12", 5), Some(12));
+/// assert_eq!(issue_branch_attempt("inchworm/5-a99999999999", 5), None);
+/// ```
+pub fn issue_branch_attempt(branch: &str, issue: u64) -> Option<u32> {
+    let attempt = branch.strip_prefix(&format!("inchworm/{issue}-a"))?;
+    if attempt.is_empty() || !attempt.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    attempt.parse().ok()
+}
+
+pub fn is_issue_branch(branch: &str, issue: u64) -> bool {
+    issue_branch_attempt(branch, issue).is_some()
+}
+
 #[derive(Deserialize)]
 struct WireLabel {
     name: String,
@@ -121,6 +154,10 @@ struct WireIssue {
     #[serde(default)]
     labels: Vec<WireLabel>,
     url: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default, rename = "authorAssociation")]
+    author_association: String,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +165,8 @@ struct WireIssue {
 struct WirePr {
     number: u64,
     head_ref_oid: String,
+    #[serde(default)]
+    head_ref_name: String,
     #[serde(default)]
     is_draft: bool,
     state: String,
@@ -144,6 +183,8 @@ impl From<WireIssue> for Issue {
             body: wire.body.unwrap_or_default(),
             labels: wire.labels.into_iter().map(|l| l.name).collect(),
             url: wire.url,
+            open: wire.state.eq_ignore_ascii_case("OPEN"),
+            author_association: wire.author_association,
         }
     }
 }
@@ -165,12 +206,12 @@ pub struct GhCli<R: Runner = SystemRunner> {
 
 impl GhCli<SystemRunner> {
     pub fn new() -> Self {
-        GhCli::with_runner(SystemRunner::with_timeout(GH_TIMEOUT))
+        GhCli::with_runner(SystemRunner)
     }
 
     pub fn with_program(program: impl Into<String>) -> Self {
         GhCli {
-            runner: SystemRunner::with_timeout(GH_TIMEOUT),
+            runner: SystemRunner,
             program: program.into(),
         }
     }
@@ -191,7 +232,9 @@ impl<R: Runner> GhCli<R> {
     }
 
     fn run(&self, args: &[&str]) -> Result<String, GitHubError> {
-        let spec = CmdSpec::new(&self.program, args);
+        let spec = CmdSpec::new(&self.program, args)
+            .with_timeout(GH_TIMEOUT)
+            .in_own_process_group();
         let command = spec.display();
         let output = self.runner.run(&spec).map_err(|err| GitHubError::Command {
             command: command.clone(),
@@ -216,10 +259,12 @@ impl<R: Runner> GhCli<R> {
     }
 }
 
+const OPEN_PR_LIMIT: usize = 200;
+
 impl<R: Runner> GitHub for GhCli<R> {
     fn open_issues_with_label(&self, repo: &str, label: &str) -> Result<Vec<Issue>, GitHubError> {
         #[rustfmt::skip]
-        let args = ["issue", "list", "-R", repo, "--label", label, "--state", "open", "--limit", "100", "--json", "number,title,body,labels,url"];
+        let args = ["issue", "list", "-R", repo, "--label", label, "--state", "open", "--limit", "100", "--json", "number,title,body,labels,url,state,authorAssociation"];
         let issues: Vec<WireIssue> = self.json(&args)?;
         Ok(issues.into_iter().map(Issue::from).collect())
     }
@@ -227,7 +272,7 @@ impl<R: Runner> GitHub for GhCli<R> {
     fn issue(&self, repo: &str, number: u64) -> Result<Issue, GitHubError> {
         let number = number.to_string();
         #[rustfmt::skip]
-        let args = ["issue", "view", &number, "-R", repo, "--json", "number,title,body,labels,url"];
+        let args = ["issue", "view", &number, "-R", repo, "--json", "number,title,body,labels,url,state,authorAssociation"];
         let issue: WireIssue = self.json(&args)?;
         Ok(issue.into())
     }
@@ -278,17 +323,66 @@ impl<R: Runner> GitHub for GhCli<R> {
         }))
     }
 
+    fn open_prs_for_issue(
+        &self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+        #[rustfmt::skip]
+        let args = ["pr", "list", "-R", repo, "--state", "open", "--limit", &OPEN_PR_LIMIT.to_string(), "--json", "number,headRefName,headRefOid,isDraft,state,url,baseRefName,isCrossRepository"];
+        let prs: Vec<WirePr> = self.json(&args)?;
+        if prs.len() >= OPEN_PR_LIMIT {
+            return Err(GitHubError::Command {
+                command: format!("gh pr list -R {repo}"),
+                detail: format!(
+                    "{OPEN_PR_LIMIT} open pull requests or more: cannot tell whether one is already open for #{issue}"
+                ),
+            });
+        }
+        Ok(prs
+            .into_iter()
+            .filter(|pr| is_issue_branch(&pr.head_ref_name, issue))
+            .map(|pr| {
+                (
+                    pr.head_ref_name,
+                    PullRequest {
+                        number: pr.number,
+                        head_sha: pr.head_ref_oid,
+                        is_draft: pr.is_draft,
+                        state: parse_pr_state(&pr.state),
+                        url: pr.url,
+                        base_ref: pr.base_ref_name,
+                        is_cross_repository: pr.is_cross_repository,
+                    },
+                )
+            })
+            .collect())
+    }
+
     fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
         let endpoint = format!("repos/{repo}/pulls/{number}/files");
         #[rustfmt::skip]
-        let args = ["api", "--paginate", &endpoint, "--jq", ".[] | .filename, (.previous_filename // empty)"];
+        let args = ["api", "--paginate", &endpoint, "--jq", r#".[] | ("F " + .filename), (if .previous_filename then "P " + .previous_filename else empty end)"#];
         let out = self.run(&args)?;
-        Ok(out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect())
+        let mut files = Vec::new();
+        let mut listed = 0usize;
+        for line in out.lines() {
+            if let Some(name) = line.strip_prefix("F ") {
+                listed += 1;
+                files.push(name.trim().to_string());
+            } else if let Some(name) = line.strip_prefix("P ") {
+                files.push(name.trim().to_string());
+            }
+        }
+        if listed >= PR_FILES_LIMIT {
+            return Err(GitHubError::Command {
+                command: format!("gh api {endpoint}"),
+                detail: format!(
+                    "the pull request lists {listed} files, which is GitHub's limit for this endpoint; the list may be truncated, so it cannot be checked"
+                ),
+            });
+        }
+        Ok(files)
     }
 
     fn pr(&self, repo: &str, number: u64) -> Result<PullRequest, GitHubError> {
@@ -389,6 +483,8 @@ struct FakeState {
     repo_labels: BTreeMap<String, BTreeSet<String>>,
     prs: BTreeMap<(String, String), PullRequest>,
     pr_files: BTreeMap<(String, u64), Vec<String>>,
+    pr_files_error: Option<String>,
+    open_prs_error: Option<String>,
     comments: Vec<(String, u64, String)>,
     patches: BTreeMap<(String, u64), String>,
     check_polls: BTreeMap<(String, String), Vec<Vec<CheckRun>>>,
@@ -439,6 +535,14 @@ impl FakeGitHub {
             .unwrap()
             .prs
             .insert((repo.to_string(), branch.to_string()), pr);
+    }
+
+    pub fn fail_open_prs(&self, message: &str) {
+        self.state.lock().unwrap().open_prs_error = Some(message.to_string());
+    }
+
+    pub fn fail_pr_files(&self, message: &str) {
+        self.state.lock().unwrap().pr_files_error = Some(message.to_string());
     }
 
     pub fn set_pr_files(&self, repo: &str, number: u64, files: &[&str]) {
@@ -613,11 +717,39 @@ impl GitHub for FakeGitHub {
             .cloned())
     }
 
+    fn open_prs_for_issue(
+        &self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+        let state = self.state.lock().unwrap();
+        if let Some(message) = &state.open_prs_error {
+            return Err(GitHubError::Command {
+                command: format!("gh pr list -R {repo}"),
+                detail: message.clone(),
+            });
+        }
+        let mut found: Vec<(String, PullRequest)> = state
+            .prs
+            .iter()
+            .filter(|((r, branch), pr)| {
+                r == repo && is_issue_branch(branch, issue) && pr.state == PrState::Open
+            })
+            .map(|((_, branch), pr)| (branch.clone(), pr.clone()))
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(found)
+    }
+
     fn pr_files(&self, repo: &str, number: u64) -> Result<Vec<String>, GitHubError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        if let Some(message) = &state.pr_files_error {
+            return Err(GitHubError::Command {
+                command: format!("gh api repos/{repo}/pulls/{number}/files"),
+                detail: message.clone(),
+            });
+        }
+        Ok(state
             .pr_files
             .get(&(repo.to_string(), number))
             .cloned()
@@ -785,7 +917,7 @@ mod tests {
         assert!(!GitHubError::NotFound("Upgrade to GitHub Pro 403".to_string()).is_plan_limit());
     }
 
-    const ISSUE_JSON: &str = r#"{"number":7,"title":"T","body":null,"labels":[{"name":"inchworm"},{"name":"bug"}],"url":"https://github.com/o/r/issues/7"}"#;
+    const ISSUE_JSON: &str = r#"{"number":7,"title":"T","body":null,"labels":[{"name":"inchworm"},{"name":"bug"}],"url":"https://github.com/o/r/issues/7","state":"OPEN","authorAssociation":"OWNER"}"#;
 
     fn issue(number: u64, labels: &[&str]) -> Issue {
         Issue {
@@ -794,6 +926,8 @@ mod tests {
             body: "body".into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
             url: format!("https://github.com/o/r/issues/{number}"),
+            open: true,
+            author_association: "OWNER".into(),
         }
     }
 
@@ -809,7 +943,7 @@ mod tests {
         assert_eq!(
             gh.runner.calls(),
             [
-                "gh issue list -R o/r --label inchworm --state open --limit 100 --json number,title,body,labels,url"
+                "gh issue list -R o/r --label inchworm --state open --limit 100 --json number,title,body,labels,url,state,authorAssociation"
             ]
         );
     }
@@ -819,10 +953,66 @@ mod tests {
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(ISSUE_JSON)]));
         let issue = gh.issue("o/r", 7).unwrap();
         assert_eq!(issue.title, "T");
+        assert!(issue.open);
+        assert_eq!(issue.author_association, "OWNER");
         assert_eq!(
             gh.runner.calls(),
-            ["gh issue view 7 -R o/r --json number,title,body,labels,url"]
+            ["gh issue view 7 -R o/r --json number,title,body,labels,url,state,authorAssociation"]
         );
+    }
+
+    #[test]
+    fn an_issue_missing_state_or_association_is_treated_as_closed_and_untrusted() {
+        let bare = r#"{"number":7,"title":"T","labels":[],"url":"u"}"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(bare)]));
+        let issue = gh.issue("o/r", 7).unwrap();
+        assert!(!issue.open);
+        assert_eq!(issue.author_association, "");
+        let closed = r#"{"number":7,"title":"T","labels":[],"url":"u","state":"CLOSED","authorAssociation":"OWNER"}"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(closed)]));
+        assert!(!gh.issue("o/r", 7).unwrap().open);
+        let lower = r#"{"number":7,"title":"T","labels":[],"url":"u","state":"open"}"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(lower)]));
+        assert!(gh.issue("o/r", 7).unwrap().open);
+    }
+
+    #[test]
+    fn gh_lists_open_prs_for_an_issue_by_branch_name_only() {
+        let prs = r#"[
+            {"number":1,"headRefName":"inchworm/5-a1","headRefOid":"a","isDraft":true,"state":"OPEN","url":"u1","baseRefName":"main","isCrossRepository":false},
+            {"number":2,"headRefName":"inchworm/50-a1","headRefOid":"b","isDraft":true,"state":"OPEN","url":"u2","baseRefName":"main","isCrossRepository":false},
+            {"number":3,"headRefName":"inchworm/5-a2","headRefOid":"c","isDraft":false,"state":"OPEN","url":"u3","baseRefName":"main","isCrossRepository":false},
+            {"number":4,"headRefName":"main","headRefOid":"d","isDraft":false,"state":"OPEN","url":"u4","baseRefName":"main","isCrossRepository":false},
+            {"number":5,"headRefOid":"e","isDraft":false,"state":"OPEN","url":"u5","baseRefName":"main","isCrossRepository":false}
+        ]"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(prs)]));
+        let found = gh.open_prs_for_issue("o/r", 5).unwrap();
+        assert_eq!(
+            found.iter().map(|(_, p)| p.number).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(found[0].0, "inchworm/5-a1");
+        assert_eq!(found[1].0, "inchworm/5-a2");
+        assert!(!found[1].1.is_draft);
+        assert_eq!(
+            gh.runner.calls(),
+            [
+                "gh pr list -R o/r --state open --limit 200 --json number,headRefName,headRefOid,isDraft,state,url,baseRefName,isCrossRepository"
+            ]
+        );
+    }
+
+    #[test]
+    fn too_many_open_prs_to_check_is_an_error_not_a_silent_miss() {
+        let many: Vec<String> = (0..200)
+            .map(|n| format!(r#"{{"number":{n},"headRefName":"x{n}","headRefOid":"a","isDraft":true,"state":"OPEN","url":"u","baseRefName":"main","isCrossRepository":false}}"#))
+            .collect();
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&format!(
+            "[{}]",
+            many.join(",")
+        ))]));
+        let err = gh.open_prs_for_issue("o/r", 5).unwrap_err();
+        assert!(err.to_string().contains("200 open pull requests"), "{err}");
     }
 
     #[test]
@@ -856,6 +1046,64 @@ mod tests {
     }
 
     #[test]
+    fn every_gh_call_has_a_timeout_and_its_own_process_group() {
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok("[]")]));
+        let _ = gh.labels("o/r");
+        let calls = gh.runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].timeout, Some(GH_TIMEOUT));
+        assert!(calls[0].own_group);
+    }
+
+    #[test]
+    fn the_fake_can_fail_the_open_pull_request_lookup() {
+        let fake = FakeGitHub::new();
+        assert!(fake.open_prs_for_issue("o/r", 5).unwrap().is_empty());
+        fake.fail_open_prs("boom");
+        let err = fake.open_prs_for_issue("o/r", 5).unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn the_draft_flag_and_state_of_a_pull_request_are_read_as_reported() {
+        let ready = r#"[{"number":9,"headRefOid":"abc","isDraft":false,"state":"OPEN","url":"u","baseRefName":"main","isCrossRepository":false}]"#;
+        let missing = r#"[{"number":9,"headRefOid":"abc","state":"OPEN","url":"u","baseRefName":"main","isCrossRepository":false}]"#;
+        let merged = r#"[{"number":9,"headRefOid":"abc","isDraft":true,"state":"MERGED","url":"u","baseRefName":"main","isCrossRepository":false}]"#;
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(ready),
+            ScriptedRunner::ok(missing),
+            ScriptedRunner::ok(merged),
+        ]));
+        assert!(!gh.pr_for_branch("o/r", "b").unwrap().unwrap().is_draft);
+        assert!(!gh.pr_for_branch("o/r", "b").unwrap().unwrap().is_draft);
+        assert_eq!(
+            gh.pr_for_branch("o/r", "b").unwrap().unwrap().state,
+            PrState::Merged
+        );
+    }
+
+    #[test]
+    fn only_digit_attempt_numbers_on_the_right_issue_count_as_an_issue_branch() {
+        assert_eq!(issue_branch_attempt("inchworm/5-a1", 5), Some(1));
+        assert_eq!(issue_branch_attempt("inchworm/5-a0", 5), Some(0));
+        for not in [
+            "inchworm/5-a",
+            "inchworm/5-abc",
+            "inchworm/5-a1x",
+            "inchworm/5-a-1",
+            "inchworm/5-a+3",
+            "inchworm/6-a1",
+            "inchworm/50-a1",
+            "inchworm/5-a99999999999",
+            "other/5-a1",
+            "",
+        ] {
+            assert_eq!(issue_branch_attempt(not, 5), None, "{not}");
+            assert!(!is_issue_branch(not, 5), "{not}");
+        }
+    }
+
+    #[test]
     fn gh_finds_the_pr_for_a_branch_or_none() {
         let pr = r#"[{"number":9,"headRefOid":"abc123","isDraft":true,"state":"OPEN","url":"https://github.com/o/r/pull/9","baseRefName":"main","isCrossRepository":false}]"#;
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![
@@ -877,18 +1125,48 @@ mod tests {
     #[test]
     fn gh_lists_every_file_of_a_pr_including_rename_sources() {
         let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(
-            "src/a.rs\n.inchworm/old.toml\n\nsrc/b.rs\n",
+            "F src/a.rs\nP .inchworm/old.toml\nF src/new.toml\n\nF src/b.rs\nnoise\n",
         )]));
         assert_eq!(
             gh.pr_files("o/r", 9).unwrap(),
-            ["src/a.rs", ".inchworm/old.toml", "src/b.rs"]
+            ["src/a.rs", ".inchworm/old.toml", "src/new.toml", "src/b.rs"]
         );
-        assert_eq!(
-            gh.runner.calls(),
-            [
-                "gh api --paginate repos/o/r/pulls/9/files --jq .[] | .filename, (.previous_filename // empty)"
-            ]
-        );
+        assert_eq!(gh.runner.calls().len(), 1);
+        assert!(gh.runner.calls()[0].starts_with("gh api --paginate repos/o/r/pulls/9/files --jq"));
+    }
+
+    #[test]
+    fn a_listing_at_githubs_cap_fails_closed_and_one_below_it_does_not() {
+        let listing = |n: usize| {
+            (0..n)
+                .map(|i| format!("F src/f{i}.rs\n"))
+                .collect::<String>()
+        };
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&listing(
+            PR_FILES_LIMIT,
+        ))]));
+        let err = gh.pr_files("o/r", 9).unwrap_err().to_string();
+        assert!(err.contains("cannot be checked"), "{err}");
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&listing(
+            PR_FILES_LIMIT - 1,
+        ))]));
+        assert_eq!(gh.pr_files("o/r", 9).unwrap().len(), PR_FILES_LIMIT - 1);
+    }
+
+    #[test]
+    fn rename_sources_do_not_count_toward_the_listing_cap_and_the_jq_tags_files() {
+        let mut listing = String::new();
+        for i in 0..2999 {
+            listing.push_str(&format!("F src/f{i}.rs\nP src/old{i}.rs\n"));
+        }
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&listing)]));
+        assert_eq!(gh.pr_files("o/r", 9).unwrap().len(), 5998);
+        let call = gh.runner.calls()[0].clone();
+        assert!(call.contains("(\"F \" + .filename)"), "{call}");
+        assert!(call.contains("\"P \" + .previous_filename"), "{call}");
+        let exactly: String = (0..3000).map(|i| format!("F src/f{i}.rs\n")).collect();
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![ScriptedRunner::ok(&exactly)]));
+        assert!(gh.pr_files("o/r", 9).is_err());
     }
 
     #[test]

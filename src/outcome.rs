@@ -589,6 +589,7 @@ mod tests {
     use crate::nanna_client::{AssignRequest, ClientError, TaskOutcome};
     use crate::run::{RunContext, RunError, RunSummary, execute_run, run_issue};
     use crate::store::AttemptState;
+    use crate::store::Subject;
     use crate::testing::{DRAFT_OUTCOME, FakeScorer, env, flow_with, github_with_issue, pr_at};
     use proptest::prelude::*;
 
@@ -626,6 +627,7 @@ mod tests {
 
     struct Rig {
         store: Store,
+        lock: crate::store::DaemonLock,
         github: FakeGitHub,
         clock: FakeClock,
         scorer: FakeScorer,
@@ -633,12 +635,17 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let lock = crate::store::DaemonLock::acquire(&db).unwrap();
+        let store = Store::open(&db).unwrap();
         Rig {
-            store: Store::open_in_memory().unwrap(),
+            store,
+            lock,
             github: github_with_issue(),
             clock: FakeClock::new(1_000),
             scorer: FakeScorer::new(),
-            dir: tempfile::tempdir().unwrap(),
+            dir,
         }
     }
 
@@ -912,12 +919,7 @@ mod tests {
         rig.github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
         rig.github.set_pr_patch("o/r", 77, &patch(3));
         let extra = format!("{}{}", diff_judge_toml(1), DRAFT_OUTCOME);
-        let summary = rig
-            .run(
-                &flow_with(1, "\"judge_rejected\"", &extra),
-                two_successes(1),
-            )
-            .await;
+        let summary = rig.run(&flow_with(1, "", &extra), two_successes(1)).await;
         assert_eq!(summary.state, RunState::Failed);
         assert_eq!(summary.failure.unwrap().0, FailureClass::JudgeRejected);
         assert_eq!(rig.github.issue_labels("o/r", 5), ["inchworm:failed"]);
@@ -961,9 +963,10 @@ mod tests {
             scorer: FakeScorer::replying(vec![Err(LlmError::Status(500))]),
             ..rig
         };
-        std::fs::write(rig.dir.path().join("rubric.md"), "r").unwrap();
+        std::fs::create_dir_all(rig.dir.path().join(".inchworm")).unwrap();
+        std::fs::write(rig.dir.path().join(".inchworm/rubric.md"), "r").unwrap();
         let extra = format!(
-            "[[flow.judge]]\nkind = \"llm\"\nrubric = \"rubric.md\"\nmodel = \"m\"\nmin_score = 1\n{}",
+            "[[flow.judge]]\nkind = \"llm\"\nrubric = \".inchworm/rubric.md\"\nmodel = \"m\"\nmin_score = 1\n{}",
             DRAFT_OUTCOME
         );
         let summary = tokio::time::timeout(
@@ -1352,7 +1355,7 @@ mod tests {
     ) -> (Concluded, Vec<String>) {
         let run = rig
             .store
-            .enqueue_run("o/r", 5, "issue", 1)
+            .enqueue_run("o/r", &Subject::issue(5).unwrap(), "issue", 1)
             .unwrap()
             .unwrap();
         rig.store.set_run_state(run, RunState::Running, 2).unwrap();
@@ -1517,7 +1520,7 @@ mod tests {
     fn published_run(rig: &Rig, state: RunState) -> crate::store::RunId {
         let run = rig
             .store
-            .enqueue_run("o/r", 5, "issue", 1)
+            .enqueue_run("o/r", &Subject::issue(5).unwrap(), "issue", 1)
             .unwrap()
             .unwrap();
         rig.store.set_run_state(run, RunState::Running, 2).unwrap();
@@ -1648,12 +1651,18 @@ mod tests {
             let rig = rig();
             let run = rig
                 .store
-                .enqueue_run("o/r", 5, "issue", 1)
+                .enqueue_run("o/r", &Subject::issue(5).unwrap(), "issue", 1)
                 .unwrap()
                 .unwrap();
             rig.store.set_run_state(run, RunState::Running, 2).unwrap();
             rig.store.start_attempt(run, 3).unwrap();
-            assert_eq!(rig.store.recover_after_crash(4).unwrap(), 1);
+            assert_eq!(
+                rig.store
+                    .recover_after_crash(&rig.lock, 4)
+                    .unwrap()
+                    .attempts_failed,
+                1
+            );
             rig.github.add_pr("o/r", "inchworm/5-a2", pr_at(78, SHA));
             let (mut client, fake) = connect(two_successes(1));
             client.initialize().unwrap();
@@ -1693,7 +1702,7 @@ mod tests {
         let rig = rig();
         let run = rig
             .store
-            .enqueue_run("o/r", 5, "issue", 1)
+            .enqueue_run("o/r", &Subject::issue(5).unwrap(), "issue", 1)
             .unwrap()
             .unwrap();
         rig.store.set_run_state(run, RunState::Failed, 2).unwrap();
@@ -1707,7 +1716,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, RunError::NotRunnable { .. }), "{err}");
+        assert!(matches!(err, RunError::RunNotRunnable { .. }), "{err}");
     }
 }
 
@@ -1718,6 +1727,7 @@ mod round2_safety {
     use crate::config::MergeMethod;
     use crate::github::{FakeGitHub, GitHubError, Issue};
     use crate::judges::NannaReport;
+    use crate::store::Subject;
     use crate::testing::{FakeScorer, env, flow_with, github_with_issue, pr_at};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1787,6 +1797,13 @@ mod round2_safety {
         fn required_checks(&self, r: &str, b: &str) -> Result<Option<Vec<String>>, GitHubError> {
             self.inner.required_checks(r, b)
         }
+        fn open_prs_for_issue(
+            &self,
+            r: &str,
+            n: u64,
+        ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+            self.inner.open_prs_for_issue(r, n)
+        }
     }
 
     fn proxy(patch: &str) -> Proxy {
@@ -1827,7 +1844,10 @@ mod round2_safety {
         let clock = FakeClock::new(1_000);
         let scorer = FakeScorer::new();
         let dir = tempfile::tempdir().unwrap();
-        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        let run = store
+            .enqueue_run("o/r", &Subject::issue(5).unwrap(), "issue", 1)
+            .unwrap()
+            .unwrap();
         store.set_run_state(run, RunState::Running, 2).unwrap();
         let attempt = store.start_attempt(run, 3).unwrap();
         store.mark_published(attempt.id, 0, Some(true)).unwrap();
@@ -1967,9 +1987,9 @@ mod round2_safety {
 mod round2_correct {
     use super::*;
     use crate::clock::FakeClock;
-    use crate::github::PrState;
     use crate::nanna_client::fake::{Scenario, connect};
     use crate::run::{RunContext, run_issue};
+    use crate::store::Subject;
     use crate::testing::{FakeScorer, env, flow_with, github_with_issue, pr_at};
 
     const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1979,9 +1999,9 @@ mod round2_correct {
     async fn retry_after_an_early_rejection_keeps_the_state_machine_legal() {
         let store = Store::open_in_memory().unwrap();
         let github = github_with_issue();
-        let mut closed = pr_at(77, SHA1);
-        closed.state = PrState::Closed;
-        github.add_pr("o/r", "inchworm/5-a1", closed);
+        let mut wrong_base = pr_at(77, SHA1);
+        wrong_base.base_ref = "develop".into();
+        github.add_pr("o/r", "inchworm/5-a1", wrong_base);
         github.add_pr("o/r", "inchworm/5-a2", pr_at(78, SHA2));
         github.set_pr_patch(
             "o/r",
@@ -2045,7 +2065,10 @@ mod round2_correct {
                 conclusion: CheckConclusion::Success,
             }],
         );
-        let run = store.enqueue_run("o/r", 5, "issue", 1).unwrap().unwrap();
+        let run = store
+            .enqueue_run("o/r", &Subject::issue(5).unwrap(), "issue", 1)
+            .unwrap()
+            .unwrap();
         store.set_run_state(run, RunState::Running, 2).unwrap();
         let a = store.start_attempt(run, 3).unwrap();
         store.record_pr(a.id, "inchworm/5-a1", SHA1, 77).unwrap();

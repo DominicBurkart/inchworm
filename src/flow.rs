@@ -8,6 +8,7 @@ use crate::model::FailureClass;
 use crate::nanna_client::{AssignRequest, ClientError, NannaClient, TaskDone, TaskOutcome};
 
 pub const PROTECTED_DIR: &str = ".inchworm";
+pub const PROTECTED_FILE: &str = "inchworm.toml";
 pub const MAX_FORWARDED_PATCH_BYTES: usize = 100_000;
 
 pub trait Dispatcher {
@@ -16,6 +17,10 @@ pub trait Dispatcher {
         request: &AssignRequest,
         timeout: Duration,
     ) -> Result<TaskOutcome, ClientError>;
+
+    fn is_usable(&self) -> bool {
+        true
+    }
 }
 
 impl Dispatcher for NannaClient {
@@ -25,6 +30,10 @@ impl Dispatcher for NannaClient {
         timeout: Duration,
     ) -> Result<TaskOutcome, ClientError> {
         self.run_task(request, timeout)
+    }
+
+    fn is_usable(&self) -> bool {
+        NannaClient::is_usable(self)
     }
 }
 
@@ -99,16 +108,63 @@ pub fn branch_name(issue: u64, attempt: u32) -> String {
 }
 
 /// ```
-/// use inchworm::flow::touches_protected;
+/// use inchworm::flow::decode_git_quotes;
 ///
-/// assert!(touches_protected(".inchworm/flows.toml"));
-/// assert!(touches_protected("./src/../.inchworm/rubric.md"));
-/// assert!(!touches_protected("src/inchworm.rs"));
+/// assert_eq!(decode_git_quotes(".\\151nchworm/x"), ".inchworm/x");
+/// assert_eq!(decode_git_quotes("caf\\303\\251"), "caf\u{e9}");
+/// assert_eq!(decode_git_quotes("a\\tb\\\\c"), "a\tb\\c");
+/// assert_eq!(decode_git_quotes("odd\\q\\"), "odd\\q\\");
 /// ```
-pub fn touches_protected(path: &str) -> bool {
-    let unquoted = path.trim().trim_matches('"').replace('\\', "/");
+pub fn decode_git_quotes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let next = bytes[i + 1];
+        let named = match next {
+            b'a' => Some(7),
+            b'b' => Some(8),
+            b't' => Some(9),
+            b'n' => Some(10),
+            b'v' => Some(11),
+            b'f' => Some(12),
+            b'r' => Some(13),
+            b'\\' | b'"' => Some(next),
+            _ => None,
+        };
+        if let Some(byte) = named {
+            out.push(byte);
+            i += 2;
+        } else if (b'0'..=b'7').contains(&next) {
+            let mut value: u32 = 0;
+            let mut used = 0;
+            while used < 3 && i + 1 + used < bytes.len() {
+                let digit = bytes[i + 1 + used];
+                if !(b'0'..=b'7').contains(&digit) {
+                    break;
+                }
+                value = value * 8 + u32::from(digit - b'0');
+                used += 1;
+            }
+            out.push((value & 0xff) as u8);
+            i += 1 + used;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn components_are_protected(text: &str) -> bool {
+    let normalised = text.replace('\\', "/");
     let mut stack: Vec<&str> = Vec::new();
-    for part in unquoted.split('/') {
+    for part in normalised.split('/') {
         match part {
             "" | "." => {}
             ".." => {
@@ -120,6 +176,23 @@ pub fn touches_protected(path: &str) -> bool {
     stack
         .iter()
         .any(|part| part.eq_ignore_ascii_case(PROTECTED_DIR))
+        || stack
+            .last()
+            .is_some_and(|part| part.eq_ignore_ascii_case(PROTECTED_FILE))
+}
+
+/// ```
+/// use inchworm::flow::touches_protected;
+///
+/// assert!(touches_protected(".inchworm/flows.toml"));
+/// assert!(touches_protected("./src/../.inchworm/rubric.md"));
+/// assert!(touches_protected("\".\\151nchworm/x\""));
+/// assert!(touches_protected("services/api/inchworm.toml"));
+/// assert!(!touches_protected("src/inchworm.rs"));
+/// ```
+pub fn touches_protected(path: &str) -> bool {
+    let unquoted = path.trim().trim_matches('"');
+    components_are_protected(unquoted) || components_are_protected(&decode_git_quotes(unquoted))
 }
 
 fn header_paths(patch: &str) -> impl Iterator<Item = &str> {
@@ -128,6 +201,8 @@ fn header_paths(patch: &str) -> impl Iterator<Item = &str> {
         .filter(|line| {
             [
                 "diff --git ",
+                "diff --cc ",
+                "diff --combined ",
                 "--- ",
                 "+++ ",
                 "rename ",
@@ -162,23 +237,15 @@ pub fn protected_paths_in(files: &[String], patches: &[Option<&str>]) -> Vec<Str
         .collect();
     for patch in patches.iter().flatten() {
         for path in header_paths(patch) {
-            if touches_protected(path) && !found.iter().any(|f| f == path) {
-                found.push(path.to_string());
+            if touches_protected(path) {
+                let shown = decode_git_quotes(path);
+                if !found.contains(&shown) {
+                    found.push(shown);
+                }
             }
         }
     }
     found
-}
-
-fn truncate_to_boundary(text: &str, max: usize) -> (&str, bool) {
-    if text.len() <= max {
-        return (text, false);
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&text[..end], true)
 }
 
 fn describe_step(
@@ -189,7 +256,7 @@ fn describe_step(
 ) -> String {
     let step = &flow.step[index];
     let mut text = format!(
-        "Issue #{}: {}\n\n{}\n\n---\nInchworm step {} of {}: {}\nAttempt: {}\nBranch for any pull request: {}\nBase branch: {}\nNever modify anything under {}/.",
+        "Issue #{}: {}\n\n{}\n\n---\nInchworm step {} of {}: {}\nAttempt: {}\nBase branch: {}\nNever modify anything under {}/.",
         input.issue_number,
         input.issue_title,
         input.issue_body,
@@ -197,7 +264,6 @@ fn describe_step(
         flow.step.len(),
         step.name,
         input.attempt,
-        input.branch,
         flow.base,
         PROTECTED_DIR,
     );
@@ -216,11 +282,7 @@ fn describe_step(
             ));
         }
         if let Some(patch) = patch {
-            let (kept, cut) = truncate_to_boundary(patch, MAX_FORWARDED_PATCH_BYTES);
-            text.push_str(&format!("\nPatch:\n{kept}"));
-            if cut {
-                text.push_str("\n[patch truncated]");
-            }
+            text.push_str(&format!("\nPatch:\n{patch}"));
         }
     }
     text
@@ -332,7 +394,7 @@ pub fn run_flow(
                 &step.name,
                 FailureClass::ProtectedPathViolation,
                 format!(
-                    "step output touches protected {PROTECTED_DIR}/**: {}",
+                    "step output touches protected {PROTECTED_DIR}/** or {PROTECTED_FILE}: {}",
                     violations.join(", ")
                 ),
             );
@@ -358,6 +420,21 @@ pub fn run_flow(
             .changes_patch
             .clone()
             .or_else(|| done.format_patch.clone());
+        if let Some(patch) = forwarded_patch.as_deref()
+            && !is_final
+            && patch.len() > MAX_FORWARDED_PATCH_BYTES
+        {
+            return failed(
+                records,
+                &step.name,
+                FailureClass::PatchApplyFailed,
+                format!(
+                    "the output of step `{}` is {} bytes, over the {MAX_FORWARDED_PATCH_BYTES}-byte limit for handing changes to the next step; it was not truncated and the flow stopped",
+                    step.name,
+                    patch.len()
+                ),
+            );
+        }
         last = Some(done);
     }
 
@@ -472,7 +549,8 @@ mod tests {
         assert!(first_text.contains("Issue #12: Fix the thing"));
         assert!(first_text.contains("It is broken."));
         assert!(first_text.contains("step 1 of 2: implement"));
-        assert!(first_text.contains("inchworm/12-a2"));
+        assert!(first_text.contains("Attempt: 2"));
+        assert!(!first_text.contains("Branch for any pull request"));
         assert!(!first_text.contains("previous step"));
         let second_text = assigned[1]["description"].as_str().unwrap();
         assert!(second_text.contains("step 2 of 2: publish"));
@@ -644,27 +722,173 @@ mod tests {
     }
 
     #[test]
-    fn oversized_patches_are_truncated_at_a_char_boundary() {
+    fn a_patch_too_large_to_hand_to_the_next_step_stops_the_flow_instead_of_being_cut() {
         let big = "é".repeat(MAX_FORWARDED_PATCH_BYTES);
         let (mut client, fake) = connect(vec![
             Scenario::success_with_patch(&big, &["a.rs"]),
             Scenario::success(),
         ]);
         client.initialize().unwrap();
-        run_flow(&two_steps(), &input(None), &mut client);
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        let FlowOutcome::Failed {
+            step,
+            class,
+            raw_error,
+            steps,
+        } = outcome
+        else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(class, FailureClass::PatchApplyFailed);
+        assert_eq!(step, "implement");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "implement");
+        assert!(raw_error.contains("200000 bytes"), "{raw_error}");
+        assert!(raw_error.contains("100000-byte limit"), "{raw_error}");
+        assert!(raw_error.contains("not truncated"), "{raw_error}");
+        assert_eq!(
+            fake.assigned().len(),
+            1,
+            "the next step must not be dispatched"
+        );
+    }
+
+    #[test]
+    fn a_patch_exactly_at_the_limit_is_handed_over_whole() {
+        let exact = "a".repeat(MAX_FORWARDED_PATCH_BYTES);
+        let (mut client, fake) = connect(vec![
+            Scenario::success_with_patch(&exact, &["a.rs"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
         let text = fake.assigned()[1]["description"]
             .as_str()
             .unwrap()
             .to_string();
-        assert!(text.ends_with("[patch truncated]"));
-        assert!(text.len() < MAX_FORWARDED_PATCH_BYTES + 2_000);
+        assert!(text.contains(&exact));
+        assert!(!text.contains("truncated"));
     }
 
     #[test]
-    fn short_patches_are_not_marked_truncated() {
-        assert_eq!(truncate_to_boundary("abc", 10), ("abc", false));
-        assert_eq!(truncate_to_boundary("abcdef", 3), ("abc", true));
-        assert_eq!(truncate_to_boundary("aé", 2), ("a", true));
+    fn a_large_patch_from_the_final_step_is_not_a_handoff_problem() {
+        let big = "a".repeat(MAX_FORWARDED_PATCH_BYTES * 2);
+        let (mut client, _fake) = connect(vec![
+            Scenario::success_with_patch("small", &["a.rs"]),
+            Scenario::success_with_patch(&big, &["b.rs"]),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn bare_old_and_new_file_lines_are_scanned_and_quoted_headers_report_a_clean_path() {
+        let minus = "--- a/.inchworm/x\n";
+        assert_eq!(protected_paths_in(&[], &[Some(minus)]), [".inchworm/x"]);
+        let plus = "+++ b/.inchworm/y\n";
+        assert_eq!(protected_paths_in(&[], &[Some(plus)]), [".inchworm/y"]);
+        let quoted = "diff --git \"a/.inchworm/x\" \"b/.inchworm/x\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(quoted)]), [".inchworm/x"]);
+        let quoted_minus = "--- \"a/.inchworm/z\"\n";
+        assert_eq!(
+            protected_paths_in(&[], &[Some(quoted_minus)]),
+            [".inchworm/z"]
+        );
+    }
+
+    #[test]
+    fn protected_output_that_only_appears_in_the_format_patch_is_rejected() {
+        let format_patch = "From abc Mon Sep 17 00:00:00 2001\nSubject: x\n\n---\n .inchworm/flows.toml | 1 +\ndiff --git a/.inchworm/flows.toml b/.inchworm/flows.toml\n";
+        let (mut client, fake) = connect(vec![
+            Scenario::success_with_format_patch(format_patch, &["src/a.rs"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(
+                outcome,
+                FlowOutcome::Failed {
+                    class: FailureClass::ProtectedPathViolation,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(fake.assigned().len(), 1);
+    }
+
+    #[test]
+    fn a_format_patch_is_handed_to_the_next_step_when_there_is_no_changes_patch() {
+        let (mut client, fake) = connect(vec![
+            Scenario::success_with_format_patch("FORMAT PATCH BODY", &["a.rs"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let outcome = run_flow(&two_steps(), &input(None), &mut client);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let text = fake.assigned()[1]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("Patch:\nFORMAT PATCH BODY"), "{text}");
+    }
+
+    struct Recording<'a> {
+        client: &'a mut NannaClient,
+        timeouts: Vec<Duration>,
+        pause: Duration,
+    }
+
+    impl Dispatcher for Recording<'_> {
+        fn dispatch(
+            &mut self,
+            request: &AssignRequest,
+            timeout: Duration,
+        ) -> Result<TaskOutcome, ClientError> {
+            self.timeouts.push(timeout);
+            std::thread::sleep(self.pause);
+            self.client.dispatch(request, timeout)
+        }
+    }
+
+    #[test]
+    fn the_attempt_budget_is_shared_across_steps() {
+        let mut f = two_steps();
+        f.attempt_timeout_secs = 10;
+        let (mut client, _fake) = connect(vec![
+            Scenario::success_with_patch("diff --git a/a b/a\n", &["a"]),
+            Scenario::success(),
+        ]);
+        client.initialize().unwrap();
+        let mut recording = Recording {
+            client: &mut client,
+            timeouts: Vec::new(),
+            pause: Duration::from_millis(150),
+        };
+        let outcome = run_flow(&f, &input(None), &mut recording);
+        assert!(
+            matches!(outcome, FlowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(recording.timeouts.len(), 2);
+        assert!(recording.timeouts[0] <= Duration::from_secs(10));
+        assert!(
+            recording.timeouts[1] + Duration::from_millis(140) <= recording.timeouts[0],
+            "{:?}",
+            recording.timeouts
+        );
     }
 
     struct Scripted(VecDeque<Result<TaskOutcome, ClientError>>);
@@ -686,6 +910,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_client_is_usable_until_its_connection_dies() {
+        let mut client = NannaClient::new(std::io::BufReader::new(&b""[..]), std::io::sink());
+        assert!(Dispatcher::is_usable(&client));
+        let request = AssignRequest {
+            description: "d".into(),
+            repo_path: std::path::PathBuf::from("/r"),
+            identity: "i".into(),
+            branch: "main".into(),
+        };
+        let err = client
+            .dispatch(&request, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(matches!(err, ClientError::Eof), "{err:?}");
+        assert!(!Dispatcher::is_usable(&client));
+        let scripted = Scripted(VecDeque::new());
+        assert!(scripted.is_usable());
     }
 
     #[test]
@@ -763,6 +1006,111 @@ mod tests {
     }
 
     #[test]
+    fn git_quoted_octal_paths_are_decoded_before_they_are_matched() {
+        let header = "diff --git \"a/.\\151nchworm/x\" \"b/.\\151nchworm/x\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(header)]), [".inchworm/x"]);
+        let rename = "rename from src/a.rs\nrename to \"\\056inchworm/y\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(rename)]), [".inchworm/y"]);
+        let plus = "+++ \"b/.\\151NCHWORM/z\"\n";
+        assert_eq!(protected_paths_in(&[], &[Some(plus)]), [".iNCHWORM/z"]);
+        assert!(touches_protected("\\056inchworm/flows.toml"));
+        assert!(touches_protected("\"\\056inchworm\\057x\""));
+        assert!(touches_protected("src/\\056\\056/\\056inchworm/x"));
+    }
+
+    #[test]
+    fn every_step_prompt_forbids_touching_the_protected_directory() {
+        let flow = FlowFile::parse(
+            "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        )
+        .unwrap()
+        .flow
+        .remove(0);
+        let input = FlowInput {
+            repo_path: Path::new("/repo"),
+            issue_number: 5,
+            issue_title: "t",
+            issue_body: "b",
+            attempt: 1,
+            branch: "inchworm/5-a1",
+            previous_failure: None,
+        };
+        let text = describe_step(&flow, 0, &input, None);
+        assert!(
+            text.contains("Never modify anything under .inchworm/."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn combined_diff_headers_are_scanned_for_protected_paths() {
+        for header in ["diff --cc", "diff --combined"] {
+            let patch = format!("{header} .inchworm/flows.toml\nindex 1,2..3\n");
+            assert_eq!(
+                protected_paths_in(&[], &[Some(patch.as_str())]),
+                vec![".inchworm/flows.toml".to_string()],
+                "{header}"
+            );
+            let clean = format!("{header} src/lib.rs\n");
+            assert!(protected_paths_in(&[], &[Some(clean.as_str())]).is_empty());
+        }
+    }
+
+    #[test]
+    fn git_named_escapes_decode_to_their_control_characters() {
+        assert_eq!(
+            decode_git_quotes("\\a\\b\\t\\n\\v\\f\\r\\\\\\\""),
+            "\u{7}\u{8}\t\n\u{b}\u{c}\r\\\""
+        );
+        assert_eq!(decode_git_quotes("a\\"), "a\\");
+        assert_eq!(decode_git_quotes("\\9"), "\\9");
+        assert_eq!(decode_git_quotes("\\1"), "\u{1}");
+        assert_eq!(decode_git_quotes("\\1234"), "S4");
+        assert_eq!(decode_git_quotes("\\400"), "\u{0}");
+    }
+
+    #[test]
+    fn a_windows_separator_is_still_a_separator_even_when_it_spells_an_escape() {
+        for bad in [
+            ".inchworm\\temp\\x",
+            ".inchworm\\new",
+            ".inchworm\\0",
+            ".inchworm\\\\x",
+        ] {
+            assert!(touches_protected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_inchworm_toml_at_any_depth_is_protected_but_lookalikes_are_not() {
+        for bad in [
+            "inchworm.toml",
+            "./inchworm.toml",
+            "a/b/inchworm.toml",
+            "A/INCHWORM.TOML",
+            "\"sub/inchworm.toml\"",
+            "sub\\inchworm.toml",
+            "src/\\151nchworm.toml",
+        ] {
+            assert!(touches_protected(bad), "{bad}");
+        }
+        for good in [
+            "inchworm.toml.bak",
+            "inchworm.tomlx",
+            "myinchworm.toml",
+            "inchworm.toml/child.rs",
+            "a/inchworm.tom",
+        ] {
+            assert!(!touches_protected(good), "{good}");
+        }
+        let patch = "diff --git a/svc/inchworm.toml b/svc/inchworm.toml\n";
+        assert_eq!(
+            protected_paths_in(&[], &[Some(patch)]),
+            ["svc/inchworm.toml"]
+        );
+    }
+
+    #[test]
     fn patch_scanning_covers_headers_but_ignores_unrelated_lines() {
         let clean = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+let p = \".inchworm/x\";\n";
         assert!(protected_paths_in(&[], &[Some(clean)]).is_empty());
@@ -797,6 +1145,29 @@ mod tests {
         fn paths_without_one_are_accepted(parts in proptest::collection::vec("[a-z][a-z.]{0,6}", 1..5)) {
             prop_assume!(parts.iter().all(|p| p != ".inchworm"));
             prop_assert!(!touches_protected(&parts.join("/")));
+        }
+
+        #[test]
+        fn decoding_never_panics_and_leaves_text_without_backslashes_alone(text in ".{0,40}") {
+            let decoded = decode_git_quotes(&text);
+            if !text.contains('\\') {
+                prop_assert_eq!(decoded, text);
+            }
+        }
+
+        #[test]
+        fn fully_octal_escaping_the_protected_component_never_hides_it(
+            before in proptest::collection::vec("[a-z]{1,6}", 0..3),
+            after in proptest::collection::vec("[a-z]{1,6}", 0..3),
+        ) {
+            let escaped: String = PROTECTED_DIR.bytes().map(|b| format!("\\{b:03o}")).collect();
+            let mut parts: Vec<String> = before;
+            parts.push(escaped);
+            parts.extend(after);
+            let quoted = format!("\"{}\"", parts.join("/"));
+            prop_assert!(touches_protected(&quoted), "{quoted}");
+            let header = format!("diff --git {quoted} {quoted}\n");
+            prop_assert!(!protected_paths_in(&[], &[Some(header.as_str())]).is_empty());
         }
 
         #[test]

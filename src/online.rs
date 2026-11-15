@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{FlowFile, GlobalConfig, RepoEntry, Trigger};
+use crate::config::{FlowFile, GlobalConfig, PROJECT_FILE, ProjectConfig, RepoEntry, Trigger};
 use crate::exec::{CmdSpec, Runner, SystemRunner};
 use crate::github::GitHub;
 use crate::validate::{Report, Severity, validate};
@@ -23,7 +23,7 @@ pub struct NannaCatalog<R: Runner = SystemRunner> {
 
 impl NannaCatalog<SystemRunner> {
     pub fn new(nanna_bin: &Path) -> Self {
-        NannaCatalog::with_runner(SystemRunner::default(), nanna_bin)
+        NannaCatalog::with_runner(SystemRunner, nanna_bin)
     }
 }
 
@@ -66,6 +66,8 @@ impl<R: Runner> IdentityCatalog for NannaCatalog<R> {
     }
 }
 
+pub const NIX_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub struct NixBuilder<R: Runner = SystemRunner> {
     runner: R,
     program: String,
@@ -73,12 +75,12 @@ pub struct NixBuilder<R: Runner = SystemRunner> {
 
 impl NixBuilder<SystemRunner> {
     pub fn new() -> Self {
-        NixBuilder::with_runner(SystemRunner::default())
+        NixBuilder::with_runner(SystemRunner)
     }
 
     pub fn with_program(program: impl Into<String>) -> Self {
         NixBuilder {
-            runner: SystemRunner::default(),
+            runner: SystemRunner,
             program: program.into(),
         }
     }
@@ -99,10 +101,33 @@ impl<R: Runner> NixBuilder<R> {
     }
 }
 
+/// ```
+/// use std::path::Path;
+/// use inchworm::online::flake_url;
+///
+/// assert_eq!(flake_url(Path::new("/code/my repo")), "git+file:///code/my%20repo#devContainerImage");
+/// ```
+pub fn flake_url(repo: &Path) -> String {
+    let absolute = std::path::absolute(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let mut encoded = String::new();
+    for byte in absolute.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("git+file://{encoded}#devContainerImage")
+}
+
 impl<R: Runner> ImageBuilder for NixBuilder<R> {
     fn build(&self, repo: &Path) -> Result<(), String> {
-        let flake = format!("path:{}#devContainerImage", repo.display());
-        let spec = CmdSpec::new(&self.program, ["build", flake.as_str(), "--no-link"]);
+        let flake = flake_url(repo);
+        let spec = CmdSpec::new(
+            &self.program,
+            ["build", flake.as_str(), "--no-link", "--no-write-lock-file"],
+        )
+        .with_timeout(NIX_BUILD_TIMEOUT);
         let out = self.runner.run(&spec).map_err(|e| e.to_string())?;
         if out.success() {
             Ok(())
@@ -137,10 +162,33 @@ pub struct Online<'a> {
 /// let config = GlobalConfig::parse("nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"/gone\"\n").unwrap();
 /// let github = FakeGitHub::new();
 /// let online = Online { catalog: &Empty, github: &github, branch_protection: true, builder: None };
-/// assert!(!validate_online(&config, &online).is_ok());
+/// assert!(!validate_online(&config, &online, None).is_ok());
 /// ```
-pub fn validate_online(config: &GlobalConfig, online: &Online<'_>) -> Report {
-    let mut report = validate(config);
+pub const AUDITOR_IDENTITY: &str = "auditor";
+
+const NANNA_OLLAMA_ADDRESSES: [&str; 3] = [
+    "http://localhost:11434",
+    "http://127.0.0.1:11434",
+    "http://[::1]:11434",
+];
+
+pub fn validate_online(
+    config: &GlobalConfig,
+    online: &Online<'_>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Report {
+    let mut report = validate(config, path_var);
+    let configured = config.ollama_url.trim().trim_end_matches('/');
+    if !NANNA_OLLAMA_ADDRESSES.contains(&configured) {
+        report.push(
+            None,
+            Severity::Warning,
+            format!(
+                "ollama_url is {} but `nanna mcp-serve` always talks to Ollama at http://localhost:11434; the setting applies only to inchworm's own calls",
+                config.ollama_url
+            ),
+        );
+    }
     for repo in &config.repo {
         check_repo_online(repo, online, &mut report);
     }
@@ -213,15 +261,26 @@ fn check_branch_protection(
 
 fn check_repo_online(repo: &RepoEntry, online: &Online<'_>, report: &mut Report) {
     let slug = Some(repo.slug.as_str());
-    let Ok(text) = std::fs::read_to_string(repo.path.join(".inchworm/flows.toml")) else {
+    let Ok(text) = std::fs::read_to_string(repo.path.join(PROJECT_FILE)) else {
         return;
     };
-    let Ok(file) = FlowFile::parse(&text) else {
+    let Ok(project) = ProjectConfig::parse(&text) else {
         return;
     };
+    let file = project.flow_file();
 
     match online.catalog.identities(&repo.path) {
         Ok(known) => {
+            if !known.contains(AUDITOR_IDENTITY) {
+                report.push(
+                    slug,
+                    Severity::Error,
+                    format!(
+                        "nanna has no `{AUDITOR_IDENTITY}` identity here and `nanna mcp-serve` refuses to start without one; add an auditor card to the global catalog (known: {})",
+                        known.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                );
+            }
             for flow in &file.flow {
                 for step in &flow.step {
                     if !known.contains(&step.identity) {
@@ -292,6 +351,8 @@ mod tests {
     use std::cell::RefCell;
 
     const FLOWS: &str = r#"
+[auditor]
+runs_in = { kind = "nanna", identity = "auditor" }
 [[flow]]
 name = "issue"
 trigger = { kind = "label", label = "inchworm" }
@@ -301,6 +362,8 @@ identity = "rust-implementer"
 [[flow.step]]
 name = "publish"
 identity = "pr-shepherd"
+[[flow.judge]]
+kind = "nanna_clean"
 [flow.outcome]
 mode = "draft_pr"
 "#;
@@ -373,21 +436,35 @@ mode = "draft_pr"
         fn required_checks(&self, _: &str, _: &str) -> Result<Option<Vec<String>>, GitHubError> {
             unreachable!()
         }
+        fn open_prs_for_issue(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Vec<(String, PullRequest)>, GitHubError> {
+            unreachable!()
+        }
     }
 
     fn repo(dir: &Path) -> GlobalConfig {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join(".inchworm")).unwrap();
         std::fs::create_dir_all(dir.join(".nanna")).unwrap();
-        std::fs::write(dir.join(".inchworm/flows.toml"), FLOWS).unwrap();
+        std::fs::write(dir.join("inchworm.toml"), FLOWS).unwrap();
         std::fs::write(
             dir.join(".nanna/protected.toml"),
-            "extra = [\".inchworm/**\"]\n",
+            "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
         )
         .unwrap();
         std::fs::write(dir.join(".nanna/prompt.md"), "p").unwrap();
+        let nanna = dir.join("fake-nanna");
+        std::fs::write(&nanna, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&nanna, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         GlobalConfig::parse(&format!(
-            "nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
+            "nanna_bin = \"{}\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
+            nanna.display(),
             dir.display()
         ))
         .unwrap()
@@ -416,7 +493,12 @@ mode = "draft_pr"
     fn a_fully_resolvable_repo_is_clean() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd", "reviewer"]));
+        let catalog = Catalog(Ok(vec![
+            "auditor",
+            "rust-implementer",
+            "pr-shepherd",
+            "reviewer",
+        ]));
         let github = github_with_labels(ALL_LABELS);
         let online = Online {
             catalog: &catalog,
@@ -424,7 +506,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
@@ -432,7 +514,7 @@ mode = "draft_pr"
     fn unresolvable_identities_are_errors_naming_the_step() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer"]));
         let github = github_with_labels(ALL_LABELS);
         let online = Online {
             catalog: &catalog,
@@ -440,14 +522,17 @@ mode = "draft_pr"
             branch_protection: true,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert_eq!(report.error_count(), 1);
         let message = &messages(&report)[0];
         assert!(
             message.contains("step `publish`") && message.contains("`pr-shepherd`"),
             "{message}"
         );
-        assert!(message.contains("known: rust-implementer"));
+        assert!(
+            message.contains("known: auditor, rust-implementer"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -462,7 +547,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert_eq!(report.error_count(), 1);
         assert!(
             messages(&report)[0].contains("cannot list identities")
@@ -471,12 +556,15 @@ mode = "draft_pr"
     }
 
     fn protection_flow(mode: &str, checks: &str) -> String {
-        FLOWS.replace(
+        let flows = FLOWS.replace(
             "[flow.outcome]\nmode = \"draft_pr\"",
-            &format!(
-                "[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"{mode}\"\nrequired_checks = [{checks}]"
-            ),
-        )
+            &format!("[flow.outcome]\nmode = \"{mode}\"\nrequired_checks = [{checks}]"),
+        );
+        if mode == "merge_when" {
+            format!("[merge]\nallow = true\n{flows}")
+        } else {
+            flows
+        }
     }
 
     fn protection_findings(
@@ -486,7 +574,7 @@ mode = "draft_pr"
     ) -> Vec<(Severity, String)> {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        std::fs::write(dir.path().join(".inchworm/flows.toml"), flows).unwrap();
+        std::fs::write(dir.path().join("inchworm.toml"), flows).unwrap();
         let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
         let online = Online {
             catalog: &catalog,
@@ -494,7 +582,7 @@ mode = "draft_pr"
             branch_protection: enabled,
             builder: None,
         };
-        validate_online(&config, &online)
+        validate_online(&config, &online, None)
             .findings
             .into_iter()
             .filter(|f| f.message.contains("branch"))
@@ -581,10 +669,130 @@ mode = "draft_pr"
     }
 
     #[test]
-    fn missing_labels_are_errors_with_the_fix() {
+    fn a_catalog_without_an_auditor_card_is_an_error_because_nanna_will_not_start() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
         let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(ALL_LABELS);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            branch_protection: false,
+            builder: None,
+        };
+        let report = validate_online(&config, &online, None);
+        let found = messages(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("`auditor`") && found[0].contains("refuses to start"),
+            "{found:?}"
+        );
+        assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn an_ollama_url_that_is_not_nannas_address_is_only_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = repo(dir.path());
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(ALL_LABELS);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            branch_protection: false,
+            builder: None,
+        };
+        for same in [
+            "http://localhost:11434",
+            "http://localhost:11434/",
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434/",
+        ] {
+            config.ollama_url = same.to_string();
+            let report = validate_online(&config, &online, None);
+            assert!(report.findings.is_empty(), "{same}: {:?}", report.findings);
+        }
+        for different in [
+            "http://gpu-box:11434",
+            "http://localhost:8080",
+            "https://localhost:11434",
+        ] {
+            config.ollama_url = different.to_string();
+            let report = validate_online(&config, &online, None);
+            assert!(report.is_ok(), "{different}");
+            assert_eq!(
+                report.warning_count(),
+                1,
+                "{different}: {:?}",
+                report.findings
+            );
+            let message = &report.findings[0].message;
+            assert!(
+                message.contains(different) && message.contains("localhost:11434"),
+                "{message}"
+            );
+            assert_eq!(report.findings[0].repo, None);
+        }
+    }
+
+    #[test]
+    fn every_status_label_is_required_and_named_in_its_own_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(&["inchworm"]);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            branch_protection: false,
+            builder: None,
+        };
+        let found = messages(&validate_online(&config, &online, None));
+        assert_eq!(found.len(), 3, "{found:?}");
+        for label in ["inchworm:running", "inchworm:failed", "inchworm:done"] {
+            assert!(
+                found.iter().any(|m| m.contains(&format!("`{label}`"))),
+                "{label}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_trigger_label_must_exist_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        let flows = std::fs::read_to_string(dir.path().join("inchworm.toml")).unwrap();
+        std::fs::write(
+            dir.path().join("inchworm.toml"),
+            flows.replace("label = \"inchworm\"", "label = \"queue-me\""),
+        )
+        .unwrap();
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
+        let github = github_with_labels(&[
+            "inchworm",
+            "inchworm:running",
+            "inchworm:failed",
+            "inchworm:done",
+        ]);
+        let online = Online {
+            catalog: &catalog,
+            github: &github,
+            branch_protection: false,
+            builder: None,
+        };
+        let found = messages(&validate_online(&config, &online, None));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("`queue-me`") && found[0].contains("gh label create queue-me -R o/r"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn missing_labels_are_errors_with_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let github = github_with_labels(&["inchworm", "inchworm:done"]);
         let online = Online {
             catalog: &catalog,
@@ -592,7 +800,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         let found = messages(&report);
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|m| m.contains("`inchworm:running`")
@@ -604,14 +812,14 @@ mode = "draft_pr"
     fn a_failing_label_listing_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let online = Online {
             catalog: &catalog,
             github: &BrokenGitHub,
             branch_protection: true,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(messages(&report)[0].contains("cannot list labels"));
     }
 
@@ -619,7 +827,7 @@ mode = "draft_pr"
     fn images_are_built_only_when_asked_and_failures_are_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd"]));
+        let catalog = Catalog(Ok(vec!["auditor", "rust-implementer", "pr-shepherd"]));
         let github = github_with_labels(ALL_LABELS);
 
         let ok = Builder {
@@ -632,7 +840,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: Some(&ok),
         };
-        assert!(validate_online(&config, &online).findings.is_empty());
+        assert!(validate_online(&config, &online, None).findings.is_empty());
         assert_eq!(ok.built.borrow().as_slice(), [dir.path().to_path_buf()]);
 
         let bad = Builder {
@@ -645,7 +853,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: Some(&bad),
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(messages(&report)[0].contains("devContainerImage does not build: no such output"));
 
         let off = Online {
@@ -654,7 +862,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: None,
         };
-        validate_online(&config, &off);
+        validate_online(&config, &off, None);
         assert_eq!(bad.built.borrow().len(), 1);
     }
 
@@ -662,7 +870,7 @@ mode = "draft_pr"
     fn repos_with_unusable_flows_are_left_to_the_offline_checks() {
         let dir = tempfile::tempdir().unwrap();
         let config = repo(dir.path());
-        std::fs::write(dir.path().join(".inchworm/flows.toml"), "garbage = [").unwrap();
+        std::fs::write(dir.path().join("inchworm.toml"), "garbage = [").unwrap();
         let catalog = Catalog(Err("never asked"));
         let github = FakeGitHub::new();
         let online = Online {
@@ -671,10 +879,10 @@ mode = "draft_pr"
             branch_protection: true,
             builder: None,
         };
-        let report = validate_online(&config, &online);
+        let report = validate_online(&config, &online, None);
         assert!(messages(&report).iter().all(|m| !m.contains("never asked")));
-        std::fs::remove_file(dir.path().join(".inchworm/flows.toml")).unwrap();
-        assert!(!validate_online(&config, &online).is_ok());
+        std::fs::remove_file(dir.path().join("inchworm.toml")).unwrap();
+        assert!(!validate_online(&config, &online, None).is_ok());
     }
 
     #[test]
@@ -702,6 +910,55 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn the_flake_url_names_tracked_files_only_and_escapes_the_path() {
+        assert_eq!(
+            flake_url(Path::new("/home/me/code/repo")),
+            "git+file:///home/me/code/repo#devContainerImage"
+        );
+        assert_eq!(
+            flake_url(Path::new("/tmp/my repo/a#b/c?d/100%")),
+            "git+file:///tmp/my%20repo/a%23b/c%3Fd/100%25#devContainerImage"
+        );
+        assert_eq!(
+            flake_url(Path::new("/tmp/caf\u{e9}")),
+            "git+file:///tmp/caf%C3%A9#devContainerImage"
+        );
+        assert!(!flake_url(Path::new("/r")).starts_with("path:"));
+    }
+
+    #[test]
+    fn a_relative_repo_path_becomes_absolute_in_the_flake_url() {
+        let url = flake_url(Path::new("relative/repo"));
+        assert!(url.starts_with("git+file:///"), "{url}");
+        assert!(url.ends_with("/relative/repo#devContainerImage"), "{url}");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn an_escaped_path_never_contains_url_metacharacters_and_decodes_back(
+            segments in proptest::collection::vec("[ -.0-~\u{e9}\u{4e2d}]{1,8}", 1..4)
+        ) {
+            let path = format!("/x{}", segments.join("/x"));
+            let url = flake_url(Path::new(&path));
+            let body = url.strip_prefix("git+file://").unwrap().strip_suffix("#devContainerImage").unwrap();
+            proptest::prop_assert!(!body.contains(['#', '?', ' ', '\n']));
+            let mut decoded = Vec::new();
+            let bytes = body.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    decoded.push(u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap(), 16).unwrap());
+                    i += 3;
+                } else {
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            proptest::prop_assert_eq!(String::from_utf8(decoded).unwrap(), path);
+        }
+    }
+
+    #[test]
     fn nix_builder_builds_the_dev_container_image_flake_output() {
         let runner = ScriptedRunner::new(vec![
             ScriptedRunner::ok(""),
@@ -712,7 +969,7 @@ mode = "draft_pr"
         builder.build(Path::new("/repo")).unwrap();
         assert_eq!(
             builder.runner.calls(),
-            ["nix build path:/repo#devContainerImage --no-link"]
+            ["nix build git+file:///repo#devContainerImage --no-link --no-write-lock-file"]
         );
         assert_eq!(
             builder.build(Path::new("/repo")).unwrap_err(),

@@ -3,7 +3,7 @@ D=$(dirname "$0")
 cfg() { if [ -f "$D/$1" ]; then cat "$D/$1"; else printf '%s' "$2"; fi; }
 if [ "$1" = agents ]; then
   printf 'NAME LOOP MODEL MAX_EFFECT\n'
-  for name in $(cfg identities rust-implementer); do printf '%s inner m workspace\n' "$name"; done
+  for name in $(cfg identities "auditor rust-implementer"); do printf '%s inner m workspace\n' "$name"; done
   exit 0
 fi
 [ "$1" = mcp-serve ] || exit 9
@@ -15,7 +15,8 @@ while read -r line; do
   id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
   case "$line" in
     *'"method":"initialize"'*) reply "$id" initialize_result ;;
-    *'"method":"tools/call"'*) reply "$id" create_task_result ;;
+    *'"method":"tools/call"'*) : > "$D/started"; reply "$id" create_task_result ;;
+    *'"method":"tasks/cancel"'*) : > "$D/cancelled"; reply "$id" task_cancelled ;;
     *'"method":"tasks/get"'*) reply "$id" "$STATE" ;;
     *'"method":"tasks/result"'*) reply "$id" "$RESULT" ;;
   esac

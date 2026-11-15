@@ -3,6 +3,10 @@ use std::path::Path;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+fn quoted(path: &Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 fn write(root: &Path, relative: &str, text: &str) {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -13,43 +17,56 @@ fn good_repo(root: &Path) {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         root,
-        ".inchworm/flows.toml",
-        "[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        "inchworm.toml",
+        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
     );
     write(
         root,
         ".nanna/protected.toml",
-        "extra = [\".inchworm/**\"]\n",
+        "extra = [\"inchworm.toml\", \".inchworm/**\"]\n",
     );
     write(root, ".nanna/prompt.md", "prompt");
 }
 
 fn config(dir: &Path, repo: &Path) -> std::path::PathBuf {
+    let bin = dir.join("nanna");
+    std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let path = dir.join("config.toml");
     write(
         dir,
         "config.toml",
         &format!(
-            "nanna_bin = \"nanna\"\n[[repo]]\nslug = \"o/r\"\npath = \"{}\"\n",
-            repo.display()
+            "nanna_bin = {}\n[[repo]]\nslug = \"o/r\"\npath = {}\n",
+            quoted(&bin),
+            quoted(repo)
         ),
     );
     path
 }
 
+fn inchworm() -> Command {
+    let mut command = Command::cargo_bin("inchworm").unwrap();
+    command.env_clear();
+    command
+}
+
 #[test]
-fn validate_exits_zero_for_a_complete_repo() {
+fn validate_exits_zero_for_a_complete_repo_with_no_environment_at_all() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     good_repo(&repo);
     let config = config(dir.path(), &repo);
-    Command::cargo_bin("inchworm")
-        .unwrap()
+    inchworm()
         .args(["validate", "--config"])
         .arg(&config)
         .assert()
         .success()
-        .stdout(predicates_contains("0 error(s), 0 warning(s)"));
+        .stdout(predicate::str::contains("0 error(s), 0 warning(s)"));
 }
 
 #[test]
@@ -59,34 +76,70 @@ fn validate_exits_one_when_a_repo_has_errors() {
     good_repo(&repo);
     std::fs::remove_file(repo.join(".nanna/protected.toml")).unwrap();
     let config = config(dir.path(), &repo);
-    Command::cargo_bin("inchworm")
-        .unwrap()
+    inchworm()
         .args(["validate", "--config"])
         .arg(&config)
         .assert()
         .code(1)
-        .stdout(predicates_contains("error: [o/r]"));
+        .stdout(predicate::str::contains("error: [o/r]"));
 }
 
 #[test]
-fn validate_exits_two_when_the_config_is_unreadable() {
+fn validate_exits_two_with_one_message_when_the_config_is_unreadable() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("inchworm")
-        .unwrap()
+    inchworm()
         .args(["validate", "--config"])
         .arg(dir.path().join("missing.toml"))
         .assert()
         .code(2)
-        .stderr(predicates_contains("cannot read"));
+        .stderr(predicate::str::contains("cannot read"))
+        .stderr(predicate::function(|text: &str| {
+            text.matches("os error").count() == 1
+        }));
 }
 
 #[test]
-fn unknown_subcommands_are_rejected() {
-    Command::cargo_bin("inchworm")
-        .unwrap()
+fn validate_finds_the_default_config_from_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    let config = config(dir.path(), &repo);
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".config/inchworm")).unwrap();
+    std::fs::copy(&config, home.join(".config/inchworm/config.toml")).unwrap();
+    inchworm()
+        .env("HOME", &home)
+        .arg("validate")
+        .assert()
+        .success();
+}
+
+#[test]
+fn unknown_subcommands_exit_two_and_print_usage() {
+    inchworm()
         .arg("bogus")
         .assert()
-        .failure();
+        .code(2)
+        .stderr(predicate::str::contains("Usage"));
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_exits_one_when_the_inchworm_directory_is_a_symlink_to_an_outside_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    good_repo(&repo);
+    write(&repo, ".inchworm/rubric.md", "rubric");
+    let outside = dir.path().join("outside");
+    std::fs::rename(repo.join(".inchworm"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join(".inchworm")).unwrap();
+    let config = config(dir.path(), &repo);
+    inchworm()
+        .args(["validate", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("`.inchworm` is a symlink"));
 }
 
 fn predicates_contains(needle: &'static str) -> impl predicates::Predicate<[u8]> {
@@ -154,7 +207,7 @@ fn fakes() -> Fakes {
     Fakes { dir, repo, config }
 }
 
-fn inchworm(fakes: &Fakes) -> Command {
+fn inchworm_with(fakes: &Fakes) -> Command {
     let mut command = Command::cargo_bin("inchworm").unwrap();
     let path = format!(
         "{}:{}",
@@ -162,13 +215,15 @@ fn inchworm(fakes: &Fakes) -> Command {
         std::env::var("PATH").unwrap()
     );
     command.env("PATH", path);
+    command.env("HOME", fakes.dir.path().join("home"));
+    command.env_remove("XDG_CONFIG_HOME");
     command
 }
 
 #[test]
 fn online_validate_passes_when_identities_and_labels_resolve() {
     let fakes = fakes();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -181,7 +236,7 @@ fn online_validate_reports_unknown_identities_and_missing_labels() {
     let fakes = fakes();
     fakes.set("identities", "reviewer");
     fakes.set("labels", r#"[{"name":"inchworm"}]"#);
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -197,13 +252,18 @@ fn online_validate_reports_unknown_identities_and_missing_labels() {
 const PLAN_LIMIT: &str =
     "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n";
 
+const AUDITOR: &str = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
+
 fn require_build_check(fakes: &Fakes, outcome: &str) {
-    let flows = std::fs::read_to_string(fakes.repo.join(".inchworm/flows.toml")).unwrap();
-    let flows = flows.replace(
+    let flows = std::fs::read_to_string(fakes.repo.join("inchworm.toml")).unwrap();
+    let mut flows = flows.replace(
         "[flow.outcome]\nmode = \"draft_pr\"",
-        &format!("[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\n{outcome}\nrequired_checks = [\"build\"]"),
+        &format!("[flow.outcome]\n{outcome}\nrequired_checks = [\"build\"]"),
     );
-    write(&fakes.repo, ".inchworm/flows.toml", &flows);
+    if outcome.contains("merge_when") {
+        flows = format!("[merge]\nallow = true\n{flows}");
+    }
+    write(&fakes.repo, "inchworm.toml", &flows);
 }
 
 #[test]
@@ -211,7 +271,7 @@ fn online_validate_warns_when_branch_protection_is_plan_limited_for_draft_pr() {
     let fakes = fakes();
     require_build_check(&fakes, "mode = \"draft_pr\"");
     fakes.set("protection_error", PLAN_LIMIT);
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -225,7 +285,7 @@ fn online_validate_keeps_plan_limited_branch_protection_an_error_for_merge_when(
     let fakes = fakes();
     require_build_check(&fakes, "mode = \"merge_when\"");
     fakes.set("protection_error", PLAN_LIMIT);
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -238,7 +298,7 @@ fn online_validate_keeps_other_branch_protection_failures_errors_for_draft_pr() 
     let fakes = fakes();
     require_build_check(&fakes, "mode = \"draft_pr\"");
     fakes.set("protection_error", "gh: Bad credentials (HTTP 401)\n");
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -256,7 +316,7 @@ fn build_images_runs_nix_build_and_reports_failures() {
         "#!/bin/sh\necho \"$@\" > \"$NIX_ARGS\"\nexit 0\n",
     );
     let args_file = fakes.dir.path().join("nix-args");
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .env("NIX_ARGS", &args_file)
         .args(["validate", "--build-images", "--config"])
         .arg(&fakes.config)
@@ -266,7 +326,7 @@ fn build_images_runs_nix_build_and_reports_failures() {
     assert_eq!(
         recorded.trim(),
         format!(
-            "build path:{}#devContainerImage --no-link",
+            "build git+file://{}#devContainerImage --no-link --no-write-lock-file",
             fakes.repo.display()
         )
     );
@@ -276,7 +336,7 @@ fn build_images_runs_nix_build_and_reports_failures() {
         "nix",
         "#!/bin/sh\necho 'attribute missing' >&2\nexit 1\n",
     );
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--build-images", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -289,14 +349,14 @@ fn build_images_runs_nix_build_and_reports_failures() {
 #[test]
 fn run_dispatches_the_flow_and_records_the_pr() {
     let fakes = fakes();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .success()
         .stdout(predicates_contains("pr_open after 1 attempt(s)"))
         .stdout(predicates_contains("pull/9"));
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -307,8 +367,8 @@ fn run_dispatches_the_flow_and_records_the_pr() {
 #[test]
 fn run_rejects_a_pr_that_touches_inchworm_files() {
     let fakes = fakes();
-    fakes.set("files", "src/lib.rs\n.inchworm/flows.toml");
-    inchworm(&fakes)
+    fakes.set("files", "F src/lib.rs\nF .inchworm/flows.toml");
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -321,7 +381,7 @@ fn run_reports_a_failed_task_with_exit_one() {
     let fakes = fakes();
     fakes.set("state", "task_failed");
     fakes.set("result", "result_failed_structured");
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -332,20 +392,20 @@ fn run_reports_a_failed_task_with_exit_one() {
 #[test]
 fn run_accepts_a_repo_path_and_a_flow_name_and_rejects_unknown_ones() {
     let fakes = fakes();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run"])
         .arg(&fakes.repo)
         .args(["5", "--flow", "issue", "--config"])
         .arg(&fakes.config)
         .assert()
         .success();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "x/y", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .code(2)
         .stderr(predicates_contains("not in the config"));
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "6", "--flow", "nope", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -365,14 +425,14 @@ fn run_fails_cleanly_when_nanna_cannot_start_or_flows_are_missing() {
         ),
     )
     .unwrap();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .code(2)
         .stderr(predicates_contains("cannot start"));
-    std::fs::remove_file(fakes.repo.join(".inchworm/flows.toml")).unwrap();
-    inchworm(&fakes)
+    std::fs::remove_file(fakes.repo.join("inchworm.toml")).unwrap();
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -466,8 +526,10 @@ fn end_to_end_dry_run_issue_to_judged_draft_pr_and_stats() {
     let (ollama, _server) = ollama_fixture(9);
     write(
         &fakes.repo,
-        ".inchworm/flows.toml",
-        r#"[[flow]]
+        "inchworm.toml",
+        &format!(
+            "{AUDITOR}{}",
+            r#"[[flow]]
 name = "issue"
 trigger = { kind = "label", label = "inchworm" }
 [[flow.step]]
@@ -487,7 +549,8 @@ min_score = 7
 [flow.outcome]
 mode = "draft_pr"
 required_checks = ["build"]
-"#,
+"#
+        ),
     );
     write(
         &fakes.repo,
@@ -503,13 +566,13 @@ required_checks = ["build"]
     );
     fakes.set("protection", "build\n");
 
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["validate", "--online", "--config"])
         .arg(&fakes.config)
         .assert()
         .success();
 
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -517,20 +580,20 @@ required_checks = ["build"]
         .stdout(predicates_contains("pr_open after 1 attempt(s)"))
         .stdout(predicates_contains("pull/9"));
 
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["stats", "--window", "all", "--config"])
         .arg(&fakes.config)
         .assert()
         .success()
         .stdout(predicates_contains("o/r"))
         .stdout(predicates_contains("100.0%"));
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["status", "--config"])
         .arg(&fakes.config)
         .assert()
         .success()
         .stdout(predicates_contains("pr_open"));
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["failures", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -562,8 +625,10 @@ fn end_to_end_with_a_low_llm_score_rejects_the_attempt_and_records_it() {
     let (ollama, _server) = ollama_fixture(2);
     write(
         &fakes.repo,
-        ".inchworm/flows.toml",
-        r#"[[flow]]
+        "inchworm.toml",
+        &format!(
+            "{AUDITOR}{}",
+            r#"[[flow]]
 name = "issue"
 max_attempts = 1
 trigger = { kind = "label", label = "inchworm" }
@@ -577,18 +642,19 @@ model = "gemma4:e4b"
 min_score = 7
 [flow.outcome]
 mode = "draft_pr"
-"#,
+"#
+        ),
     );
     write(&fakes.repo, ".inchworm/rubric.md", "Be good.");
     let text = std::fs::read_to_string(&fakes.config).unwrap();
     std::fs::write(&fakes.config, format!("ollama_url = \"{ollama}\"\n{text}")).unwrap();
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
         .code(1)
         .stdout(predicates_contains("failure: judge_rejected"));
-    inchworm(&fakes)
+    inchworm_with(&fakes)
         .args(["failures", "--class", "judge_rejected", "--config"])
         .arg(&fakes.config)
         .assert()
@@ -601,9 +667,9 @@ fn run_never_prints_escape_or_bidi_characters_from_failure_text() {
     let fakes = fakes();
     fakes.set(
         "files",
-        "src/lib.rs\n.inchworm/\u{1b}]0;pwned\u{7}\u{1b}[2J\u{202e}.toml",
+        "F src/lib.rs\nF .inchworm/\u{1b}]0;pwned\u{7}\u{1b}[2J\u{202e}.toml",
     );
-    let out = inchworm(&fakes)
+    let out = inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .output()

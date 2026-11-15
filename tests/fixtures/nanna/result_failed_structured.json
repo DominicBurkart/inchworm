@@ -1,8 +1,9 @@
 {
+  "_provenance": "RECONSTRUCTED, not captured: structuredContent shape defined by nanna-coder #1030 (draft).",
   "content": [
     {
       "type": "text",
-      "text": "Maximum iterations (100) exceeded\n\n{\n  \"error_type\": \"MaxIterationsExceeded\",\n  \"iterations_completed\": 100,\n  \"last_tool_call\": null,\n  \"partial_changes\": null,\n  \"tool_call_history\": [],\n  \"last_agent_state\": null,\n  \"conversation_snapshot\": null,\n  \"action_audit\": [],\n  \"denials\": []\n}"
+      "text": "Maximum iterations (100) exceeded\n\n{\n  \"error_type\": \"MaxIterationsExceeded\",\n  \"iterations_completed\": 100,\n  \"last_tool_call\": null,\n  \"partial_changes\": null,\n  \"tool_call_history\": [],\n  \"last_agent_state\": null,\n  \"conversation_snapshot\": null,\n  \"action_audit\": [],\n  \"denials\": [],\n  \"failure_kind\": \"max_iterations\"\n}"
     }
   ],
   "isError": true,

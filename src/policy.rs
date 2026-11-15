@@ -38,25 +38,20 @@ pub struct CheckRun {
     pub conclusion: CheckConclusion,
 }
 
-/// Whether a repository-declared rule currently grants this orchestrator the right to merge there.
+/// The caller-supplied input meaning that a repository-declared rule currently grants this
+/// orchestrator the right to merge there; it is the config type `MergeGrantSetting`, produced
+/// from `inchworm.toml` by `MergeConfig::grant` and nowhere else.
 ///
-/// The caller supplies it; nothing in this crate reads a repository file to decide it. Merging
-/// is unreachable in production until nanna-coder#1043 defines the capability and a later change
-/// wires `Granted` to it, so every production caller passes `Denied` and `merge_when` degrades to
-/// a draft pull request.
+/// Nothing in `decide` reads a repository file. No production caller of `decide` exists in this
+/// change, so merging is unreachable until nanna-coder#1043 defines the capability and a later
+/// change wires `Granted` to it; `Denied` is the default and degrades `merge_when` to a draft.
 ///
 /// ```
 /// use inchworm::policy::MergeGrant;
 ///
 /// assert_eq!(MergeGrant::default(), MergeGrant::Denied);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum MergeGrant {
-    #[default]
-    Denied,
-    Granted,
-}
+pub use crate::config::MergeGrantSetting as MergeGrant;
 
 #[derive(Debug, Clone)]
 pub struct PolicyInput<'a> {

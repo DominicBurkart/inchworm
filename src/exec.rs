@@ -1,10 +1,19 @@
 use std::ffi::{OsStr, OsString};
-use std::io;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
+
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+
+const POLL: Duration = Duration::from_millis(20);
+
+const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdOutput {
@@ -24,6 +33,9 @@ pub struct CmdSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
+    pub timeout: Option<Duration>,
+    pub max_output: Option<usize>,
+    pub own_group: bool,
 }
 
 impl CmdSpec {
@@ -45,7 +57,39 @@ impl CmdSpec {
                 .map(|a| a.as_ref().to_os_string())
                 .collect(),
             cwd: None,
+            timeout: None,
+            max_output: None,
+            own_group: false,
         }
+    }
+
+    /// ```
+    /// use inchworm::exec::CmdSpec;
+    ///
+    /// assert!(!CmdSpec::new("gh", ["api"]).own_group);
+    /// assert!(CmdSpec::new("gh", ["api"]).in_own_process_group().own_group);
+    /// ```
+    pub fn in_own_process_group(mut self) -> CmdSpec {
+        self.own_group = true;
+        self
+    }
+
+    /// ```
+    /// use std::time::Duration;
+    /// use inchworm::exec::CmdSpec;
+    ///
+    /// let spec = CmdSpec::new("nix", ["build"]).with_timeout(Duration::from_secs(3600)).with_max_output(1024);
+    /// assert_eq!(spec.timeout, Some(Duration::from_secs(3600)));
+    /// assert_eq!(spec.max_output, Some(1024));
+    /// ```
+    pub fn with_timeout(mut self, timeout: Duration) -> CmdSpec {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_max_output(mut self, bytes: usize) -> CmdSpec {
+        self.max_output = Some(bytes);
+        self
     }
 
     pub fn in_dir(mut self, dir: impl AsRef<Path>) -> CmdSpec {
@@ -64,25 +108,47 @@ pub trait Runner: Send + Sync {
     fn run(&self, spec: &CmdSpec) -> io::Result<CmdOutput>;
 }
 
-/// ```
-/// use inchworm::exec::{CmdSpec, Runner, SystemRunner};
-///
-/// let out = SystemRunner::default().run(&CmdSpec::new("echo", ["hi"])).unwrap();
-/// assert!(out.success());
-/// assert_eq!(out.stdout.trim(), "hi");
-/// ```
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemRunner {
-    pub timeout: Option<Duration>,
+fn pump(mut source: impl Read + Send + 'static, is_stderr: bool, tx: Sender<(bool, Vec<u8>)>) {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match source.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if tx.send((is_stderr, buffer[..read].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
-impl SystemRunner {
-    pub fn with_timeout(timeout: Duration) -> SystemRunner {
-        SystemRunner {
-            timeout: Some(timeout),
+const BUSY_RETRIES: u32 = 40;
+const BUSY_PAUSE: Duration = Duration::from_millis(25);
+
+/// ```
+/// use std::process::Command;
+/// use inchworm::exec::spawn_retrying;
+///
+/// let mut child = spawn_retrying(&mut Command::new("true")).unwrap();
+/// assert!(child.wait().unwrap().success());
+/// assert!(spawn_retrying(&mut Command::new("/no/such/program")).is_err());
+/// ```
+pub fn spawn_retrying(command: &mut Command) -> io::Result<Child> {
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Err(err) if err.raw_os_error() == Some(ETXTBSY) && attempts < BUSY_RETRIES => {
+                attempts += 1;
+                thread::sleep(BUSY_PAUSE);
+            }
+            other => return other,
         }
     }
 }
+
+const ETXTBSY: i32 = 26;
 
 fn kill_group(pid: u32) {
     if let Ok(pid) = i32::try_from(pid) {
@@ -92,13 +158,28 @@ fn kill_group(pid: u32) {
     }
 }
 
-fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = pipe.read_to_end(&mut buffer);
-        buffer
-    })
+fn kill(child: &mut Child, own_group: bool) {
+    if own_group {
+        kill_group(child.id());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
+
+/// ```
+/// use std::time::Duration;
+/// use inchworm::exec::{CmdSpec, Runner, SystemRunner};
+///
+/// let out = SystemRunner.run(&CmdSpec::new("echo", ["hi"])).unwrap();
+/// assert!(out.success());
+/// assert_eq!(out.stdout.trim(), "hi");
+///
+/// let slow = CmdSpec::new("sleep", ["30"]).with_timeout(Duration::from_millis(100));
+/// let err = SystemRunner.run(&slow).unwrap_err();
+/// assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, spec: &CmdSpec) -> io::Result<CmdOutput> {
@@ -108,50 +189,84 @@ impl Runner for SystemRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if self.timeout.is_some() {
-            command.process_group(0);
-        }
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
-        let Some(limit) = self.timeout else {
-            let output = command.output()?;
-            return Ok(CmdOutput {
-                code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        };
-        let mut child = command.spawn()?;
-        let stdout = child.stdout.take().map(drain);
-        let stderr = child.stderr.take().map(drain);
-        let started = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
+        if spec.own_group {
+            command.process_group(0);
+        }
+        let mut child = spawn_retrying(&mut command)?;
+        let (tx, rx) = mpsc::channel();
+        if let Some(stdout) = child.stdout.take() {
+            pump(stdout, false, tx.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            pump(stderr, true, tx.clone());
+        }
+        drop(tx);
+
+        let timeout = spec.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        let max_output = spec.max_output.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
+        let deadline = Instant::now() + timeout;
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut status = None;
+        let mut drain_until: Option<Instant> = None;
+        loop {
+            match rx.recv_timeout(POLL) {
+                Ok((is_stderr, chunk)) => {
+                    let sink = if is_stderr { &mut stderr } else { &mut stdout };
+                    sink.extend_from_slice(&chunk);
+                    if stdout.len() + stderr.len() > max_output {
+                        kill(&mut child, spec.own_group);
+                        return Err(io::Error::other(format!(
+                            "`{}` printed more than {max_output} bytes",
+                            spec.display()
+                        )));
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    if status.is_some() {
+                        break;
+                    }
+                    if let Some(done) = child.try_wait()? {
+                        status = Some(done);
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        kill(&mut child, spec.own_group);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("`{}` timed out after {timeout:?}", spec.display()),
+                        ));
+                    }
+                    thread::sleep(POLL);
+                    continue;
+                }
             }
-            if started.elapsed() >= limit {
-                kill_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
+            if status.is_some() {
+                if drain_until.is_some_and(|until| Instant::now() >= until) {
+                    break;
+                }
+            } else if let Some(done) = child.try_wait()? {
+                status = Some(done);
+                drain_until = Some(Instant::now() + DRAIN_AFTER_EXIT);
+            } else if Instant::now() >= deadline {
+                kill(&mut child, spec.own_group);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("timed out after {}s", limit.as_secs_f64()),
+                    format!("`{}` timed out after {timeout:?}", spec.display()),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        kill_group(child.id());
-        let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
-            handle
-                .and_then(|handle| handle.join().ok())
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default()
-        };
+        }
+        if spec.own_group {
+            kill_group(child.id());
+        }
         Ok(CmdOutput {
-            code: status.code(),
-            stdout: collect(stdout),
-            stderr: collect(stderr),
+            code: status.and_then(|done| done.code()),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 }
@@ -221,7 +336,7 @@ mod tests {
     #[test]
     fn system_runner_captures_stdout_stderr_and_exit_code() {
         let spec = CmdSpec::new("sh", ["-c", "echo out; echo err >&2; exit 3"]);
-        let out = SystemRunner::default().run(&spec).unwrap();
+        let out = SystemRunner.run(&spec).unwrap();
         assert_eq!(out.code, Some(3));
         assert!(!out.success());
         assert_eq!(out.stdout.trim(), "out");
@@ -232,70 +347,271 @@ mod tests {
     fn system_runner_honours_the_working_directory() {
         let dir = tempfile::tempdir().unwrap();
         let spec = CmdSpec::new("pwd", [] as [&str; 0]).in_dir(dir.path());
-        let out = SystemRunner::default().run(&spec).unwrap();
+        let out = SystemRunner.run(&spec).unwrap();
         let reported = std::fs::canonicalize(out.stdout.trim()).unwrap();
         assert_eq!(reported, std::fs::canonicalize(dir.path()).unwrap());
     }
 
+    #[cfg(unix)]
+    fn pid_alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn a_timeout_kills_a_hung_command_and_reports_timed_out() {
-        let runner = SystemRunner::with_timeout(Duration::from_millis(200));
+    fn a_command_that_outlives_its_deadline_is_killed_and_reported_as_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 60", pidfile.display());
+        let spec =
+            CmdSpec::new("sh", ["-c", script.as_str()]).with_timeout(Duration::from_millis(300));
         let started = Instant::now();
-        let err = runner
-            .run(&CmdSpec::new("sh", ["-c", "sleep 30"]))
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    #[test]
-    fn a_timeout_does_not_wait_for_a_grandchild_holding_the_pipes() {
-        let runner = SystemRunner::with_timeout(Duration::from_millis(200));
-        let started = Instant::now();
-        let err = runner
-            .run(&CmdSpec::new("sh", ["-c", "sleep 5 & wait"]))
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(4));
-    }
-
-    #[test]
-    fn a_command_within_the_timeout_returns_output_and_exit_code() {
-        let runner = SystemRunner::with_timeout(Duration::from_secs(10));
-        let out = runner
-            .run(&CmdSpec::new(
-                "sh",
-                ["-c", "echo out; echo err >&2; exit 3"],
-            ))
-            .unwrap();
-        assert_eq!(out.code, Some(3));
-        assert_eq!(out.stdout.trim(), "out");
-        assert_eq!(out.stderr.trim(), "err");
-    }
-
-    #[test]
-    fn a_missing_program_is_an_error_under_a_timeout_too() {
-        let runner = SystemRunner::with_timeout(Duration::from_secs(1));
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
-            runner
-                .run(&CmdSpec::new("/definitely/not/a/program", [] as [&str; 0]))
-                .is_err()
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
         );
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!pid_alive(&pid), "the timed-out process is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_beyond_the_cap_kills_the_command_and_is_an_error() {
+        let spec = CmdSpec::new("sh", ["-c", "head -c 5000000 /dev/zero; sleep 60"])
+            .with_max_output(10_000)
+            .with_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert!(err.to_string().contains("more than 10000 bytes"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_counts_stdout_and_stderr_together() {
+        let spec = CmdSpec::new(
+            "sh",
+            ["-c", "head -c 600 /dev/zero; head -c 600 /dev/zero >&2"],
+        )
+        .with_max_output(1000);
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert!(err.to_string().contains("more than 1000 bytes"), "{err}");
+        let spec = CmdSpec::new(
+            "sh",
+            ["-c", "head -c 400 /dev/zero; head -c 400 /dev/zero >&2"],
+        )
+        .with_max_output(1000);
+        let out = SystemRunner.run(&spec).unwrap();
+        assert_eq!(out.stdout.len(), 400);
+        assert_eq!(out.stderr.len(), 400);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_holding_the_pipes_open_does_not_hang_the_call() {
+        let spec = CmdSpec::new("sh", ["-c", "sleep 30 & echo done"])
+            .with_timeout(Duration::from_secs(20));
+        let started = Instant::now();
+        let out = SystemRunner.run(&spec).unwrap();
+        assert_eq!(out.stdout.trim(), "done");
+        assert!(out.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_closes_its_pipes_and_keeps_running_still_hits_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; exec >&- 2>&-; exec sleep 60",
+            pidfile.display()
+        );
+        let spec =
+            CmdSpec::new("sh", ["-c", script.as_str()]).with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!pid_alive(&pid), "the timed-out process is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_kills_the_process_and_stdin_is_not_left_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; head -c 5000000 /dev/zero; exec sleep 60",
+            pidfile.display()
+        );
+        let spec = CmdSpec::new("sh", ["-c", script.as_str()])
+            .with_max_output(10_000)
+            .with_timeout(Duration::from_secs(30));
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert!(err.to_string().contains("more than 10000 bytes"), "{err}");
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!pid_alive(&pid), "the capped process is still running");
+
+        let started = Instant::now();
+        let out = SystemRunner
+            .run(&CmdSpec::new("cat", [] as [&str; 0]).with_timeout(Duration::from_secs(30)))
+            .unwrap();
+        assert!(out.success() && out.stdout.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cat waited for stdin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_still_open_for_writing_is_retried_until_it_can_run() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let busy = Command::new(&path).spawn().unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(ETXTBSY), "{busy}");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(writer);
+        });
+        let out = SystemRunner
+            .run(&CmdSpec::new(path.to_str().unwrap(), [] as [&str; 0]))
+            .unwrap();
+        closer.join().unwrap();
+        assert_eq!(out.stdout.trim(), "ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_that_stays_busy_gives_up_after_a_bounded_number_of_retries() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let err = spawn_retrying(&mut Command::new(&path)).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ETXTBSY), "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_exactly_at_the_cap_is_allowed_and_one_byte_more_is_not() {
+        let at = CmdSpec::new("sh", ["-c", "head -c 1000 /dev/zero"]).with_max_output(1000);
+        assert_eq!(SystemRunner.run(&at).unwrap().stdout.len(), 1000);
+        let over = CmdSpec::new("sh", ["-c", "head -c 1001 /dev/zero"]).with_max_output(1000);
+        assert!(SystemRunner.run(&over).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_reports_a_live_process_and_then_a_dead_one() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        assert!(pid_alive(&pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!pid_alive(&pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_written_just_after_exit_is_still_captured() {
+        let spec = CmdSpec::new("sh", ["-c", "(sleep 0.1; echo late) & exit 0"]);
+        let out = SystemRunner.run(&spec).unwrap();
+        assert_eq!(out.stdout.trim(), "late");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_output_under_the_cap_is_captured_whole_from_both_streams() {
+        let spec = CmdSpec::new(
+            "sh",
+            [
+                "-c",
+                "head -c 300000 /dev/zero | tr '\\0' a; head -c 200000 /dev/zero | tr '\\0' b >&2",
+            ],
+        );
+        let out = SystemRunner.run(&spec).unwrap();
+        assert_eq!(out.stdout.len(), 300_000);
+        assert!(out.stdout.bytes().all(|b| b == b'a'));
+        assert_eq!(out.stderr.len(), 200_000);
+        assert!(out.stderr.bytes().all(|b| b == b'b'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_command_has_no_exit_code() {
+        let out = SystemRunner
+            .run(&CmdSpec::new("sh", ["-c", "kill -9 $$"]))
+            .unwrap();
+        assert_eq!(out.code, None);
+        assert!(!out.success());
     }
 
     #[test]
     fn system_runner_reports_a_missing_program() {
         let spec = CmdSpec::new("/definitely/not/a/program", [] as [&str; 0]);
-        assert!(SystemRunner::default().run(&spec).is_err());
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     }
 
     #[test]
-    fn a_background_grandchild_after_a_normal_exit_does_not_defeat_the_timeout() {
-        let runner = SystemRunner::with_timeout(Duration::from_millis(500));
+    fn a_background_grandchild_after_a_normal_exit_is_cleaned_up_in_its_own_group() {
+        let spec = CmdSpec::new("/bin/sh", ["-c", "sleep 4 & echo hi"])
+            .with_timeout(Duration::from_millis(500))
+            .in_own_process_group();
         let started = Instant::now();
-        let out = runner
-            .run(&CmdSpec::new("/bin/sh", ["-c", "sleep 4 & echo hi"]))
-            .unwrap();
+        let out = SystemRunner.run(&spec).unwrap();
         assert_eq!(out.stdout.trim(), "hi");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -305,14 +621,14 @@ mod tests {
     }
 
     #[test]
-    fn a_timeout_kills_the_whole_process_group() {
+    fn a_timeout_kills_the_whole_process_group_when_asked_to() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
-        let runner = SystemRunner::with_timeout(Duration::from_millis(300));
-        let err = runner
-            .run(&CmdSpec::new("/bin/sh", ["-c", script.as_str()]))
-            .unwrap_err();
+        let spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()])
+            .with_timeout(Duration::from_millis(300))
+            .in_own_process_group();
+        let err = SystemRunner.run(&spec).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let pid: u32 = std::fs::read_to_string(&pidfile)
             .unwrap()
@@ -329,5 +645,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!alive(), "the grandchild {pid} survived the timeout");
+    }
+
+    #[test]
+    fn without_the_own_group_option_the_grandchild_is_not_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("sleep 3 & echo $! > {}; echo done", pidfile.display());
+        let spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()]);
+        assert_eq!(SystemRunner.run(&spec).unwrap().stdout.trim(), "done");
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| !stat.contains(") Z"))
+            .unwrap_or(false);
+        assert!(alive, "the grandchild was killed without the option");
+        unsafe {
+            libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL);
+        }
     }
 }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -23,6 +24,9 @@ pub enum Scenario {
     Cancelled { result: Value },
     Refused { error: Value },
     Hang,
+    FinishedBeforeCancel { result: Value },
+    ForgottenBeforeCancel,
+    RejectsCancelStillWorking,
 }
 
 impl Scenario {
@@ -42,6 +46,17 @@ impl Scenario {
         Scenario::Success { result }
     }
 
+    pub fn success_with_format_patch(patch: &str, files: &[&str]) -> Scenario {
+        let mut result = fixture("result_success");
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        let mut body: Value = serde_json::from_str(&text).unwrap();
+        body["changes_patch"] = Value::Null;
+        body["format_patch"] = json!(patch);
+        body["files_modified"] = json!(files);
+        result["content"][0]["text"] = json!(body.to_string());
+        Scenario::Success { result }
+    }
+
     pub fn success_empty() -> Scenario {
         let mut result = fixture("result_success");
         let text = result["content"][0]["text"].as_str().unwrap().to_string();
@@ -52,10 +67,24 @@ impl Scenario {
         Scenario::Success { result }
     }
 
+    pub fn finished_before_cancel() -> Scenario {
+        Scenario::FinishedBeforeCancel {
+            result: fixture("result_success"),
+        }
+    }
+
     pub fn failed(fixture_name: &str) -> Scenario {
         Scenario::Failed {
             result: fixture(fixture_name),
         }
+    }
+
+    pub fn failed_with_message(message: &str) -> Scenario {
+        let mut result = fixture("result_failed_legacy");
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        let diagnostics = text.split_once("\n\n").unwrap().1.to_string();
+        result["content"][0]["text"] = json!(format!("{message}\n\n{diagnostics}"));
+        Scenario::Failed { result }
     }
 
     pub fn refused(fixture_name: &str) -> Scenario {
@@ -105,7 +134,8 @@ pub fn connect(scenarios: Vec<Scenario>) -> (NannaClient, FakeNanna) {
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&requests);
     let handle = std::thread::spawn(move || serve(server_in, server_out, scenarios, log));
-    let client = NannaClient::new(BufReader::new(client_in), client_out);
+    let mut client = NannaClient::new(BufReader::new(client_in), client_out);
+    client.set_poll_cap(Duration::from_millis(5));
     (
         client,
         FakeNanna {
@@ -119,6 +149,7 @@ struct Task {
     scenario: Scenario,
     gets: usize,
     cancelled: bool,
+    cancel_rejected: bool,
 }
 
 fn serve(
@@ -166,6 +197,7 @@ fn serve(
                             scenario,
                             gets: 0,
                             cancelled: false,
+                            cancel_rejected: false,
                         },
                     );
                     reply(&id, Ok(created));
@@ -176,10 +208,25 @@ fn serve(
                     &id,
                     Err(json!({"code": -32602, "message": "Task not found"})),
                 ),
+                Some(task)
+                    if task.cancel_rejected
+                        && matches!(task.scenario, Scenario::ForgottenBeforeCancel) =>
+                {
+                    reply(
+                        &id,
+                        Err(json!({"code": -32602, "message": "Task not found"})),
+                    )
+                }
                 Some(task) => {
                     task.gets += 1;
                     let name = if task.cancelled {
                         "task_cancelled"
+                    } else if matches!(task.scenario, Scenario::FinishedBeforeCancel { .. }) {
+                        if task.cancel_rejected {
+                            "task_completed"
+                        } else {
+                            "task_working"
+                        }
                     } else if task.gets < 2 {
                         "task_working"
                     } else {
@@ -200,6 +247,20 @@ fn serve(
                     &id,
                     Err(json!({"code": -32602, "message": "Task not found"})),
                 ),
+                Some(task)
+                    if matches!(
+                        task.scenario,
+                        Scenario::FinishedBeforeCancel { .. }
+                            | Scenario::ForgottenBeforeCancel
+                            | Scenario::RejectsCancelStillWorking
+                    ) =>
+                {
+                    task.cancel_rejected = true;
+                    reply(
+                        &id,
+                        Err(json!({"code": -32602, "message": "Task already in a terminal state"})),
+                    )
+                }
                 Some(task) => {
                     task.cancelled = true;
                     let mut wire = fixture("task_cancelled");
@@ -216,7 +277,8 @@ fn serve(
                 Some(task) => match &task.scenario {
                     Scenario::Success { result }
                     | Scenario::Failed { result }
-                    | Scenario::Cancelled { result } => reply(&id, Ok(result.clone())),
+                    | Scenario::Cancelled { result }
+                    | Scenario::FinishedBeforeCancel { result } => reply(&id, Ok(result.clone())),
                     _ => reply(&id, Ok(fixture("result_cancelled_legacy"))),
                 },
             },

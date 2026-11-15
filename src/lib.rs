@@ -1,3 +1,8 @@
+#[cfg(not(unix))]
+compile_error!(
+    "inchworm supports Linux and macOS only: it drives nanna (podman and nix) and its tests need a POSIX shell, kill and /proc"
+);
+
 pub mod classify;
 pub mod cli;
 pub mod clock;
@@ -5,6 +10,7 @@ pub mod config;
 pub mod daemon;
 pub mod exec;
 pub mod flow;
+pub mod fsutil;
 pub mod github;
 pub mod judges;
 pub mod model;

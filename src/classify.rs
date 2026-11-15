@@ -71,6 +71,15 @@ const ERROR_TYPE_TABLE: &[(&str, FailureClass)] = &[
 ];
 
 const TEXT_TABLE: &[(&[&str], FailureClass)] = &[
+    (
+        &[
+            "tests failed",
+            "test failed",
+            "verification failed",
+            "check failed",
+        ],
+        FailureClass::TestsFailed,
+    ),
     (&["spawn refused"], FailureClass::SpawnRefused),
     (
         &["protected path", "protected-path"],
@@ -84,9 +93,13 @@ const TEXT_TABLE: &[(&[&str], FailureClass)] = &[
     (&["cancelled", "canceled"], FailureClass::Cancelled),
     (
         &[
-            "container",
-            "image",
-            "vendor",
+            "container image",
+            "container build",
+            "container setup",
+            "container runtime",
+            "image build",
+            "image pull",
+            "cargo vendor",
             "offline dependenc",
             "nix build",
         ],
@@ -105,15 +118,6 @@ const TEXT_TABLE: &[(&[&str], FailureClass)] = &[
     (
         &["patch does not apply", "patch failed", "apply patch"],
         FailureClass::PatchApplyFailed,
-    ),
-    (
-        &[
-            "tests failed",
-            "test failed",
-            "verification failed",
-            "check failed",
-        ],
-        FailureClass::TestsFailed,
     ),
 ];
 
@@ -302,6 +306,157 @@ mod tests {
         assert_eq!(classify(&f), FailureClass::ContainerBuildFailed);
         let f = failure(Some("unclassified"), Some("SomethingNew"), "Ollama said no");
         assert_eq!(classify(&f), FailureClass::ModelError);
+    }
+
+    #[test]
+    fn every_error_type_label_maps_to_its_own_class() {
+        let expected: [(&str, FailureClass); 22] = [
+            ("MaxIterationsExceeded", FailureClass::MaxIterations),
+            ("StateError", FailureClass::AgentFailed),
+            ("TaskCheckFailed", FailureClass::TestsFailed),
+            (
+                "ProtectedPathViolation",
+                FailureClass::ProtectedPathViolation,
+            ),
+            ("ScopeError", FailureClass::AgentFailed),
+            ("IdentityUnavailable", FailureClass::SpawnRefused),
+            ("NoProvider", FailureClass::ModelError),
+            ("ContainerSetupFailed", FailureClass::ContainerBuildFailed),
+            ("SidecarSetupFailed", FailureClass::ContainerBuildFailed),
+            (
+                "WorkspaceCreationFailed",
+                FailureClass::ContainerBuildFailed,
+            ),
+            (
+                "OfflineDependenciesFailed",
+                FailureClass::ContainerBuildFailed,
+            ),
+            ("ImpactError", FailureClass::AgentFailed),
+            ("QueuePersistFailed", FailureClass::AgentFailed),
+            ("RestoreNoIdentity", FailureClass::SpawnRefused),
+            ("RestoreOverridesInvalid", FailureClass::SpawnRefused),
+            ("RestoreRefused", FailureClass::SpawnRefused),
+            ("RestoreAuditFailed", FailureClass::SpawnRefused),
+            ("RestoreAuditDeferred", FailureClass::SpawnRefused),
+            ("VerificationFailed", FailureClass::TestsFailed),
+            ("VerifierChecksInvalid", FailureClass::SpawnRefused),
+            (
+                "VerifierRequiresContainer",
+                FailureClass::ContainerBuildFailed,
+            ),
+            ("VerifierExecFailed", FailureClass::AgentFailed),
+        ];
+        assert_eq!(
+            expected.len(),
+            ERROR_TYPE_TABLE.len(),
+            "a label was added without a test"
+        );
+        for (label, class) in expected {
+            assert_eq!(
+                classify(&failure(None, Some(label), "no keywords here")),
+                class,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_text_needle_maps_to_its_own_class() {
+        let expected: &[(&str, FailureClass)] = &[
+            ("tests failed", FailureClass::TestsFailed),
+            ("test failed", FailureClass::TestsFailed),
+            ("verification failed", FailureClass::TestsFailed),
+            ("check failed", FailureClass::TestsFailed),
+            ("spawn refused", FailureClass::SpawnRefused),
+            ("protected path", FailureClass::ProtectedPathViolation),
+            ("protected-path", FailureClass::ProtectedPathViolation),
+            ("maximum iterations", FailureClass::MaxIterations),
+            ("max iterations", FailureClass::MaxIterations),
+            ("max_iterations", FailureClass::MaxIterations),
+            ("timed out", FailureClass::Timeout),
+            ("timeout", FailureClass::Timeout),
+            ("cancelled", FailureClass::Cancelled),
+            ("canceled", FailureClass::Cancelled),
+            ("container image", FailureClass::ContainerBuildFailed),
+            ("container build", FailureClass::ContainerBuildFailed),
+            ("container setup", FailureClass::ContainerBuildFailed),
+            ("container runtime", FailureClass::ContainerBuildFailed),
+            ("image build", FailureClass::ContainerBuildFailed),
+            ("image pull", FailureClass::ContainerBuildFailed),
+            ("cargo vendor", FailureClass::ContainerBuildFailed),
+            ("offline dependenc", FailureClass::ContainerBuildFailed),
+            ("nix build", FailureClass::ContainerBuildFailed),
+            ("ollama", FailureClass::ModelError),
+            ("model provider", FailureClass::ModelError),
+            ("no provider", FailureClass::ModelError),
+            ("model unavailable", FailureClass::ModelError),
+            ("connection refused", FailureClass::ModelError),
+            ("patch does not apply", FailureClass::PatchApplyFailed),
+            ("patch failed", FailureClass::PatchApplyFailed),
+            ("apply patch", FailureClass::PatchApplyFailed),
+        ];
+        let in_table: usize = TEXT_TABLE.iter().map(|(needles, _)| needles.len()).sum();
+        assert_eq!(
+            expected.len(),
+            in_table,
+            "a needle was added or removed without a test"
+        );
+        for (needle, class) in expected {
+            for text in [
+                format!("x {needle} y"),
+                format!("X {} Y", needle.to_uppercase()),
+            ] {
+                assert_eq!(classify(&failure(None, None, &text)), *class, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_test_whose_name_contains_another_keyword_is_still_a_test_failure() {
+        for text in [
+            "tests failed: test_connection_timeout panicked",
+            "2 tests failed: protected_path_rules, max_iterations_cap",
+            "verification failed: check lint timed out",
+            "check failed: cancelled_tasks_are_reported",
+            "tests failed: the container image builder",
+        ] {
+            assert_eq!(
+                classify(&failure(None, None, text)),
+                FailureClass::TestsFailed,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_text_with_a_bare_container_image_or_vendor_word_is_not_a_build_failure() {
+        for text in [
+            "failed to decode image attachment",
+            "container_id missing from the log line",
+            "the vendored crate foo panicked",
+            "wrote a vendor-neutral summary",
+        ] {
+            assert_eq!(
+                classify(&failure(None, None, text)),
+                FailureClass::AgentFailed,
+                "{text}"
+            );
+        }
+        for text in [
+            "could not build the container image",
+            "cannot start container runtime",
+            "podman: container setup failed",
+            "image pull failed: no route",
+            "cargo vendor failed: no Cargo.lock",
+            "offline dependencies could not be prepared",
+            "nix build exited 1",
+        ] {
+            assert_eq!(
+                classify(&failure(None, None, text)),
+                FailureClass::ContainerBuildFailed,
+                "{text}"
+            );
+        }
     }
 
     #[test]

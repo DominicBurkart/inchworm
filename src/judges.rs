@@ -159,6 +159,14 @@ fn parse_git_header(rest: &str, stats: &mut PatchStats) -> bool {
     }
 }
 
+fn is_git_version(line: &str) -> bool {
+    line.starts_with(|c: char| c.is_ascii_digit())
+        && line.contains('.')
+        && line.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '~' | ' ' | '(' | ')')
+        })
+}
+
 fn range_len(spec: &str) -> Option<usize> {
     match spec.split_once(',') {
         Some((start, count)) => {
@@ -188,6 +196,7 @@ pub fn patch_stats(patch: &str) -> PatchStats {
     let mut stats = PatchStats::default();
     let mut hunk: Option<(usize, usize)> = None;
     let mut awaiting_target = false;
+    let mut awaiting_version = false;
     if !patch.is_empty() && !patch.ends_with('\n') {
         stats.unparsable_header = true;
     }
@@ -197,8 +206,15 @@ pub fn patch_stats(patch: &str) -> PatchStats {
                 stats.unparsable_header = true;
             }
             stats.git_format = true;
+            awaiting_version = false;
             awaiting_target = parse_git_header(rest, &mut stats);
             continue;
+        }
+        if awaiting_version {
+            awaiting_version = false;
+            if !is_git_version(line) {
+                stats.unparsable_header = true;
+            }
         }
         if let Some((old, new)) = hunk.as_mut() {
             match line.as_bytes().first() {
@@ -245,11 +261,13 @@ pub fn patch_stats(patch: &str) -> PatchStats {
                 awaiting_target = false;
             }
             header_path(rest, false, &mut stats);
+        } else if stats.git_format && line == "-- " {
+            awaiting_version = true;
         } else if stats.git_format && (line.starts_with('+') || line.starts_with('-')) {
             stats.unparsable_header = true;
         }
     }
-    if hunk.is_some() || awaiting_target {
+    if hunk.is_some() || awaiting_target || awaiting_version {
         stats.unparsable_header = true;
     }
     stats
@@ -283,6 +301,10 @@ pub fn compile_forbid_paths(patterns: &[String]) -> Result<globset::GlobSet, Str
         .map_err(|err| format!("invalid forbid_paths globs: {err}"))
 }
 
+/// The input must be exactly one patch: the output of `git diff`, or of a single-commit
+/// `git format-patch` (its `-- ` and version trailer is accepted). A multi-commit mbox is
+/// rejected because the second message's `---` separator is not a valid patch line.
+///
 /// ```
 /// use inchworm::judges::diff_judge;
 ///
@@ -598,16 +620,8 @@ pub async fn llm_judge<S: Scorer>(
     min_score: u8,
     patch: &str,
 ) -> Verdict {
-    llm_judge_timed(
-        scorer,
-        permit,
-        rubric,
-        model,
-        min_score,
-        patch,
-        JUDGE_TIMEOUT,
-    )
-    .await
+    let limit = JUDGE_TIMEOUT;
+    llm_judge_timed(scorer, permit, rubric, model, min_score, patch, limit).await
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -655,14 +669,9 @@ pub async fn llm_judge_timed<S: Scorer>(
             if reply.score >= min_score {
                 Verdict::pass(NAME, &reason).with_score(reply.score)
             } else {
-                Verdict::fail(
-                    NAME,
-                    &format!(
-                        "score {} below min_score {min_score}: {reason}",
-                        reply.score
-                    ),
-                )
-                .with_score(reply.score)
+                let score = reply.score;
+                let detail = format!("score {score} below min_score {min_score}: {reason}");
+                Verdict::fail(NAME, &detail).with_score(score)
             }
         }
     }
@@ -920,7 +929,7 @@ mod tests {
         let verdict = judge(&scorer, 7).await;
         assert!(!verdict.passed);
         assert_eq!(verdict.score, Some(3));
-        assert!(verdict.detail.contains("messy"));
+        assert_eq!(verdict.detail, "score 3 below min_score 7: messy");
     }
 
     #[tokio::test]
@@ -1663,6 +1672,119 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    const MBOX_HEAD: &str = "From 294e173f437b7d46775a09af6246e1f8bec7727d Mon Sep 17 00:00:00 2001\nFrom: t <t@e>\nDate: Fri, 13 Nov 2026 08:40:02 +0100\nSubject: [PATCH] second\n\n--- a note in the body\nmore\n---\n g.txt          | 1 +\n f.txt => h.txt | 1 +\n 2 files changed, 2 insertions(+)\n rename f.txt => h.txt (75%)\n\n";
+    const MBOX_BODY: &str = "diff --git a/g.txt b/g.txt\nindex b77b4eb..04ec35a 100644\n--- a/g.txt\n+++ b/g.txt\n@@ -1,2 +1,3 @@\n x\n y\n+z\ndiff --git a/f.txt b/h.txt\nsimilarity index 75%\nrename from f.txt\nrename to h.txt\nindex de98044..d68dd40 100644\n--- a/f.txt\n+++ b/h.txt\n@@ -1,3 +1,4 @@\n a\n b\n c\n+d\n";
+
+    #[test]
+    fn git_format_patch_output_with_its_default_signature_trailer_is_accepted() {
+        for trailer in [
+            "-- \n2.54.0\n\n",
+            "-- \n2.54.0\n",
+            "-- \n2.54.0.windows.1\n\n",
+        ] {
+            let text = format!("{MBOX_HEAD}{MBOX_BODY}{trailer}");
+            let stats = patch_stats(&text);
+            assert!(!stats.unparsable_header, "{trailer:?}");
+            assert_eq!(stats.changed_lines, 2);
+            assert!(stats.paths.contains("h.txt") && stats.paths.contains("g.txt"));
+            assert!(diff_judge(&text, 10, &[]).passed, "{trailer:?}");
+            assert!(!diff_judge(&text, 10, &["h.txt".to_string()]).passed);
+            let crlf = text.replace('\n', "\r\n");
+            assert!(diff_judge(&crlf, 10, &[]).passed, "{trailer:?}");
+        }
+        let nosig = format!("{MBOX_HEAD}{MBOX_BODY}");
+        assert!(diff_judge(&nosig, 10, &[]).passed);
+    }
+
+    #[test]
+    fn a_signature_trailer_never_hides_a_truncated_hunk_or_a_later_file() {
+        let open = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,5 +1,5 @@\n-a\n+b\n";
+        let text = format!("{open}-- \n2.54.0\n");
+        assert!(patch_stats(&text).unparsable_header);
+        assert!(!diff_judge(&text, 100, &[]).passed);
+        let later = format!(
+            "{MBOX_BODY}-- \n2.54.0\ndiff --git a/secrets/k b/secrets/k\n--- a/secrets/k\n+++ b/secrets/k\n@@ -1 +1 @@\n-a\n+b\n"
+        );
+        let verdict = diff_judge(&later, 100, &["secrets/**".to_string()]);
+        assert!(!verdict.passed);
+        assert!(verdict.detail.contains("secrets/k"), "{verdict:?}");
+    }
+
+    #[test]
+    fn only_a_git_version_line_is_accepted_after_the_signature_marker() {
+        for version in [
+            "2.54.0",
+            "2.54.0.windows.1",
+            "2.43.0-rc1",
+            "2.39.5 (Apple Git-154)",
+            "2.30.2+really2.30",
+            "2.11.0~rc1",
+            "2.54.0_beta",
+        ] {
+            let text = format!("{MBOX_BODY}-- \n{version}\n");
+            assert!(diff_judge(&text, 100, &[]).passed, "{version}");
+        }
+        for version in [
+            "",
+            "evil",
+            "2",
+            "see below",
+            "@@ -1 +1 @@",
+            "2.54.0; rm",
+            "GIT binary patch",
+            "v2.54.0",
+            "evil.sh",
+            "-2.54.0",
+            "2.54.0\u{e9}",
+            "2.54.0\u{df}",
+            "2.54.0\u{661}",
+        ] {
+            let text = format!("{MBOX_BODY}-- \n{version}\n");
+            assert!(!diff_judge(&text, 100, &[]).passed, "{version:?}");
+        }
+        let lookalike = format!("{MBOX_BODY}-- x\n2.54.0\n");
+        assert!(patch_stats(&lookalike).unparsable_header);
+        assert!(!diff_judge(&lookalike, 100, &[]).passed);
+    }
+
+    #[test]
+    fn a_multi_commit_format_patch_mbox_is_rejected_as_more_than_one_patch() {
+        let first = format!("{MBOX_HEAD}{MBOX_BODY}-- \n2.54.0\n\n\n");
+        let second = "From 883c40610814ece3863932ccc43c1cd2c1bbe100 Mon Sep 17 00:00:00 2001\nFrom: t <t@e>\nSubject: [PATCH 2/2] c3\n\n---\n new.txt | 1 +\n 1 file changed, 1 insertion(+)\n\ndiff --git a/secrets/k b/secrets/k\nnew file mode 100644\n--- /dev/null\n+++ b/secrets/k\n@@ -0,0 +1 @@\n+n\n-- \n2.54.0\n";
+        let text = format!("{first}{second}");
+        assert!(diff_judge(&first, 100, &[]).passed);
+        let verdict = diff_judge(&text, 100, &["secrets/**".to_string()]);
+        assert!(!verdict.passed);
+        assert!(
+            verdict.detail.starts_with("patch could not be parsed"),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn change_lines_after_a_signature_trailer_still_fail_closed() {
+        for tail in [
+            "-- \n+evil\n",
+            "-- \n2.54.0\n+evil\n",
+            "-- \n-evil\n",
+            "-- \n2.54.0\n-- \n+evil\n",
+        ] {
+            let text = format!("{MBOX_BODY}{tail}");
+            assert!(patch_stats(&text).unparsable_header, "{tail:?}");
+            assert!(!diff_judge(&text, 100, &[]).passed, "{tail:?}");
+        }
+        for tail in ["-- \n", "-- \n\n", "-- \r\n\r\n"] {
+            let text = format!("{MBOX_BODY}{tail}");
+            assert!(patch_stats(&text).unparsable_header, "{tail:?}");
+        }
+        let swallowed =
+            format!("{MBOX_BODY}-- \ndiff --git a/x.png b/x.png\nGIT binary patch\nliteral 1\n");
+        let verdict = diff_judge(&swallowed, 100, &[]);
+        assert!(verdict.detail.contains("binary"), "{verdict:?}");
+        let bare = format!("{MBOX_BODY}-- x\n");
+        assert!(!diff_judge(&bare, 100, &[]).passed);
     }
 
     #[test]

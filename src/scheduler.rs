@@ -35,10 +35,8 @@ impl<T> RepoQueues<T> {
     pub fn enqueue(&mut self, repo: &str, item: T) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.queues
-            .entry(repo.to_string())
-            .or_default()
-            .push_back((seq, item));
+        let queue = self.queues.entry(repo.to_string()).or_default();
+        queue.push_back((seq, item));
     }
 
     pub fn claim(&mut self) -> Option<(String, T)> {
@@ -74,6 +72,7 @@ impl<T> RepoQueues<T> {
 struct Probes {
     after_claim: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     wake_log: Mutex<Vec<BTreeSet<String>>>,
+    gate: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct Shared<T> {
@@ -92,6 +91,10 @@ impl<T> Shared<T> {
             let hook = self.probes.after_claim.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
+            }
+            let gate = self.probes.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate();
             }
         }
         claimed
@@ -462,6 +465,99 @@ mod tests {
         s.enqueue("q", 2);
         let log = s.shared.probes.wake_log.lock().unwrap().clone();
         assert_eq!(log.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn two_waiters_between_a_failed_claim_and_the_wait_are_both_woken_by_two_events() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let s: Scheduler<u8> = Scheduler::new(1);
+        let entered = Arc::new(Barrier::new(3));
+        let released = Arc::new(Barrier::new(3));
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        {
+            let (entered, released, arrivals) =
+                (entered.clone(), released.clone(), arrivals.clone());
+            *s.shared.probes.gate.lock().unwrap() = Some(Arc::new(move || {
+                if arrivals.fetch_add(1, Ordering::SeqCst) < 2 {
+                    entered.wait();
+                    released.wait();
+                }
+            }));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..2 {
+            let (s, tx) = (s.clone(), tx.clone());
+            tokio::spawn(async move {
+                let lease = s.next().await;
+                tx.send(lease).unwrap();
+            });
+        }
+        entered.wait();
+        s.enqueue("a", 1);
+        s.enqueue("b", 2);
+        released.wait();
+        let mut leases = Vec::new();
+        while leases.len() < 2 {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(lease)) => leases.push(lease),
+                _ => break,
+            }
+        }
+        assert_eq!(leases.len(), 2, "a waiter sleeps while repo b is claimable");
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_waiter_sleeps_while_work_is_claimable_for_every_short_event_sequence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const WAITERS: usize = 3;
+        for code in 0..3usize.pow(6) {
+            let s: Scheduler<usize> = Scheduler::new(1);
+            let releases = Arc::new(Semaphore::new(0));
+            let holding = Arc::new(AtomicUsize::new(0));
+            let tasks: Vec<_> = (0..WAITERS)
+                .map(|_| {
+                    let (s, releases, holding) = (s.clone(), releases.clone(), holding.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let lease = s.next().await;
+                            holding.fetch_add(1, Ordering::SeqCst);
+                            releases.acquire().await.unwrap().forget();
+                            holding.fetch_sub(1, Ordering::SeqCst);
+                            drop(lease);
+                        }
+                    })
+                })
+                .collect();
+            settle().await;
+            let mut rest = code;
+            for step in 0..6 {
+                match rest % 3 {
+                    0 => s.enqueue("a", step),
+                    1 => s.enqueue("b", step),
+                    _ => releases.add_permits(1),
+                }
+                rest /= 3;
+                settle().await;
+                let claimable = ["a", "b"]
+                    .into_iter()
+                    .filter(|repo| !s.is_active(repo) && s.queued_len(repo) > 0)
+                    .count();
+                assert!(
+                    claimable == 0 || holding.load(Ordering::SeqCst) == WAITERS,
+                    "sequence {code} step {step}: {claimable} claimable with a sleeping waiter"
+                );
+            }
+            for task in tasks {
+                task.abort();
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

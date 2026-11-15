@@ -41,10 +41,10 @@ pub fn parse_class(text: &str) -> Result<FailureClass, StatsError> {
 /// ```
 /// use inchworm::model::RunState;
 /// use inchworm::stats::render_stats;
-/// use inchworm::store::Store;
+/// use inchworm::store::{Store, Subject};
 ///
 /// let store = Store::open_in_memory().unwrap();
-/// let run = store.enqueue_run("o/r", 1, "issue", 100).unwrap().unwrap();
+/// let run = store.enqueue_run("o/r", &Subject::issue(1).unwrap(), "issue", 100).unwrap().unwrap();
 /// store.set_run_state(run, RunState::Failed, 100).unwrap();
 /// let text = render_stats(&store, 200, Some("all")).unwrap();
 /// assert!(text.contains("o/r") && text.contains("0.0%"));
@@ -91,12 +91,13 @@ pub fn render_stats(store: &Store, now: i64, window: Option<&str>) -> Result<Str
 }
 
 /// ```
-/// use inchworm::model::FailureClass;
+/// use inchworm::model::{FailureClass, RunState};
 /// use inchworm::stats::render_failures;
-/// use inchworm::store::Store;
+/// use inchworm::store::{Store, Subject};
 ///
 /// let store = Store::open_in_memory().unwrap();
-/// let run = store.enqueue_run("o/r", 1, "issue", 0).unwrap().unwrap();
+/// let run = store.enqueue_run("o/r", &Subject::issue(1).unwrap(), "issue", 0).unwrap().unwrap();
+/// store.set_run_state(run, RunState::Running, 1).unwrap();
 /// let attempt = store.start_attempt(run, 1).unwrap();
 /// store.finish_attempt_failed(attempt.id, FailureClass::CiRed, "check build failed", 2).unwrap();
 /// let text = render_failures(&store, None).unwrap();
@@ -149,7 +150,11 @@ pub fn render_status(store: &Store) -> Result<String, StatsError> {
         writeln!(
             out,
             "{:>5} {:<28} {:>6} {:<14} {:<12}",
-            run.id, run.repo, run.issue, run.flow, run.state
+            run.id,
+            run.repo,
+            run.subject.reference(),
+            run.flow,
+            run.state
         )
         .ok();
     }
@@ -160,10 +165,11 @@ pub fn render_status(store: &Store) -> Result<String, StatsError> {
 mod tests {
     use super::*;
     use crate::model::RunState;
+    use crate::store::Subject;
 
     fn finished(store: &Store, repo: &str, issue: u64, end: RunState, at: i64) {
         let id = store
-            .enqueue_run(repo, issue, "issue", at)
+            .enqueue_run(repo, &Subject::issue(issue).unwrap(), "issue", at)
             .unwrap()
             .unwrap();
         store.set_run_state(id, RunState::Running, at).unwrap();
@@ -195,7 +201,11 @@ mod tests {
     #[test]
     fn failures_filter_by_class_and_keep_raw_errors_on_one_line() {
         let store = Store::open_in_memory().unwrap();
-        let run = store.enqueue_run("o/r", 3, "issue", 0).unwrap().unwrap();
+        let run = store
+            .enqueue_run("o/r", &Subject::issue(3).unwrap(), "issue", 0)
+            .unwrap()
+            .unwrap();
+        store.set_run_state(run, RunState::Running, 1).unwrap();
         for (class, raw) in [
             (FailureClass::CiRed, "line one\nline two"),
             (FailureClass::Timeout, "slow"),
@@ -217,7 +227,11 @@ mod tests {
     #[test]
     fn failures_never_print_escape_sequences_and_cap_long_errors() {
         let store = Store::open_in_memory().unwrap();
-        let run = store.enqueue_run("o/r", 3, "issue", 0).unwrap().unwrap();
+        let run = store
+            .enqueue_run("o/r", &Subject::issue(3).unwrap(), "issue", 0)
+            .unwrap()
+            .unwrap();
+        store.set_run_state(run, RunState::Running, 1).unwrap();
         let attempt = store.start_attempt(run, 1).unwrap();
         let raw = format!("\u{1b}[2Jevil\u{7}{}", "x".repeat(2000));
         store
