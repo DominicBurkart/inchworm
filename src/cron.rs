@@ -5,6 +5,8 @@ use thiserror::Error;
 const SECONDS_PER_DAY: i64 = 86_400;
 const SEARCH_DAYS: i64 = 366 * 9;
 const MAX_TIMESTAMP: i64 = 253_402_300_799;
+const LAST_ANCHOR: i64 = 7_258_118_400;
+const ANCHOR_STEP: i64 = 61 * SECONDS_PER_DAY;
 
 const MONTH_NAMES: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -81,9 +83,6 @@ fn parse_value(spec: &Spec, token: &str) -> Result<u32, CronError> {
 }
 
 fn parse_field(spec: &Spec, text: &str) -> Result<(u64, bool), CronError> {
-    if text.is_empty() {
-        return Err(bad(spec.field, "empty field"));
-    }
     let mut bits = 0u64;
     for item in text.split(',') {
         if item.is_empty() {
@@ -218,10 +217,28 @@ impl Cron {
             any_day_of_month,
             any_day_of_week,
         };
-        if cron.next_after(0).is_none() {
-            return Err(CronError::NeverFires);
+        let mut anchor = 0;
+        while anchor <= LAST_ANCHOR {
+            if cron.next_after(anchor).is_none() {
+                return Err(CronError::NeverFires);
+            }
+            anchor += ANCHOR_STEP;
         }
         Ok(cron)
+    }
+
+    fn last_in_day(&self, days: i64, until: i64) -> Option<i64> {
+        (0..=until / 60).rev().find_map(|hour| {
+            if self.hours & (1 << hour) == 0 {
+                return None;
+            }
+            let high = if hour == until / 60 { until % 60 } else { 59 };
+            let candidates = self.minutes & (u64::MAX >> (63 - high));
+            (candidates != 0).then(|| {
+                let minute = 63 - i64::from(candidates.leading_zeros());
+                days * SECONDS_PER_DAY + hour * 3600 + minute * 60
+            })
+        })
     }
 
     fn day_matches(&self, days: i64) -> bool {
@@ -322,31 +339,18 @@ impl Cron {
         }
         let end = timestamp.div_euclid(60) * 60;
         let last_day = end.div_euclid(SECONDS_PER_DAY);
-        for days in (last_day - SEARCH_DAYS + 1..=last_day).rev() {
-            if days < 0 {
-                return None;
-            }
-            if !self.day_matches(days) {
-                continue;
-            }
-            let until = if days == last_day {
-                end.rem_euclid(SECONDS_PER_DAY) / 60
-            } else {
-                1439
-            };
-            for hour in (0..=until / 60).rev() {
-                if self.hours & (1 << hour) == 0 {
-                    continue;
-                }
-                let high = if hour == until / 60 { until % 60 } else { 59 };
-                let candidates = self.minutes & (u64::MAX >> (63 - high));
-                if candidates != 0 {
-                    let minute = 63 - i64::from(candidates.leading_zeros());
-                    return Some(days * SECONDS_PER_DAY + hour * 3600 + minute * 60);
-                }
-            }
-        }
-        None
+        (last_day - SEARCH_DAYS + 1..=last_day)
+            .rev()
+            .take_while(|days| *days >= 0)
+            .filter(|days| self.day_matches(*days))
+            .find_map(|days| {
+                let until = if days == last_day {
+                    end.rem_euclid(SECONDS_PER_DAY) / 60
+                } else {
+                    1439
+                };
+                self.last_in_day(days, until)
+            })
     }
 }
 
@@ -512,6 +516,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cron_that_is_sparse_only_in_later_years_is_rejected_at_load() {
+        for text in [
+            "0 0 29 2 */2",
+            "0 0 29 2 */3",
+            "0 0 29 2 */4",
+            "0 0 29 2 */7",
+        ] {
+            assert_eq!(Cron::parse(text), Err(CronError::NeverFires), "{text}");
+        }
+        for text in ["0 0 29 2 *", "0 0 29 2 */1", "0 0 29 2 1-5"] {
+            let parsed = cron(text);
+            for year in [1976, 2000, 2024, 2096, 2100, 2150] {
+                assert!(
+                    parsed.next_after(at(year, 3, 1, 0, 0)).is_some(),
+                    "{text} {year}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn expressions_that_never_fire_are_rejected() {
         for text in [
             "0 0 30 2 *",
@@ -617,6 +642,25 @@ mod tests {
         assert!(!any.matches(-60));
         assert!(!any.matches(i64::MAX));
         assert!(any.next_after(MAX_TIMESTAMP - 3600).is_some());
+    }
+
+    #[test]
+    fn latest_at_or_before_gives_up_after_nine_years_and_before_the_epoch() {
+        let leap = cron("0 0 29 2 *");
+        assert_eq!(
+            leap.latest_at_or_before(at(2100, 3, 1, 0, 0)),
+            Some(at(2096, 2, 29, 0, 0))
+        );
+        assert_eq!(
+            leap.latest_at_or_before(at(1975, 1, 1, 0, 0)),
+            Some(at(1972, 2, 29, 0, 0))
+        );
+        assert_eq!(leap.latest_at_or_before(at(1971, 1, 1, 0, 0)), None);
+        let december = cron("0 0 1 12 *");
+        assert_eq!(
+            december.latest_at_or_before(at(2026, 11, 1, 0, 0)),
+            Some(at(2025, 12, 1, 0, 0))
+        );
     }
 
     #[test]
