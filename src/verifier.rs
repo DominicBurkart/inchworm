@@ -9,7 +9,7 @@ pub const VERIFIER_IDENTITY: &str = "verifier";
 pub const MAX_CHECKS: usize = 32;
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_VERIFIERS_PER_FLOW: usize = 1;
-pub const MAX_RESULT_BYTES: usize = 512 * 1024;
+pub const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DETAIL_CHARS: usize = 500;
 
 /// ```
@@ -226,9 +226,6 @@ pub fn evidence_from_failure(failure: &NannaFailure) -> Evidence {
         .iter()
         .filter(|record| record.tool_name == CHECK_TOOL_NAME)
     {
-        if record.result.len() > MAX_RESULT_BYTES {
-            return unavailable("a verifier check record is larger than the size cap");
-        }
         match serde_json::from_str::<WireCheck>(&record.result) {
             Ok(check) => wire.push(check),
             Err(_) => return unavailable("a verifier check record does not match the schema"),
@@ -645,13 +642,52 @@ mod tests {
         let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_RESULT_BYTES));
         let verdict = judged(&["fmt"], failed_with("VerificationFailed", Some(big)));
         assert!(verdict.model_error);
-        let record = json!({"name": "fmt", "pad": "x".repeat(MAX_RESULT_BYTES)});
-        let one = json!({"tool_call_history": [{"tool_name": "run_check", "result": record.to_string()}]});
+    }
+
+    #[test]
+    fn the_worst_case_real_failure_fits_under_the_size_cap() {
+        let escapes = "\u{1b}".repeat(8 * 1024);
+        let records: Vec<Value> = (0..MAX_CHECKS)
+            .map(|n| {
+                let mut check = wire(&format!("c{n}"), "passed", Some(0));
+                check["output"] = json!(escapes);
+                check
+            })
+            .collect();
+        let diagnostics = history(records);
+        assert!(diagnostics.len() > 1024 * 1024, "{}", diagnostics.len());
+        assert!(diagnostics.len() < MAX_RESULT_BYTES);
         let verdict = judged(
-            &["fmt"],
-            failed_with("VerificationFailed", Some(one.to_string())),
+            &["c0", "c31"],
+            failed_with("VerificationFailed", Some(diagnostics)),
         );
-        assert!(verdict.model_error);
+        assert!(verdict.passed && !verdict.model_error, "{verdict:?}");
+    }
+
+    #[test]
+    fn status_labels_match_the_wire_names() {
+        for (status, label) in [
+            (CheckStatus::Passed, "passed"),
+            (CheckStatus::Failed, "failed"),
+            (CheckStatus::TimedOut, "timed_out"),
+            (CheckStatus::Skipped, "skipped"),
+        ] {
+            assert_eq!(status.label(), label);
+        }
+    }
+
+    #[test]
+    fn a_check_reported_twice_in_hand_built_evidence_fails() {
+        let check = |status| ReportedCheck {
+            name: "fmt".into(),
+            status,
+            exit_code: Some(0),
+        };
+        let evidence =
+            Evidence::Checks(vec![check(CheckStatus::Failed), check(CheckStatus::Passed)]);
+        let verdict = verifier_judge(&names(&["fmt"]), Some(&evidence));
+        assert!(!verdict.passed && !verdict.model_error);
+        assert_eq!(verdict.detail, "fmt reported more than once");
     }
 
     #[test]
