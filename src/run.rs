@@ -1711,6 +1711,33 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn public_text_strips_every_bidirectional_control_and_keeps_their_neighbours() {
+        let controls: Vec<char> = ['\u{061c}', '\u{200e}', '\u{200f}']
+            .into_iter()
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}')
+            .collect();
+        for c in controls {
+            assert_eq!(
+                public_text(&format!("a{c}b")),
+                "ab",
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        for c in [
+            '\u{061b}', '\u{200d}', '\u{2029}', '\u{202f}', '\u{2065}', '\u{206a}',
+        ] {
+            assert_eq!(
+                public_text(&format!("a{c}b")),
+                format!("a{c}b"),
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+    }
+
+    #[test]
     fn a_run_with_no_pull_request_is_not_replayed() {
         let store = Store::open_in_memory().unwrap();
         let github = github4();

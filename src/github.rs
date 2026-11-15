@@ -499,7 +499,10 @@ struct FakeState {
     check_error: Option<String>,
     protection_error: Option<String>,
     label_error: Option<String>,
+    edit_at_next_check_poll: Option<(String, u64, PrEdit)>,
 }
+
+type PrEdit = Box<dyn FnOnce(&mut PullRequest) + Send>;
 
 #[derive(Default)]
 pub struct FakeGitHub {
@@ -572,6 +575,16 @@ impl FakeGitHub {
             .entry((repo.to_string(), sha.to_string()))
             .or_default()
             .push(runs);
+    }
+
+    pub fn edit_pr_at_next_check_poll(
+        &self,
+        repo: &str,
+        number: u64,
+        edit: impl FnOnce(&mut PullRequest) + Send + 'static,
+    ) {
+        self.state.lock().unwrap().edit_at_next_check_poll =
+            Some((repo.to_string(), number, Box::new(edit)));
     }
 
     pub fn set_head_sha(&self, repo: &str, number: u64, sha: &str) {
@@ -787,6 +800,14 @@ impl GitHub for FakeGitHub {
 
     fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
         let mut state = self.state.lock().unwrap();
+        if let Some((edit_repo, number, edit)) = state.edit_at_next_check_poll.take() {
+            for ((r, _), pr) in state.prs.iter_mut() {
+                if *r == edit_repo && pr.number == number {
+                    edit(pr);
+                    break;
+                }
+            }
+        }
         if let Some(message) = state.check_error.clone() {
             return Err(GitHubError::Command {
                 command: format!("gh api check-runs {sha}"),

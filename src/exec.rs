@@ -621,6 +621,46 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_grandchild_is_killed_after_a_normal_exit_only_when_asked_to() {
+        for (own_group, expect_alive) in [(true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!(
+                "sleep 30 >/dev/null 2>&1 & echo $! > {}; echo hi",
+                pidfile.display()
+            );
+            let mut spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()])
+                .with_timeout(Duration::from_secs(20));
+            if own_group {
+                spec = spec.in_own_process_group();
+            }
+            let out = SystemRunner.run(&spec).unwrap();
+            assert_eq!(out.stdout.trim(), "hi");
+            let pid: u32 = std::fs::read_to_string(&pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let alive = || {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|stat| !stat.contains(") Z"))
+                    .unwrap_or(false)
+            };
+            let patience = if expect_alive { 300 } else { 5000 };
+            let deadline = Instant::now() + Duration::from_millis(patience);
+            while alive() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(alive(), expect_alive, "own_group={own_group}, pid {pid}");
+            if alive() {
+                unsafe {
+                    libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_timeout_kills_the_whole_process_group_when_asked_to() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");

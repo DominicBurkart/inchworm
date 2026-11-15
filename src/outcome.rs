@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use crate::clock::Clock;
 use crate::config::OutcomeMode;
 use crate::config::{Flow, Judge};
-use crate::flow::{PROTECTED_DIR, protected_paths_in};
+use crate::flow::{PROTECTED_DIR, PROTECTED_FILE, protected_paths_in};
 use crate::github::{GitHub, PrState, PullRequest};
 use crate::judges::{DynScorer, NannaReport, Verdict, diff_judge, llm_judge, nanna_clean_judge};
 use crate::model::{FailureClass, RunState};
@@ -410,9 +410,10 @@ pub async fn conclude(
             published,
             FailureClass::ProtectedPathViolation,
             format!(
-                "pull request #{} touches protected {}/**: {}",
+                "pull request #{} touches protected {}/** or {}: {}",
                 published.pr.number,
                 PROTECTED_DIR,
+                PROTECTED_FILE,
                 violations.join(", ")
             ),
         );
@@ -1148,6 +1149,53 @@ mod tests {
             assert!(rig.github.merge_calls().is_empty());
             assert!(rig.github.ready_calls().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn a_pr_that_changes_during_the_ci_wait_is_never_accepted() {
+        type Change = fn(&mut PullRequest);
+        let changes: [(&str, Change, &str); 4] = [
+            ("closed", |pr| pr.state = PrState::Closed, "closed"),
+            ("head moved", |pr| pr.head_sha = SHA2.into(), "head moved"),
+            ("retargeted", |pr| pr.base_ref = "release".into(), "release"),
+            (
+                "turned into a fork",
+                |pr| pr.is_cross_repository = true,
+                "fork",
+            ),
+        ];
+        let polling_draft = outcome_toml("draft_pr", &["build"]);
+        for (name, change, expected) in changes {
+            for flow in [merge_flow(), flow_with(1, "", &polling_draft)] {
+                let rig = live_pr(|_| {});
+                rig.github.edit_pr_at_next_check_poll("o/r", 77, change);
+                let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
+                assert!(
+                    matches!(
+                        &concluded,
+                        Concluded::Rejected { class: FailureClass::MergeBlocked, raw } if raw.contains(expected)
+                    ),
+                    "{name}: {concluded:?}"
+                );
+                assert!(rig.github.merge_calls().is_empty(), "{name}");
+                assert!(rig.github.ready_calls().is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pr_merged_during_the_ci_wait_ends_the_run_merged_without_merging_again() {
+        let rig = live_pr(|_| {});
+        rig.github
+            .edit_pr_at_next_check_poll("o/r", 77, |pr| pr.state = PrState::Merged);
+        let (concluded, _) = conclude_for(&rig, &merge_flow(), &pr_at(77, SHA), SHA, 5).await;
+        assert_eq!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::Merged
+            }
+        );
+        assert!(rig.github.merge_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1918,6 +1966,19 @@ mod round2_safety {
             matches!(concluded, Concluded::Rejected { .. }),
             "net PR diff touching .inchworm/flows.toml was accepted: {concluded:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_judged_net_diff_refuses_the_project_config_and_says_so() {
+        let patch = "diff --git a/inchworm.toml b/inchworm.toml\n--- a/inchworm.toml\n+++ b/inchworm.toml\n@@ -0,0 +1,2 @@\n+a\n+b\n";
+        let gh = proxy(patch);
+        let (concluded, _) = conclude_on(&gh, &flow("draft_pr")).await;
+        let Concluded::Rejected { class, raw } = concluded else {
+            panic!("a patch that edits inchworm.toml was accepted: {concluded:?}");
+        };
+        assert_eq!(class, FailureClass::ProtectedPathViolation);
+        assert!(raw.contains("inchworm.toml"), "{raw}");
+        assert!(raw.contains(".inchworm/**"), "{raw}");
     }
 
     #[tokio::test]
