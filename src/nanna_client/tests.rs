@@ -17,6 +17,8 @@ fn request(description: &str) -> AssignRequest {
 
 const WAIT: Duration = Duration::from_secs(10);
 
+const DIAGNOSTICS: &str = "{\n  \"error_type\": \"MaxIterationsExceeded\",\n  \"iterations_completed\": 100,\n  \"last_tool_call\": null,\n  \"partial_changes\": null,\n  \"tool_call_history\": [],\n  \"last_agent_state\": null,\n  \"conversation_snapshot\": null,\n  \"action_audit\": [],\n  \"denials\": []\n}";
+
 #[test]
 fn initialize_handshake_returns_server_info_and_sends_initialized() {
     let (mut client, mut fake) = connect(vec![]);
@@ -89,6 +91,7 @@ fn failed_task_with_legacy_text_recovers_the_error_type() {
             failure_kind: None,
             error_type: Some("MaxIterationsExceeded".into()),
             message: "Maximum iterations (100) exceeded".into(),
+            diagnostics_text: Some(DIAGNOSTICS.into()),
         })
     );
 }
@@ -104,6 +107,7 @@ fn failed_task_with_structured_content_carries_failure_kind() {
             failure_kind: Some("max_iterations".into()),
             error_type: Some("MaxIterationsExceeded".into()),
             message: "Maximum iterations (100) exceeded".into(),
+            diagnostics_text: Some(DIAGNOSTICS.into()),
         })
     );
 }
@@ -248,7 +252,8 @@ fn failed_state_without_is_error_still_fails() {
         TaskOutcome::Failed(NannaFailure {
             failure_kind: None,
             error_type: None,
-            message: "boom".into()
+            message: "boom".into(),
+            diagnostics_text: None,
         })
     );
 }
@@ -256,13 +261,16 @@ fn failed_state_without_is_error_still_fails() {
 #[test]
 fn task_done_detects_changes_from_any_output() {
     let done = |patch: Option<&str>, format: Option<&str>, files: &[&str]| {
-        TaskDone::from_wire(json!({
-            "result_summary": "s",
-            "changes_patch": patch,
-            "format_patch": format,
-            "files_modified": files,
-            "denials": [{"x": 1}],
-        }))
+        TaskDone::from_wire(
+            json!({
+                "result_summary": "s",
+                "changes_patch": patch,
+                "format_patch": format,
+                "files_modified": files,
+                "denials": [{"x": 1}],
+            }),
+            String::new(),
+        )
     };
     assert!(!done(None, None, &[]).has_changes());
     assert!(!done(Some("  \n"), Some(""), &[]).has_changes());
@@ -434,4 +442,28 @@ fn a_non_timeout_error_while_polling_does_not_send_a_cancel() {
     assert!(matches!(err, ClientError::Rpc { .. }), "{err:?}");
     let sent = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
     assert!(!sent.contains("tasks/cancel"), "{sent}");
+}
+
+#[test]
+fn a_completed_result_keeps_its_exact_text() {
+    let (mut client, _fake) = connect(vec![Scenario::success()]);
+    client.initialize().unwrap();
+    let TaskOutcome::Completed(done) = client.run_task(&request("x"), WAIT).unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(
+        done.result_text,
+        fixture("result_success")["content"][0]["text"]
+            .as_str()
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_failure_whose_tail_is_not_json_has_no_diagnostics_text() {
+    let wire = json!({"isError": true, "content": [{"type": "text", "text": "boom\n\nnot json"}]});
+    let TaskOutcome::Failed(failure) = parse_result(TaskState::Failed, &wire).unwrap() else {
+        panic!("expected failure");
+    };
+    assert_eq!(failure.diagnostics_text, None);
 }

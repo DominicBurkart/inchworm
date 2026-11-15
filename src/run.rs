@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::clock::Clock;
-use crate::config::{Flow, Trigger};
+use crate::config::{Flow, Judge, Trigger};
 use crate::flow::{
     Dispatcher, FlowInput, FlowOutcome, PROTECTED_DIR, branch_name, nanna_report,
     protected_paths_in, run_flow,
@@ -12,8 +13,10 @@ use crate::flow::{
 use crate::github::PrState;
 use crate::github::{GitHub, GitHubError, PullRequest};
 use crate::model::{FailureClass, RunState};
+use crate::nanna_client::AssignRequest;
 use crate::outcome::{ConcludeContext, Concluded, DONE_LABEL, OutcomeEnv, Published, conclude};
 use crate::store::{AttemptState, RunId, Store, StoreError};
+use crate::verifier::{Evidence, VERIFIER_IDENTITY, evidence_from_dispatch};
 
 pub const RUNNING_LABEL: &str = "inchworm:running";
 pub const FAILED_LABEL: &str = "inchworm:failed";
@@ -223,15 +226,49 @@ fn settle_resumed(
     Ok(Some((target, pr)))
 }
 
+pub fn collect_verifier_evidence(
+    flow: &Flow,
+    repo_path: &Path,
+    branch: Option<&str>,
+    dispatcher: &mut dyn Dispatcher,
+) -> Option<Evidence> {
+    if !flow
+        .judge
+        .iter()
+        .any(|judge| matches!(judge, Judge::Verifier { .. }))
+    {
+        return None;
+    }
+    let Some(branch) = branch else {
+        return Some(Evidence::Unavailable(
+            "the attempt has no recorded branch to verify".to_string(),
+        ));
+    };
+    let request = AssignRequest {
+        description: format!(
+            "Run the checks declared in .nanna/verify.toml against branch {branch} and report each result."
+        ),
+        repo_path: repo_path.to_path_buf(),
+        identity: VERIFIER_IDENTITY.to_string(),
+        branch: branch.to_string(),
+    };
+    let timeout = Duration::from_secs(flow.attempt_timeout_secs);
+    Some(evidence_from_dispatch(
+        dispatcher.dispatch(&request, timeout),
+    ))
+}
+
 async fn settle_published(
     ctx: &RunContext<'_>,
     env: &OutcomeEnv<'_>,
     flow: &Flow,
     issue: u64,
-    attempt: &crate::store::Attempt,
-    pr: &PullRequest,
+    (attempt, pr): (&crate::store::Attempt, &PullRequest),
+    dispatcher: &mut dyn Dispatcher,
     warnings: &mut Vec<String>,
 ) -> Result<Concluded, RunError> {
+    let verifier =
+        collect_verifier_evidence(flow, ctx.repo_path, attempt.branch.as_deref(), dispatcher);
     let sha = attempt
         .head_sha
         .clone()
@@ -254,6 +291,7 @@ async fn settle_published(
             denial_count: attempt.nanna_denials.unwrap_or(0),
             qa_ok: attempt.nanna_qa_ok,
         },
+        verifier,
     };
     Ok(conclude(&conclude_ctx, env, flow, &published, warnings).await?)
 }
@@ -521,8 +559,16 @@ pub async fn execute_run(
             }
         };
 
-        let concluded =
-            settle_published(ctx, env, flow, issue_number, &attempt, &pr, &mut warnings).await?;
+        let concluded = settle_published(
+            ctx,
+            env,
+            flow,
+            issue_number,
+            (&attempt, &pr),
+            dispatcher,
+            &mut warnings,
+        )
+        .await?;
         match concluded {
             Concluded::Accepted { state } => {
                 return Ok(RunSummary {
@@ -590,6 +636,234 @@ mod tests {
             clock,
         };
         run_issue(&context, &env(&scorer), flow, 5, client).await
+    }
+
+    const VERIFIER_JUDGE: &str =
+        "[[flow.judge]]\nkind = \"verifier\"\nchecks = [\"fmt\", \"tests\"]\n";
+
+    fn verifier_flow(max_attempts: u32, retry_on: &str) -> Flow {
+        flow_with(
+            max_attempts,
+            retry_on,
+            &format!("{VERIFIER_JUDGE}{DRAFT_OUTCOME}"),
+        )
+    }
+
+    fn two_steps() -> Vec<Scenario> {
+        vec![Scenario::success(), Scenario::success()]
+    }
+
+    async fn verify_with(
+        verifier: Scenario,
+        flow: &Flow,
+    ) -> (RunSummary, Vec<serde_json::Value>, FakeGitHub) {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let mut scenarios = two_steps();
+        scenarios.push(verifier);
+        let (mut client, fake) = connect(scenarios);
+        client.initialize().unwrap();
+        let summary = go(&store, &github, &clock, flow, &mut client)
+            .await
+            .unwrap();
+        (summary, fake.assigned(), github)
+    }
+
+    #[tokio::test]
+    async fn the_verifier_runs_on_the_attempt_branch_after_the_steps_and_a_pass_opens_the_pr() {
+        let (summary, assigned, _) = verify_with(
+            Scenario::verifier_completed(&[("fmt", "passed"), ("tests", "passed")]),
+            &verifier_flow(1, ""),
+        )
+        .await;
+        assert_eq!(summary.state, RunState::PrOpen);
+        assert_eq!(assigned.len(), 3);
+        assert_eq!(assigned[2]["identity"], "verifier");
+        assert_eq!(assigned[2]["branch"], "inchworm/5-a1");
+        assert_eq!(assigned[0]["branch"], "main");
+        assert_eq!(assigned[1]["identity"], "pr-shepherd");
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_is_judge_rejected_and_nothing_is_retried_unless_configured() {
+        let (summary, assigned, _) = verify_with(
+            Scenario::verifier_failed(&[("fmt", "passed"), ("tests", "failed")]),
+            &verifier_flow(2, ""),
+        )
+        .await;
+        assert_eq!(summary.state, RunState::Failed);
+        assert_eq!(
+            summary.failure.as_ref().unwrap().0,
+            FailureClass::JudgeRejected
+        );
+        assert_eq!(summary.attempts, 1);
+        assert_eq!(assigned.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_retries_through_the_existing_retry_loop() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        github.add_pr("o/r", "inchworm/5-a2", pr_at(78, "cafef00d"));
+        let (mut client, fake) = connect(vec![
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::verifier_failed(&[("fmt", "passed"), ("tests", "failed")]),
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::verifier_completed(&[("fmt", "passed"), ("tests", "passed")]),
+        ]);
+        client.initialize().unwrap();
+        let summary = go(
+            &store,
+            &github,
+            &clock,
+            &verifier_flow(2, "\"judge_rejected\""),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.state, RunState::PrOpen, "{:?}", summary.failure);
+        assert_eq!(summary.attempts, 2);
+        let assigned = fake.assigned();
+        assert_eq!(assigned.len(), 6);
+        assert_eq!(assigned[5]["branch"], "inchworm/5-a2");
+    }
+
+    #[tokio::test]
+    async fn verifier_infrastructure_failures_are_model_errors_not_judge_rejections() {
+        for error_type in [
+            "VerifierExecFailed",
+            "VerifierChecksInvalid",
+            "VerifierRequiresContainer",
+        ] {
+            let (summary, _, _) = verify_with(
+                Scenario::verifier_infra_failure(error_type),
+                &verifier_flow(1, ""),
+            )
+            .await;
+            assert_eq!(summary.state, RunState::Failed, "{error_type}");
+            assert_eq!(
+                summary.failure.as_ref().unwrap().0,
+                FailureClass::ModelError,
+                "{error_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_error_for_the_verifier_fails_closed_as_a_model_error() {
+        let (summary, _, _) = verify_with(
+            Scenario::Refused {
+                error: serde_json::json!({"code": -32602, "message": "no"}),
+            },
+            &verifier_flow(1, ""),
+        )
+        .await;
+        assert_eq!(
+            summary.failure.as_ref().unwrap().0,
+            FailureClass::ModelError
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verifier_task_that_ran_as_a_normal_agent_never_passes() {
+        let (summary, _, _) = verify_with(Scenario::success(), &verifier_flow(1, "")).await;
+        assert_eq!(summary.state, RunState::Failed);
+        assert_eq!(
+            summary.failure.as_ref().unwrap().0,
+            FailureClass::ModelError
+        );
+    }
+
+    #[tokio::test]
+    async fn flows_without_a_verifier_judge_dispatch_nothing_extra() {
+        let diff = format!("[[flow.judge]]\nkind = \"nanna_clean\"\n{DRAFT_OUTCOME}");
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let (mut client, fake) = connect(two_steps());
+        client.initialize().unwrap();
+        go(
+            &store,
+            &github,
+            &clock,
+            &flow_with(1, "", &diff),
+            &mut client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.assigned().len(), 2);
+    }
+
+    struct MovingHead<'a> {
+        inner: &'a mut dyn Dispatcher,
+        github: &'a FakeGitHub,
+    }
+
+    impl Dispatcher for MovingHead<'_> {
+        fn dispatch(
+            &mut self,
+            request: &AssignRequest,
+            timeout: Duration,
+        ) -> Result<crate::nanna_client::TaskOutcome, crate::nanna_client::ClientError> {
+            if request.identity == "verifier" {
+                self.github.add_pr("o/r", "inchworm/5-a1", pr("0badc0de"));
+            }
+            self.inner.dispatch(request, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_head_that_moves_during_verification_is_never_accepted() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = FakeClock::new(100);
+        let github = github();
+        github.add_pr("o/r", "inchworm/5-a1", pr("deadbeef"));
+        let (mut client, _fake) = connect(vec![
+            Scenario::success(),
+            Scenario::success(),
+            Scenario::verifier_completed(&[("fmt", "passed"), ("tests", "passed")]),
+        ]);
+        client.initialize().unwrap();
+        let mut moving = MovingHead {
+            inner: &mut client,
+            github: &github,
+        };
+        let summary = go(&store, &github, &clock, &verifier_flow(1, ""), &mut moving)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        assert_eq!(
+            summary.failure.as_ref().unwrap().0,
+            FailureClass::MergeBlocked
+        );
+    }
+
+    #[test]
+    fn a_missing_branch_fails_closed_without_dispatching() {
+        struct Never;
+        impl Dispatcher for Never {
+            fn dispatch(
+                &mut self,
+                _: &AssignRequest,
+                _: Duration,
+            ) -> Result<crate::nanna_client::TaskOutcome, crate::nanna_client::ClientError>
+            {
+                panic!("must not dispatch")
+            }
+        }
+        let evidence =
+            collect_verifier_evidence(&verifier_flow(1, ""), Path::new("/repo"), None, &mut Never);
+        assert!(matches!(evidence, Some(Evidence::Unavailable(_))));
+        let none =
+            collect_verifier_evidence(&flow(1, ""), Path::new("/repo"), Some("b"), &mut Never);
+        assert!(none.is_none());
     }
 
     #[tokio::test]

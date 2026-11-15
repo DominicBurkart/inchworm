@@ -221,6 +221,7 @@ mod tests {
             failure_kind: kind.map(str::to_string),
             error_type: error_type.map(str::to_string),
             message: message.to_string(),
+            diagnostics_text: None,
         }
     }
 
@@ -362,6 +363,7 @@ mod tests {
             iterations: 0,
             model_used: String::new(),
             raw: serde_json::Value::Null,
+            result_text: String::new(),
         };
         assert_eq!(classify_outcome(&TaskOutcome::Completed(done)), None);
         assert_eq!(
@@ -396,6 +398,7 @@ mod tests {
                 iterations: 0,
                 model_used: String::new(),
                 raw: serde_json::Value::Null,
+                result_text: String::new(),
             })),
             ""
         );
@@ -436,6 +439,7 @@ mod tests {
                 failure_kind: kind,
                 error_type,
                 message,
+                diagnostics_text: None,
             });
             prop_assert!(FailureClass::ALL.contains(&class));
         }
