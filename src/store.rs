@@ -345,8 +345,9 @@ impl Store {
         now: i64,
     ) -> Result<Option<RunId>, StoreError> {
         let changed = self.conn.execute(
-            "INSERT OR IGNORE INTO runs (repo, issue, flow, state, created_at, updated_at, fire_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            "INSERT INTO runs (repo, issue, flow, state, created_at, updated_at, fire_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
+             ON CONFLICT DO NOTHING",
             params![
                 repo,
                 i64::try_from(SCHEDULED_SUBJECT).map_err(corrupt("subject"))?,
