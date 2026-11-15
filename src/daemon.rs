@@ -802,7 +802,9 @@ required_checks = ["build"]
     fn a_poll_that_cannot_open_the_state_database_is_logged_and_the_daemon_keeps_running() {
         let rig = Rig::new(FLOWS);
         let running = rig.start(rig.settings(), ScriptedFactory::default());
-        std::thread::sleep(Duration::from_millis(200));
+        wait_for("the first poll to queue a run", || {
+            !rig.store().recent_runs(1).unwrap().is_empty()
+        });
         std::fs::remove_file(rig.db()).unwrap();
         std::fs::create_dir(rig.db()).unwrap();
         std::thread::sleep(Duration::from_millis(300));
@@ -1176,7 +1178,7 @@ required_checks = ["build"]
         let started = Instant::now();
         running.stop().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
-        let lock = DaemonLock::acquire(&rig.db()).unwrap();
+        let lock = acquire_when_free(&rig.db());
         assert_eq!(
             rig.store()
                 .recover_after_crash(&lock, 9)
@@ -1184,6 +1186,18 @@ required_checks = ["build"]
                 .attempts_failed,
             1
         );
+    }
+
+    fn acquire_when_free(db: &std::path::Path) -> DaemonLock {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match DaemonLock::acquire(db) {
+                Err(StoreError::AlreadyRunning(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other.unwrap(),
+            }
+        }
     }
 
     #[test]
@@ -2005,5 +2019,41 @@ required_checks = ["build"]
         poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
         assert_eq!(unswapped.len(), 1);
         assert_eq!(scheduler.queued_len("o/r"), 1);
+    }
+
+    #[test]
+    fn an_issue_that_leaves_the_trigger_list_is_forgotten_by_the_label_swap_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".inchworm")).unwrap();
+        std::fs::write(repo.join("inchworm.toml"), project(FLOWS)).unwrap();
+        let entry = RepoEntry {
+            slug: "o/r".into(),
+            path: repo,
+        };
+        let github = Arc::new(github_with_issue());
+        github.fail_labels_with("HTTP 502");
+        let store = Store::open_in_memory().unwrap();
+        let deps = DaemonDeps {
+            github: github.clone(),
+            clock: Arc::new(crate::clock::FakeClock::new(1_000)),
+            dispatchers: Arc::new(Factory(Mutex::new(vec![]))),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        let mut unswapped = Unswapped::new();
+        poll_repo(&entry, &store, &deps, &scheduler, &mut unswapped).unwrap();
+        assert_eq!(unswapped.len(), 1);
+        let mut unlabelled = github.issue("o/r", 5).unwrap();
+        unlabelled.labels.clear();
+        github.add_issue("o/r", unlabelled);
+        let mut other = unswapped.clone();
+        other.insert(("other/repo".into(), 5));
+        poll_repo(&entry, &store, &deps, &scheduler, &mut other).unwrap();
+        assert_eq!(
+            other,
+            HashSet::from([("other/repo".to_string(), 5)]),
+            "the entry of a repository that is not being polled stays; this one's goes"
+        );
     }
 }

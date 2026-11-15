@@ -842,6 +842,19 @@ mod tests {
             std::fs::write(self.bin.join(name), value).unwrap();
         }
 
+        fn args_when_unlocked(&self, args: &[&str]) -> (u8, String, String) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let result = self.args(args);
+                if !result.2.contains("another inchworm daemon holds")
+                    || std::time::Instant::now() > deadline
+                {
+                    return result;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
         fn args(&self, args: &[&str]) -> (u8, String, String) {
             let mut argv = vec!["inchworm"];
             argv.extend_from_slice(args);
@@ -1132,10 +1145,13 @@ mod tests {
         assert_eq!(f.args(&["status"]).0, EXIT_VALID);
         assert_eq!(f.args(&["stats"]).0, EXIT_VALID);
         assert_eq!(f.args(&["failures"]).0, EXIT_VALID);
-        assert_eq!(f.args(&["run", "o/r", "5"]).0, EXIT_VALID);
+        assert_eq!(f.args_when_unlocked(&["run", "o/r", "5"]).0, EXIT_VALID);
         f.set("state", "task_failed");
         f.set("result", "result_failed_structured");
-        assert_eq!(f.args(&["run", "o/r", "5"]).0, EXIT_REPO_ERRORS);
+        assert_eq!(
+            f.args_when_unlocked(&["run", "o/r", "5"]).0,
+            EXIT_REPO_ERRORS
+        );
         let (code, out, _) = f.args(&["status"]);
         assert_eq!(code, EXIT_VALID);
         assert!(out.contains("o/r"), "{out}");
