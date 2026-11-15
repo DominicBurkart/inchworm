@@ -182,7 +182,13 @@ const MAX_VERIFY_FILE_BYTES: u64 = 64 * 1024;
 
 fn declared_checks(repo: &Path) -> Result<Vec<String>, String> {
     use std::io::Read;
-    let file = std::fs::File::open(repo.join(".nanna/verify.toml"))
+    let path = repo.join(".nanna/verify.toml");
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|err| format!("cannot read .nanna/verify.toml: {err}"))?;
+    if !meta.file_type().is_file() {
+        return Err(".nanna/verify.toml is not a regular file (symlinks are refused)".to_string());
+    }
+    let file = std::fs::File::open(&path)
         .map_err(|err| format!("cannot read .nanna/verify.toml: {err}"))?;
     let mut text = String::new();
     file.take(MAX_VERIFY_FILE_BYTES + 1)
@@ -193,9 +199,8 @@ fn declared_checks(repo: &Path) -> Result<Vec<String>, String> {
             ".nanna/verify.toml is larger than {MAX_VERIFY_FILE_BYTES} bytes"
         ));
     }
-    let table: toml::Table = text
-        .parse()
-        .map_err(|err| format!(".nanna/verify.toml: {err}"))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|err| format!(".nanna/verify.toml: {}", err.message()))?;
     Ok(table
         .get("check")
         .and_then(toml::Value::as_array)
@@ -515,6 +520,47 @@ mode = "draft_pr"
 
         write(dir.path(), ".nanna/verify.toml", "check = 3\n");
         assert!(messages(&validate(&config_for(dir.path())))[0].contains("`fmt` is not declared"));
+    }
+
+    #[test]
+    fn a_symlinked_or_non_regular_verify_file_is_refused_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        write(
+            dir.path(),
+            ".inchworm/flows.toml",
+            &verifier_flows("\"fmt\""),
+        );
+        write(
+            dir.path(),
+            "elsewhere.toml",
+            "[[check]]\nname = \"fmt\"\ncommand = \"a\"\n",
+        );
+        std::os::unix::fs::symlink(
+            dir.path().join("elsewhere.toml"),
+            dir.path().join(".nanna/verify.toml"),
+        )
+        .unwrap();
+        let report = validate(&config_for(dir.path()));
+        assert!(report.is_ok());
+        assert!(messages(&report)[0].contains("symlinks are refused"));
+        std::fs::remove_file(dir.path().join(".nanna/verify.toml")).unwrap();
+        std::fs::create_dir(dir.path().join(".nanna/verify.toml")).unwrap();
+        assert!(messages(&validate(&config_for(dir.path())))[0].contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_verify_parse_error_does_not_echo_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        good_repo(dir.path());
+        write(
+            dir.path(),
+            ".inchworm/flows.toml",
+            &verifier_flows("\"fmt\""),
+        );
+        write(dir.path(), ".nanna/verify.toml", "secret_marker = [\n");
+        let text = messages(&validate(&config_for(dir.path()))).join("\n");
+        assert!(!text.contains("secret_marker"), "{text}");
     }
 
     #[test]
