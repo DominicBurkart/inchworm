@@ -101,10 +101,10 @@ pub fn branch_name(issue: u64, attempt: u32) -> String {
 /// ```
 /// use inchworm::flow::scheduled_branch_name;
 ///
-/// assert_eq!(scheduled_branch_name(9, 2), "inchworm/sched-9-a2");
+/// assert_eq!(scheduled_branch_name(1_000, 9, 2), "inchworm/sched-1000-9-a2");
 /// ```
-pub fn scheduled_branch_name(run_id: i64, attempt: u32) -> String {
-    format!("inchworm/sched-{run_id}-a{attempt}")
+pub fn scheduled_branch_name(fire_at: i64, run_id: i64, attempt: u32) -> String {
+    format!("inchworm/sched-{fire_at}-{run_id}-a{attempt}")
 }
 
 /// ```

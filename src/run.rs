@@ -448,7 +448,7 @@ pub async fn execute_run(
                 Some(number) => {
                     branch_name(number, ctx.store.issue_attempt_count(ctx.slug, number)?)
                 }
-                None => scheduled_branch_name(run_id, attempt.n),
+                None => scheduled_branch_name(run.fire_at.unwrap_or_default(), run_id, attempt.n),
             };
             let held = match permit.take() {
                 Some(held) => held,
@@ -638,7 +638,11 @@ mod tests {
             .enqueue_scheduled("o/r", "issue", 1_795_057_200, 1)
             .unwrap()
             .unwrap();
-        github.add_pr("o/r", &format!("inchworm/sched-{run}-a1"), pr("deadbeef"));
+        github.add_pr(
+            "o/r",
+            &format!("inchworm/sched-1795057200-{run}-a1"),
+            pr("deadbeef"),
+        );
         let scorer = FakeScorer::new();
         let (mut client, fake) = connect(vec![Scenario::success(), Scenario::success()]);
         client.initialize().unwrap();
@@ -658,7 +662,7 @@ mod tests {
         let attempt = &store.attempts(run).unwrap()[0];
         assert_eq!(
             attempt.branch.as_deref(),
-            Some(format!("inchworm/sched-{run}-a1").as_str())
+            Some(format!("inchworm/sched-1795057200-{run}-a1").as_str())
         );
         let task = fake.assigned()[0]["description"]
             .as_str()
@@ -715,9 +719,9 @@ mod tests {
             state: PrState::Merged,
             ..pr("cafe")
         };
-        github.add_pr("o/r", "inchworm/sched-1-a1", merged);
+        github.add_pr("o/r", "inchworm/sched-600-1-a1", merged);
         store
-            .record_pr(attempt.id, "inchworm/sched-1-a1", "cafe", 77)
+            .record_pr(attempt.id, "inchworm/sched-600-1-a1", "cafe", 77)
             .unwrap();
         store.mark_published(attempt.id, 0, None).unwrap();
         let scorer = FakeScorer::new();

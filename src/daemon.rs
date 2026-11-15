@@ -2104,6 +2104,28 @@ mode = "draft_pr"
     }
 
     #[test]
+    fn a_store_failure_while_firing_is_logged_and_does_not_stop_the_poll() {
+        let rig = Rig::new(&format!("{SCHEDULED}{LABELLED}"), at(14, 3, 0));
+        drop(rig.store());
+        rusqlite::Connection::open(&rig.db)
+            .unwrap()
+            .execute("DROP TABLE schedule_seen", [])
+            .unwrap();
+        let github = github_with_issue();
+        let deps = DaemonDeps {
+            github: Arc::new(github),
+            clock: rig.clock.clone(),
+            dispatchers: Arc::new(NoDispatch),
+            scorer: Arc::new(FakeScorer::new()),
+        };
+        let scheduler: Scheduler<Job> = Scheduler::new(1);
+        let mut unswapped = Unswapped::new();
+        poll_repo(&rig.entry, &rig.store(), &deps, &scheduler, &mut unswapped).unwrap();
+        assert!(rig.runs("scout").is_empty());
+        assert_eq!(rig.runs("issue").len(), 1);
+    }
+
+    #[test]
     fn resume_requeues_an_open_scheduled_run_without_creating_another() {
         let rig = Rig::new(SCHEDULED, at(14, 3, 0));
         rig.poll();

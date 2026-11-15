@@ -475,6 +475,9 @@ mode = "draft_pr"
         assert_eq!(flow.trigger.label(), None);
         assert_eq!(flow.outcome.mode, OutcomeMode::DraftPr);
         assert!(flow.trigger.cron().unwrap().is_ok());
+        assert_eq!(flow.trigger.cron_text(), Some("0 3 * * 6"));
+        let labelled = FlowFile::parse(&minimal()).unwrap();
+        assert_eq!(labelled.flow[0].trigger.cron_text(), None);
     }
 
     #[test]
