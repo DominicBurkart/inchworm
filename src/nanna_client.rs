@@ -135,6 +135,29 @@ pub struct TaskDone {
 }
 
 impl TaskDone {
+    /// ```
+    /// use inchworm::nanna_client::parse_result;
+    /// use inchworm::nanna_client::TaskState;
+    /// use serde_json::json;
+    ///
+    /// let body = json!({"qa_summary": {"endpoint_checks_failed": 0, "console_errors": 2}}).to_string();
+    /// let value = json!({"isError": false, "content": [{"type": "text", "text": body}]});
+    /// let outcome = parse_result(TaskState::Completed, &value).unwrap();
+    /// let inchworm::nanna_client::TaskOutcome::Completed(done) = outcome else { panic!() };
+    /// assert_eq!(done.qa_ok(), Some(false));
+    /// ```
+    pub fn qa_ok(&self) -> Option<bool> {
+        let qa = self.raw.get("qa_summary")?.as_object()?;
+        let failed = [
+            "endpoint_checks_failed",
+            "browser_steps_failed",
+            "console_errors",
+        ]
+        .iter()
+        .any(|key| qa.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
+        Some(!failed)
+    }
+
     pub fn has_changes(&self) -> bool {
         let non_empty = |p: &Option<String>| p.as_deref().is_some_and(|s| !s.trim().is_empty());
         non_empty(&self.changes_patch)
@@ -689,9 +712,34 @@ impl NannaClient {
                 wait = wait.min(cap);
             }
             self.pause(wait.min(deadline - now));
-            current = self.get(&current.task_id)?;
+            current = match self.get(&current.task_id) {
+                Ok(next) => next,
+                Err(err) => {
+                    self.cancel_after_timeout(&current.task_id, &err);
+                    return Err(err);
+                }
+            };
         }
-        self.result(&current.task_id, current.state)
+        match self.result(&current.task_id, current.state) {
+            Err(err) => {
+                self.cancel_after_timeout(&current.task_id, &err);
+                Err(err)
+            }
+            done => done,
+        }
+    }
+
+    fn cancel_after_timeout(&mut self, task_id: &str, err: &ClientError) {
+        if matches!(err, ClientError::ReadTimeout(_)) {
+            self.next_id += 1;
+            let id = self.next_id;
+            let _ = self.send(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tasks/cancel",
+                "params": {"taskId": task_id}
+            }));
+        }
     }
 }
 

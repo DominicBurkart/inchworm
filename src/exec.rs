@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -34,6 +35,7 @@ pub struct CmdSpec {
     pub cwd: Option<PathBuf>,
     pub timeout: Option<Duration>,
     pub max_output: Option<usize>,
+    pub own_group: bool,
 }
 
 impl CmdSpec {
@@ -57,7 +59,19 @@ impl CmdSpec {
             cwd: None,
             timeout: None,
             max_output: None,
+            own_group: false,
         }
+    }
+
+    /// ```
+    /// use inchworm::exec::CmdSpec;
+    ///
+    /// assert!(!CmdSpec::new("gh", ["api"]).own_group);
+    /// assert!(CmdSpec::new("gh", ["api"]).in_own_process_group().own_group);
+    /// ```
+    pub fn in_own_process_group(mut self) -> CmdSpec {
+        self.own_group = true;
+        self
     }
 
     /// ```
@@ -136,7 +150,18 @@ pub fn spawn_retrying(command: &mut Command) -> io::Result<Child> {
 
 const ETXTBSY: i32 = 26;
 
-fn kill(child: &mut Child) {
+fn kill_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+fn kill(child: &mut Child, own_group: bool) {
+    if own_group {
+        kill_group(child.id());
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -167,6 +192,9 @@ impl Runner for SystemRunner {
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
+        if spec.own_group {
+            command.process_group(0);
+        }
         let mut child = spawn_retrying(&mut command)?;
         let (tx, rx) = mpsc::channel();
         if let Some(stdout) = child.stdout.take() {
@@ -190,7 +218,7 @@ impl Runner for SystemRunner {
                     let sink = if is_stderr { &mut stderr } else { &mut stdout };
                     sink.extend_from_slice(&chunk);
                     if stdout.len() + stderr.len() > max_output {
-                        kill(&mut child);
+                        kill(&mut child, spec.own_group);
                         return Err(io::Error::other(format!(
                             "`{}` printed more than {max_output} bytes",
                             spec.display()
@@ -207,7 +235,7 @@ impl Runner for SystemRunner {
                         break;
                     }
                     if Instant::now() >= deadline {
-                        kill(&mut child);
+                        kill(&mut child, spec.own_group);
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!("`{}` timed out after {timeout:?}", spec.display()),
@@ -225,12 +253,15 @@ impl Runner for SystemRunner {
                 status = Some(done);
                 drain_until = Some(Instant::now() + DRAIN_AFTER_EXIT);
             } else if Instant::now() >= deadline {
-                kill(&mut child);
+                kill(&mut child, spec.own_group);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("`{}` timed out after {timeout:?}", spec.display()),
                 ));
             }
+        }
+        if spec.own_group {
+            kill_group(child.id());
         }
         Ok(CmdOutput {
             code: status.and_then(|done| done.code()),
@@ -572,5 +603,108 @@ mod tests {
         let spec = CmdSpec::new("/definitely/not/a/program", [] as [&str; 0]);
         let err = SystemRunner.run(&spec).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    }
+
+    #[test]
+    fn a_background_grandchild_after_a_normal_exit_is_cleaned_up_in_its_own_group() {
+        let spec = CmdSpec::new("/bin/sh", ["-c", "sleep 4 & echo hi"])
+            .with_timeout(Duration::from_millis(500))
+            .in_own_process_group();
+        let started = Instant::now();
+        let out = SystemRunner.run(&spec).unwrap();
+        assert_eq!(out.stdout.trim(), "hi");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_detached_grandchild_is_killed_after_a_normal_exit_only_when_asked_to() {
+        for (own_group, expect_alive) in [(true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!(
+                "sleep 30 >/dev/null 2>&1 & echo $! > {}; echo hi",
+                pidfile.display()
+            );
+            let mut spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()])
+                .with_timeout(Duration::from_secs(20));
+            if own_group {
+                spec = spec.in_own_process_group();
+            }
+            let out = SystemRunner.run(&spec).unwrap();
+            assert_eq!(out.stdout.trim(), "hi");
+            let pid: u32 = std::fs::read_to_string(&pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let alive = || {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|stat| !stat.contains(") Z"))
+                    .unwrap_or(false)
+            };
+            let patience = if expect_alive { 300 } else { 5000 };
+            let deadline = Instant::now() + Duration::from_millis(patience);
+            while alive() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(alive(), expect_alive, "own_group={own_group}, pid {pid}");
+            if alive() {
+                unsafe {
+                    libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group_when_asked_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()])
+            .with_timeout(Duration::from_millis(2500))
+            .in_own_process_group();
+        let err = SystemRunner.run(&spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| !stat.contains(") Z"))
+                .unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(), "the grandchild {pid} survived the timeout");
+    }
+
+    #[test]
+    fn without_the_own_group_option_the_grandchild_is_not_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("sleep 3 & echo $! > {}; echo done", pidfile.display());
+        let spec = CmdSpec::new("/bin/sh", ["-c", script.as_str()]);
+        assert_eq!(SystemRunner.run(&spec).unwrap().stdout.trim(), "done");
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| !stat.contains(") Z"))
+            .unwrap_or(false);
+        assert!(alive, "the grandchild was killed without the option");
+        unsafe {
+            libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL);
+        }
     }
 }

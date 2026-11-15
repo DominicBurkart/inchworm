@@ -290,6 +290,16 @@ pub struct Outcome {
     pub merge_method: MergeMethod,
 }
 
+impl Judge {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Judge::Diff { .. } => "diff",
+            Judge::NannaClean {} => "nanna_clean",
+            Judge::Llm { .. } => "llm",
+        }
+    }
+}
+
 impl FlowFile {
     /// ```
     /// use inchworm::config::{FlowFile, OutcomeMode};
@@ -634,6 +644,22 @@ impl Flow {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn empty_flow_and_step_names_are_rejected() {
+        let blank_flow = FULL.replacen("name = \"issue\"", "name = \" \"", 1);
+        assert!(matches!(
+            FlowFile::parse(&blank_flow),
+            Err(ConfigError::EmptyFlowName)
+        ));
+        let blank_step = FULL.replacen("name = \"implement\"", "name = \"\"", 1);
+        assert!(
+            FlowFile::parse(&blank_step)
+                .unwrap_err()
+                .to_string()
+                .contains("step name")
+        );
+    }
 
     const FULL: &str = r#"
 [[flow]]

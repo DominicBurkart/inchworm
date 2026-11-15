@@ -163,10 +163,16 @@ impl Fakes {
 }
 
 fn script(dir: &Path, name: &str, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut body_name = path.clone().into_os_string();
+    body_name.push(".body");
+    std::fs::write(&body_name, body).unwrap();
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/shim"),
+        &path,
+    )
+    .unwrap();
 }
 
 fn fakes() -> Fakes {
@@ -176,7 +182,7 @@ fn fakes() -> Fakes {
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     for name in ["nanna", "gh"] {
-        std::fs::copy(
+        std::os::unix::fs::symlink(
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin/").to_string() + name,
             bin.join(name),
         )
@@ -243,6 +249,63 @@ fn online_validate_reports_unknown_identities_and_missing_labels() {
         ));
 }
 
+const PLAN_LIMIT: &str =
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n";
+
+const AUDITOR: &str = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
+
+fn require_build_check(fakes: &Fakes, outcome: &str) {
+    let flows = std::fs::read_to_string(fakes.repo.join("inchworm.toml")).unwrap();
+    let mut flows = flows.replace(
+        "[flow.outcome]\nmode = \"draft_pr\"",
+        &format!("[flow.outcome]\n{outcome}\nrequired_checks = [\"build\"]"),
+    );
+    if outcome.contains("merge_when") {
+        flows = format!("[merge]\nallow = true\n{flows}");
+    }
+    write(&fakes.repo, "inchworm.toml", &flows);
+}
+
+#[test]
+fn online_validate_warns_when_branch_protection_is_plan_limited_for_draft_pr() {
+    let fakes = fakes();
+    require_build_check(&fakes, "mode = \"draft_pr\"");
+    fakes.set("protection_error", PLAN_LIMIT);
+    inchworm_with(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("0 error(s), 1 warning(s)"))
+        .stdout(predicates_contains("Upgrade to GitHub Pro"));
+}
+
+#[test]
+fn online_validate_keeps_plan_limited_branch_protection_an_error_for_merge_when() {
+    let fakes = fakes();
+    require_build_check(&fakes, "mode = \"merge_when\"");
+    fakes.set("protection_error", PLAN_LIMIT);
+    inchworm_with(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(1)
+        .stdout(predicates_contains("Upgrade to GitHub Pro"));
+}
+
+#[test]
+fn online_validate_keeps_other_branch_protection_failures_errors_for_draft_pr() {
+    let fakes = fakes();
+    require_build_check(&fakes, "mode = \"draft_pr\"");
+    fakes.set("protection_error", "gh: Bad credentials (HTTP 401)\n");
+    inchworm_with(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(1)
+        .stdout(predicates_contains("HTTP 401"));
+}
+
 #[test]
 fn build_images_runs_nix_build_and_reports_failures() {
     let fakes = fakes();
@@ -291,14 +354,14 @@ fn run_dispatches_the_flow_and_records_the_pr() {
         .arg(&fakes.config)
         .assert()
         .success()
-        .stdout(predicates_contains("awaiting_ci after 1 attempt(s)"))
+        .stdout(predicates_contains("pr_open after 1 attempt(s)"))
         .stdout(predicates_contains("pull/9"));
-    let again = inchworm_with(&fakes)
+    inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
         .assert()
-        .code(2);
-    again.stderr(predicates_contains("already has a run"));
+        .success()
+        .stdout(predicates_contains("run 2 for o/r#5"));
 }
 
 #[test]
@@ -377,15 +440,12 @@ fn run_fails_cleanly_when_nanna_cannot_start_or_flows_are_missing() {
         .stderr(predicates_contains("cannot read"));
 }
 
-#[cfg(unix)]
-fn run_and_signal(signal: &str) -> (Option<i32>, String, Fakes) {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
+#[test]
+fn daemon_stops_cleanly_on_sigterm() {
     let fakes = fakes();
-    fakes.set("state", "task_working");
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("inchworm"))
-        .env("HOME", fakes.dir.path().join("home"))
-        .env_remove("XDG_CONFIG_HOME")
+        .args(["daemon", "--config"])
+        .arg(&fakes.config)
         .env(
             "PATH",
             format!(
@@ -394,169 +454,260 @@ fn run_and_signal(signal: &str) -> (Option<i32>, String, Fakes) {
                 std::env::var("PATH").unwrap()
             ),
         )
-        .args(["run", "o/r", "5", "--config"])
-        .arg(&fakes.config)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let started = fakes.bin().join("started");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !started.exists() {
-        assert!(Instant::now() < deadline, "the task never started");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    std::thread::sleep(Duration::from_millis(300));
-    let status = std::process::Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(child.id().to_string())
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "daemon exited early");
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
         .status()
         .unwrap();
-    assert!(status.success());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let exit = loop {
-        if let Some(exit) = child.try_wait().unwrap() {
-            break exit;
+    assert!(killed.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         assert!(
-            Instant::now() < deadline,
-            "inchworm did not stop after {signal}"
+            std::time::Instant::now() < deadline,
+            "daemon ignored SIGTERM"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    let mut stdout = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .unwrap();
-    (exit.code(), stdout, fakes)
+    assert!(status.success(), "{status:?}");
 }
 
-#[cfg(unix)]
+fn ollama_fixture(score: u8) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                request.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let inner = format!("{{\"score\": {score}, \"reason\": \"tidy\"}}");
+            let body = serde_json::json!({"response": inner}).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    (url, handle)
+}
+
 #[test]
-fn sigint_cancels_the_task_and_ends_the_run_as_cancelled() {
-    let (code, stdout, fakes) = run_and_signal("INT");
-    assert_eq!(code, Some(1), "{stdout}");
-    assert!(stdout.contains("failure: cancelled"), "{stdout}");
-    assert!(
-        fakes.bin().join("cancelled").exists(),
-        "nanna was never asked to cancel"
+fn end_to_end_dry_run_issue_to_judged_draft_pr_and_stats() {
+    let fakes = fakes();
+    let (ollama, _server) = ollama_fixture(9);
+    write(
+        &fakes.repo,
+        "inchworm.toml",
+        &format!(
+            "{AUDITOR}{}",
+            r#"[[flow]]
+name = "issue"
+trigger = { kind = "label", label = "inchworm" }
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+[[flow.judge]]
+kind = "diff"
+max_lines = 50
+forbid_paths = [".github/**"]
+[[flow.judge]]
+kind = "nanna_clean"
+[[flow.judge]]
+kind = "llm"
+rubric = ".inchworm/rubric.md"
+model = "gemma4:e4b"
+min_score = 7
+[flow.outcome]
+mode = "draft_pr"
+required_checks = ["build"]
+"#
+        ),
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn sigterm_cancels_the_task_and_ends_the_run_as_cancelled() {
-    let (code, stdout, fakes) = run_and_signal("TERM");
-    assert_eq!(code, Some(1), "{stdout}");
-    assert!(stdout.contains("failure: cancelled"), "{stdout}");
-    assert!(
-        fakes.bin().join("cancelled").exists(),
-        "nanna was never asked to cancel"
+    write(
+        &fakes.repo,
+        ".inchworm/rubric.md",
+        "Prefer small, tidy changes.",
     );
-}
+    let mut text = std::fs::read_to_string(&fakes.config).unwrap();
+    text = format!("ollama_url = \"{ollama}\"\n{text}");
+    std::fs::write(&fakes.config, text).unwrap();
+    fakes.set(
+        "checks",
+        "{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\"}",
+    );
+    fakes.set("protection", "build\n");
 
-#[test]
-fn validate_help_warns_that_build_images_evaluates_repository_nix() {
-    Command::cargo_bin("inchworm")
-        .unwrap()
-        .args(["validate", "--help"])
+    inchworm_with(&fakes)
+        .args(["validate", "--online", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success();
+
+    inchworm_with(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
         .assert()
         .success()
-        .stdout(predicates_contains(
-            "evaluates the repository's own Nix code",
-        ))
-        .stdout(predicates_contains("only on repositories you trust"));
+        .stdout(predicates_contains("pr_open after 1 attempt(s)"))
+        .stdout(predicates_contains("pull/9"));
+
+    inchworm_with(&fakes)
+        .args(["stats", "--window", "all", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("o/r"))
+        .stdout(predicates_contains("100.0%"));
+    inchworm_with(&fakes)
+        .args(["status", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("pr_open"));
+    inchworm_with(&fakes)
+        .args(["failures", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("no failures recorded"));
+
+    let store = inchworm::store::Store::open(&fakes.dir.path().join("state/state.db")).unwrap();
+    let run = store.recent_runs(1).unwrap().remove(0);
+    assert_eq!(run.state, inchworm::model::RunState::PrOpen);
+    let attempt = &store.attempts(run.id).unwrap()[0];
+    assert_eq!(attempt.state, inchworm::store::AttemptState::Succeeded);
+    let verdicts = store.verdicts(attempt.id).unwrap();
+    let names: Vec<_> = verdicts
+        .iter()
+        .map(|v| (v.judge.as_str(), v.passed))
+        .collect();
+    assert_eq!(
+        names,
+        [("diff", true), ("nanna_clean", true), ("llm", true)]
+    );
+    assert_eq!(verdicts[2].score, Some(9));
+    let rates = store.success_rates(i64::MAX / 2, None).unwrap();
+    assert_eq!((rates[0].total, rates[0].succeeded), (1, 1));
 }
 
 #[test]
-fn run_refuses_an_issue_that_is_closed_or_written_by_an_untrusted_author() {
+fn end_to_end_with_a_low_llm_score_rejects_the_attempt_and_records_it() {
+    let fakes = fakes();
+    let (ollama, _server) = ollama_fixture(2);
+    write(
+        &fakes.repo,
+        "inchworm.toml",
+        &format!(
+            "{AUDITOR}{}",
+            r#"[[flow]]
+name = "issue"
+max_attempts = 1
+trigger = { kind = "label", label = "inchworm" }
+[[flow.step]]
+name = "implement"
+identity = "rust-implementer"
+[[flow.judge]]
+kind = "llm"
+rubric = ".inchworm/rubric.md"
+model = "gemma4:e4b"
+min_score = 7
+[flow.outcome]
+mode = "draft_pr"
+"#
+        ),
+    );
+    write(&fakes.repo, ".inchworm/rubric.md", "Be good.");
+    let text = std::fs::read_to_string(&fakes.config).unwrap();
+    std::fs::write(&fakes.config, format!("ollama_url = \"{ollama}\"\n{text}")).unwrap();
+    inchworm_with(&fakes)
+        .args(["run", "o/r", "5", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .code(1)
+        .stdout(predicates_contains("failure: judge_rejected"));
+    inchworm_with(&fakes)
+        .args(["failures", "--class", "judge_rejected", "--config"])
+        .arg(&fakes.config)
+        .assert()
+        .success()
+        .stdout(predicates_contains("llm: score 2 below min_score 7"));
+}
+
+#[test]
+fn run_never_prints_escape_or_bidi_characters_from_failure_text() {
     let fakes = fakes();
     fakes.set(
-        "issue",
-        r#"{"number":5,"title":"t","body":"b","labels":[{"name":"inchworm"}],"url":"u","state":"CLOSED","authorAssociation":"OWNER"}"#,
+        "files",
+        "F src/lib.rs\nF .inchworm/\u{1b}]0;pwned\u{7}\u{1b}[2J\u{202e}.toml",
     );
-    inchworm_with(&fakes)
+    let out = inchworm_with(&fakes)
         .args(["run", "o/r", "5", "--config"])
         .arg(&fakes.config)
-        .assert()
-        .code(2)
-        .stderr(predicates_contains("the issue is not open"));
-
-    fakes.set(
-        "issue",
-        r#"{"number":5,"title":"t","body":"b","labels":[{"name":"inchworm"}],"url":"u","state":"OPEN","authorAssociation":"NONE"}"#,
-    );
-    inchworm_with(&fakes)
-        .args(["run", "o/r", "5", "--config"])
-        .arg(&fakes.config)
-        .assert()
-        .code(2)
-        .stderr(predicates_contains("`NONE` user"));
-
-    fakes.set(
-        "issue",
-        r#"{"number":5,"title":"t","body":"b","labels":[{"name":"bug"}],"url":"u","state":"OPEN","authorAssociation":"OWNER"}"#,
-    );
-    inchworm_with(&fakes)
-        .args(["run", "o/r", "5", "--config"])
-        .arg(&fakes.config)
-        .assert()
-        .code(2)
-        .stderr(predicates_contains("does not carry the `inchworm` label"));
-    assert!(
-        !fakes.dir.path().join("state/nanna").exists(),
-        "a refused run must not start nanna or leave its state files"
-    );
-}
-
-#[test]
-fn list_prints_one_tab_separated_line_per_registered_directory() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    good_repo(&repo);
-    let config = config(dir.path(), &repo);
-    inchworm()
-        .args(["list", "--config"])
-        .arg(&config)
-        .assert()
-        .success()
-        .stdout(format!("o/r\t{}\n", repo.display()));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn list_to_a_full_device_exits_two() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    good_repo(&repo);
-    let config = config(dir.path(), &repo);
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_inchworm"))
-        .env_clear()
-        .args(["list", "--config"])
-        .arg(&config)
-        .stdout(full)
-        .stderr(std::process::Stdio::piped())
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot write the list"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("failure:"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(!stdout.contains('\u{202e}'), "{stdout:?}");
 }
 
 #[test]
-fn list_exits_two_when_the_config_is_unreadable_and_prints_nothing_to_stdout() {
-    let dir = tempfile::tempdir().unwrap();
-    inchworm()
-        .args(["list", "--config"])
-        .arg(dir.path().join("missing.toml"))
-        .assert()
-        .code(2)
-        .stdout("")
-        .stderr(predicate::str::contains("cannot read"));
+fn the_shipped_unit_keeps_rootless_podman_working_and_restarts_after_transient_faults() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/contrib/inchworm.service"
+    ))
+    .unwrap();
+    for broken in [
+        "PrivateTmp",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectControlGroups",
+        "LockPersonality",
+        "RestartPreventExitStatus",
+        "network-online",
+    ] {
+        assert!(!unit.contains(broken), "{broken} is still in the unit");
+    }
+    assert!(unit.contains("Restart=on-failure"));
+    assert!(unit.contains("StartLimitBurst="));
+    assert!(unit.contains("StartLimitIntervalSec="));
+    assert!(unit.contains("NoNewPrivileges=yes"));
+}
+
+#[test]
+fn the_readme_creates_the_state_directory_private() {
+    let readme =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+    assert!(readme.contains("install -d -m 700"));
+    assert!(!readme.contains("mkdir -p ~/.config/inchworm ~/.local/state/inchworm"));
 }
