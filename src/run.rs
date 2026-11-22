@@ -994,6 +994,9 @@ mod tests {
         fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
             self.0.check_runs(r, s)
         }
+        fn commit_statuses(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.0.commit_statuses(r, s)
+        }
         fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
             self.0.mark_ready(r, n)
         }
@@ -1343,6 +1346,7 @@ name = "publish"
 identity = "pr-shepherd"
 [flow.outcome]
 mode = "draft_pr"
+required_checks = []
 "#
         ))
         .unwrap()
@@ -1864,6 +1868,9 @@ mode = "draft_pr"
         fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
             self.0.check_runs(r, s)
         }
+        fn commit_statuses(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.0.commit_statuses(r, s)
+        }
         fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
             self.0.mark_ready(r, n)
         }
@@ -2006,6 +2013,9 @@ mode = "draft_pr"
         }
         fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
             self.0.check_runs(r, s)
+        }
+        fn commit_statuses(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.0.commit_statuses(r, s)
         }
         fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
             self.0.mark_ready(r, n)

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
+use crate::blocking::{AllStatus, Resolved, Settler, resolve};
 use crate::clock::Clock;
 use crate::config::OutcomeMode;
 use crate::config::{Flow, Judge};
@@ -21,6 +22,7 @@ pub const DONE_LABEL: &str = "inchworm:done";
 pub struct CiPolicy {
     pub poll_interval: Duration,
     pub timeout: Duration,
+    pub settle: Duration,
 }
 
 impl Default for CiPolicy {
@@ -28,6 +30,7 @@ impl Default for CiPolicy {
         CiPolicy {
             poll_interval: Duration::from_secs(30),
             timeout: Duration::from_secs(2 * 60 * 60),
+            settle: Duration::from_secs(60),
         }
     }
 }
@@ -74,7 +77,9 @@ pub fn evaluate_required(required: &[String], runs: &[CheckRun], sha: &str) -> C
         {
             seen = true;
             match run.conclusion {
-                CheckConclusion::Failure => return CiStatus::Red(name.clone()),
+                CheckConclusion::Failure | CheckConclusion::Skipped => {
+                    return CiStatus::Red(name.clone());
+                }
                 CheckConclusion::Pending => pending = true,
                 CheckConclusion::Success => {}
             }
@@ -94,6 +99,7 @@ pub fn evaluate_required(required: &[String], runs: &[CheckRun], sha: &str) -> C
 pub enum CiResult {
     Green(Vec<CheckRun>),
     Red(String),
+    Vanished(String),
     TimedOut {
         pending: Vec<String>,
         last_error: Option<String>,
@@ -124,6 +130,67 @@ pub async fn wait_for_ci(
                     CiStatus::Green => return CiResult::Green(runs),
                     CiStatus::Red(name) => return CiResult::Red(name),
                     CiStatus::Waiting(names) => pending = names,
+                }
+            }
+            Err(err) => last_error = Some(err.to_string()),
+        }
+        if clock.now() >= deadline {
+            return CiResult::TimedOut {
+                pending,
+                last_error,
+            };
+        }
+        clock.sleep(policy.poll_interval).await;
+    }
+}
+
+/// Waits for the blocking checks in whichever form the flow chose.
+pub async fn wait_for_blocking(
+    github: &dyn GitHub,
+    clock: &dyn Clock,
+    repo: &str,
+    sha: &str,
+    blocking: &Resolved,
+    policy: &CiPolicy,
+    quiet_secs: i64,
+) -> CiResult {
+    match blocking {
+        Resolved::Names(names) => wait_for_ci(github, clock, repo, sha, names, policy).await,
+        Resolved::All { required } => {
+            wait_for_all(github, clock, repo, sha, required, policy, quiet_secs).await
+        }
+    }
+}
+
+/// Waits until every check run and commit status on `sha` is green and the set has settled.
+pub async fn wait_for_all(
+    github: &dyn GitHub,
+    clock: &dyn Clock,
+    repo: &str,
+    sha: &str,
+    required: &[String],
+    policy: &CiPolicy,
+    quiet_secs: i64,
+) -> CiResult {
+    let deadline = clock
+        .now()
+        .saturating_add(i64::try_from(policy.timeout.as_secs()).unwrap_or(i64::MAX));
+    let mut settler = Settler::new(quiet_secs);
+    let mut last_error: Option<String>;
+    let mut pending: Vec<String> = Vec::new();
+    loop {
+        let polled = github.check_runs(repo, sha).and_then(|mut runs| {
+            runs.extend(github.commit_statuses(repo, sha)?);
+            Ok(runs)
+        });
+        match polled {
+            Ok(runs) => {
+                last_error = None;
+                match settler.observe(required, &runs, sha, clock.now()) {
+                    AllStatus::Green => return CiResult::Green(runs),
+                    AllStatus::Red(name) => return CiResult::Red(name),
+                    AllStatus::Vanished(name) => return CiResult::Vanished(name),
+                    AllStatus::Waiting(names) => pending = names,
                 }
             }
             Err(err) => last_error = Some(err.to_string()),
@@ -343,13 +410,30 @@ pub async fn conclude(
         Live::Open(_) => {}
     }
     let run = ctx.store.run(published.run_id)?;
-    let ci = wait_for_ci(
+    let blocking = match resolve(&flow.outcome.spec(), &flow.base, || {
+        ctx.github
+            .required_checks(ctx.slug, &flow.base)
+            .map_err(|err| err.to_string())
+    }) {
+        Ok(blocking) => blocking,
+        Err(unresolved) => {
+            return reject(
+                ctx,
+                flow,
+                published,
+                FailureClass::BlockingUnresolved,
+                unresolved.0,
+            );
+        }
+    };
+    let ci = wait_for_blocking(
         ctx.github,
         ctx.clock,
         ctx.slug,
         sha,
-        &flow.outcome.required_checks,
+        &blocking,
         &env.ci,
+        i64::try_from(env.ci.settle.as_secs()).unwrap_or(i64::MAX),
     )
     .await;
     if run.state == RunState::AwaitingCi {
@@ -365,7 +449,16 @@ pub async fn conclude(
                 flow,
                 published,
                 FailureClass::CiRed,
-                format!("required check `{name}` failed on {sha}"),
+                format!("blocking check `{name}` failed on {sha}"),
+            );
+        }
+        CiResult::Vanished(name) => {
+            return reject(
+                ctx,
+                flow,
+                published,
+                FailureClass::CiRed,
+                format!("blocking check `{name}` was reported on {sha} and then disappeared"),
             );
         }
         CiResult::TimedOut {
@@ -373,9 +466,13 @@ pub async fn conclude(
             last_error,
         } => {
             let mut raw = format!(
-                "required checks still not green on {sha} after {}s: {}",
+                "blocking checks still not green on {sha} after {}s: {}",
                 env.ci.timeout.as_secs(),
-                pending.join(", ")
+                if pending.is_empty() {
+                    "the set of checks was empty or still changing".to_string()
+                } else {
+                    pending.join(", ")
+                }
             );
             if let Some(err) = last_error {
                 raw.push_str(&format!(" (last github error: {err})"));
@@ -436,10 +533,24 @@ pub async fn conclude(
         .iter()
         .map(|judge| judge.kind_name().to_string())
         .collect();
+    let effective: Vec<String> = match &blocking {
+        Resolved::Names(names) => names.clone(),
+        Resolved::All { .. } => {
+            let mut seen: Vec<String> = Vec::new();
+            for run in checks.iter().filter(|run| {
+                run.head_sha.eq_ignore_ascii_case(sha) && run.conclusion == CheckConclusion::Success
+            }) {
+                if !seen.contains(&run.name) {
+                    seen.push(run.name.clone());
+                }
+            }
+            seen
+        }
+    };
     let decision = decide(&PolicyInput {
         mode: flow.outcome.mode,
         merge_method: flow.outcome.merge_method,
-        required_checks: &flow.outcome.required_checks,
+        required_checks: &effective,
         checks: &checks,
         judged_head_sha: sha,
         live_head_sha: &live.head_sha,
@@ -464,10 +575,10 @@ pub async fn conclude(
                     "inchworm outcome `draft_pr` after attempt {}: {} stays a draft at `{sha}`. {} Judges: {}.",
                     published.attempt_n,
                     published.pr.url,
-                    if flow.outcome.required_checks.is_empty() {
+                    if effective.is_empty() {
                         "No checks were required."
                     } else {
-                        "Required checks are green on that commit."
+                        "Blocking checks are green on that commit."
                     },
                     summarise(&verdicts)
                 ),
@@ -757,6 +868,7 @@ mod tests {
         let policy = CiPolicy {
             poll_interval: Duration::from_secs(10),
             timeout: Duration::from_secs(100),
+            settle: Duration::ZERO,
         };
         let result = wait_for_ci(&github, &clock, "o/r", SHA, &required, &policy).await;
         assert!(matches!(result, CiResult::Green(runs) if runs.len() == 1));
@@ -774,6 +886,7 @@ mod tests {
         let policy = CiPolicy {
             poll_interval: Duration::from_secs(30),
             timeout: Duration::from_secs(90),
+            settle: Duration::ZERO,
         };
         github.push_check_poll(
             "o/r",
@@ -1246,7 +1359,7 @@ mod tests {
         let rig = live_pr(|pr| pr.is_draft = false);
         rig.github.fail_merges_with("not mergeable");
         let mut flow = merge_flow();
-        flow.outcome.required_checks = names(&["build"]);
+        flow.outcome.required_checks = Some(names(&["build"]));
         let mut env = env(&rig.scorer);
         env.merge_grant = MergeGrant::Granted;
         let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), "b".repeat(40).as_str()).await;
@@ -1262,7 +1375,7 @@ mod tests {
     async fn a_merge_when_rejection_leaves_an_already_draft_pr_alone() {
         let rig = live_pr(|_| {});
         let mut flow = merge_flow();
-        flow.outcome.required_checks = names(&["other"]);
+        flow.outcome.required_checks = Some(names(&["other"]));
         let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
         assert!(
             matches!(concluded, Concluded::Rejected { .. }),
@@ -1276,7 +1389,7 @@ mod tests {
     async fn a_draft_pr_flow_never_touches_a_pr_a_human_marked_ready() {
         let rig = live_pr(|pr| pr.is_draft = false);
         let mut judged = flow_with(1, "", DRAFT_OUTCOME);
-        judged.outcome.required_checks = names(&["other"]);
+        judged.outcome.required_checks = Some(names(&["other"]));
         let concluded = conclude_with(&rig, &judged, &pr_at(77, SHA), SHA).await;
         assert!(
             matches!(concluded, Concluded::Rejected { .. }),
@@ -1544,7 +1657,7 @@ mod tests {
         let rig = rig();
         rig.github.add_pr("o/r", "b", pr_at(77, SHA));
         let mut flow = merge_flow();
-        flow.outcome.required_checks.clear();
+        flow.outcome.required_checks = Some(Vec::new());
         rig.github.set_pr_patch("o/r", 77, &patch(2));
         let concluded = conclude_with(&rig, &flow, &pr_at(77, SHA), SHA).await;
         assert!(matches!(
@@ -1826,6 +1939,9 @@ mod round2_safety {
         fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
             self.inner.check_runs(r, s)
         }
+        fn commit_statuses(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.inner.commit_statuses(r, s)
+        }
         fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
             self.inner.mark_ready(r, n)
         }
@@ -1888,6 +2004,10 @@ mod round2_safety {
     }
 
     async fn conclude_on(gh: &Proxy, flow: &Flow) -> (Concluded, Store) {
+        conclude_with_settle(gh, flow, Duration::ZERO).await
+    }
+
+    async fn conclude_with_settle(gh: &Proxy, flow: &Flow, settle: Duration) -> (Concluded, Store) {
         let store = Store::open_in_memory().unwrap();
         let clock = FakeClock::new(1_000);
         let scorer = FakeScorer::new();
@@ -1921,7 +2041,9 @@ mod round2_safety {
             },
         };
         let mut warnings = Vec::new();
-        let concluded = conclude(&ctx, &env(&scorer), flow, &published, &mut warnings)
+        let mut outcome_env = env(&scorer);
+        outcome_env.ci.settle = settle;
+        let concluded = conclude(&ctx, &outcome_env, flow, &published, &mut warnings)
             .await
             .unwrap();
         (concluded, store)
@@ -2000,7 +2122,7 @@ mod round2_safety {
     async fn the_draft_comment_does_not_claim_green_checks_when_none_were_required() {
         let gh = proxy(SMALL);
         let mut no_checks = flow("draft_pr");
-        no_checks.outcome.required_checks.clear();
+        no_checks.outcome.required_checks = Some(Vec::new());
         let (concluded, _) = conclude_on(&gh, &no_checks).await;
         assert_eq!(
             concluded,
@@ -2012,7 +2134,7 @@ mod round2_safety {
         assert!(
             comments
                 .iter()
-                .all(|c| !c.2.contains("Required checks are green")),
+                .all(|c| !c.2.contains("Blocking checks are green")),
             "{comments:?}"
         );
         assert!(
@@ -2020,6 +2142,428 @@ mod round2_safety {
                 .iter()
                 .any(|c| c.2.contains("No checks were required"))
         );
+    }
+
+    fn flow_blocking(lines: &str) -> Flow {
+        flow_with(
+            1,
+            "",
+            &format!(
+                "[[flow.judge]]\nkind = \"diff\"\nmax_lines = 50\n[flow.outcome]\nmode = \"draft_pr\"\n{lines}\n"
+            ),
+        )
+    }
+
+    fn check(name: &str, conclusion: CheckConclusion) -> CheckRun {
+        CheckRun {
+            name: name.into(),
+            head_sha: SHA.into(),
+            conclusion,
+        }
+    }
+
+    async fn rejected(gh: &Proxy, flow: &Flow) -> (FailureClass, String) {
+        match conclude_on(gh, flow).await.0 {
+            Concluded::Rejected { class, raw } => (class, raw),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_blocking_set_is_the_branch_protection_read_at_decision_time() {
+        let gh = proxy(SMALL);
+        gh.inner.set_protection("o/r", "main", &["build"]);
+        let (concluded, _) = conclude_on(&gh, &flow_blocking("")).await;
+        assert_eq!(
+            concluded,
+            Concluded::Accepted {
+                state: RunState::PrOpen
+            }
+        );
+        let comment = gh.inner.comments().last().unwrap().2.clone();
+        assert!(comment.contains("Blocking checks are green"), "{comment}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_absent_or_empty_branch_protection_fails_closed_with_its_own_class() {
+        let unreadable = proxy(SMALL);
+        unreadable.inner.fail_protection_with("HTTP 502");
+        let absent = proxy(SMALL);
+        let empty = proxy(SMALL);
+        empty.inner.set_protection("o/r", "main", &[]);
+        for (gh, expect) in [
+            (&unreadable, "the branch protection cannot be read: "),
+            (&absent, "the branch protection does not exist"),
+            (&empty, "the branch protection lists no checks"),
+        ] {
+            let (class, raw) = rejected(gh, &flow_blocking("")).await;
+            assert_eq!(class, FailureClass::BlockingUnresolved, "{raw}");
+            assert!(raw.contains(expect), "{raw}");
+            assert!(gh.inner.ready_calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_explicit_list_never_reads_the_branch_protection() {
+        let gh = proxy(SMALL);
+        gh.inner.fail_protection_with("must not be read");
+        let flow = flow_blocking("required_checks = [\"build\"]");
+        assert!(matches!(
+            conclude_on(&gh, &flow).await.0,
+            Concluded::Accepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn extra_names_are_blocking_on_top_of_the_required_checks() {
+        let gh = proxy(SMALL);
+        gh.inner.set_protection("o/r", "main", &["build"]);
+        let flow = flow_blocking("extra = [\"lint\"]");
+        let (class, raw) = rejected(&gh, &flow).await;
+        assert_eq!(class, FailureClass::Timeout, "{raw}");
+        assert!(raw.contains("lint"), "{raw}");
+
+        let gh = proxy(SMALL);
+        gh.inner.set_protection("o/r", "main", &["build"]);
+        gh.inner.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("build", CheckConclusion::Success),
+                check("lint", CheckConclusion::Success),
+            ],
+        );
+        assert!(matches!(
+            conclude_on(&gh, &flow).await.0,
+            Concluded::Accepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_counts_commit_statuses_next_to_check_runs() {
+        let gh = proxy(SMALL);
+        gh.inner.set_status_polls(
+            "o/r",
+            SHA,
+            vec![vec![check("coverage", CheckConclusion::Success)]],
+        );
+        let (concluded, _) = conclude_on(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert!(
+            matches!(concluded, Concluded::Accepted { .. }),
+            "{concluded:?}"
+        );
+
+        let gh = proxy(SMALL);
+        gh.inner.set_status_polls(
+            "o/r",
+            SHA,
+            vec![vec![check("coverage", CheckConclusion::Failure)]],
+        );
+        let (class, raw) = rejected(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::CiRed);
+        assert!(raw.contains("`coverage`"), "{raw}");
+
+        let gh = proxy(SMALL);
+        gh.inner.set_status_polls(
+            "o/r",
+            SHA,
+            vec![vec![check("coverage", CheckConclusion::Pending)]],
+        );
+        let (class, raw) = rejected(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::Timeout, "{raw}");
+        assert!(raw.contains("coverage"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn all_fails_the_attempt_when_a_status_listing_is_unreadable() {
+        let gh = proxy(SMALL);
+        gh.inner.fail_commit_statuses_with("HTTP 502");
+        let (class, raw) = rejected(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::Timeout);
+        assert!(raw.contains("HTTP 502"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn all_also_waits_for_the_required_names_when_the_protection_is_readable() {
+        let gh = proxy(SMALL);
+        gh.inner.set_protection("o/r", "main", &["build", "deploy"]);
+        let (class, raw) = rejected(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::Timeout);
+        assert!(raw.contains("deploy"), "{raw}");
+        let gh = proxy(SMALL);
+        gh.inner.fail_protection_with("HTTP 403");
+        assert!(matches!(
+            conclude_on(&gh, &flow_blocking("blocking = \"all\""))
+                .await
+                .0,
+            Concluded::Accepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_with_no_checks_at_all_never_goes_green() {
+        let gh = github_with_issue();
+        gh.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        gh.set_pr_patch("o/r", 77, SMALL);
+        let gh = Proxy {
+            inner: gh,
+            merge_applies_then_errors: AtomicBool::new(false),
+            pr_read_fails_after_ready: AtomicBool::new(false),
+        };
+        let (class, raw) = rejected(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::Timeout);
+        assert!(raw.contains("empty or still changing"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn the_blocking_set_is_judged_on_the_exact_sha_only() {
+        let gh = proxy(SMALL);
+        gh.inner.set_status_polls(
+            "o/r",
+            SHA,
+            vec![vec![CheckRun {
+                name: "other".into(),
+                head_sha: "f".repeat(40),
+                conclusion: CheckConclusion::Failure,
+            }]],
+        );
+        assert!(matches!(
+            conclude_on(&gh, &flow_blocking("blocking = \"all\""))
+                .await
+                .0,
+            Concluded::Accepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_late_check_restarts_the_quiet_period_and_a_vanished_one_is_red() {
+        let clock = FakeClock::new(0);
+        let github = FakeGitHub::new();
+        github.push_check_poll("o/r", SHA, vec![check("build", CheckConclusion::Success)]);
+        github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("build", CheckConclusion::Success),
+                check("deploy", CheckConclusion::Success),
+            ],
+        );
+        let policy = CiPolicy {
+            poll_interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
+            settle: Duration::from_secs(60),
+        };
+        let result = wait_for_all(&github, &clock, "o/r", SHA, &[], &policy, 60).await;
+        assert!(matches!(result, CiResult::Green(runs) if runs.len() == 2));
+        assert_eq!(
+            clock.now(),
+            90,
+            "green only 60 s after the late check appeared at 30 s"
+        );
+
+        let clock = FakeClock::new(0);
+        let github = FakeGitHub::new();
+        github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("build", CheckConclusion::Success),
+                check("deploy", CheckConclusion::Pending),
+            ],
+        );
+        github.push_check_poll("o/r", SHA, vec![check("build", CheckConclusion::Success)]);
+        let result = wait_for_all(&github, &clock, "o/r", SHA, &[], &policy, 60).await;
+        assert_eq!(result, CiResult::Vanished("deploy".into()));
+    }
+
+    #[tokio::test]
+    async fn all_treats_skipped_and_neutral_checks_as_satisfied_but_never_as_the_success() {
+        let github = github_with_issue();
+        github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        github.set_pr_patch("o/r", 77, SMALL);
+        github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("build", CheckConclusion::Success),
+                check("release", CheckConclusion::Skipped),
+            ],
+        );
+        let gh = Proxy {
+            inner: github,
+            merge_applies_then_errors: AtomicBool::new(false),
+            pr_read_fails_after_ready: AtomicBool::new(false),
+        };
+        let (concluded, _) = conclude_on(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert!(
+            matches!(concluded, Concluded::Accepted { .. }),
+            "{concluded:?}"
+        );
+
+        let gh = github_with_issue();
+        gh.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        gh.set_pr_patch("o/r", 77, SMALL);
+        gh.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("release", CheckConclusion::Skipped),
+                check("scan", CheckConclusion::Skipped),
+            ],
+        );
+        let only_skipped = Proxy {
+            inner: gh,
+            merge_applies_then_errors: AtomicBool::new(false),
+            pr_read_fails_after_ready: AtomicBool::new(false),
+        };
+        let (class, raw) = rejected(&only_skipped, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::Timeout, "{raw}");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_check_stays_red_for_the_required_form_and_the_explicit_list() {
+        for lines in ["", "required_checks = [\"build\"]"] {
+            let github = github_with_issue();
+            github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+            github.set_pr_patch("o/r", 77, SMALL);
+            github.set_protection("o/r", "main", &["build"]);
+            github.push_check_poll("o/r", SHA, vec![check("build", CheckConclusion::Skipped)]);
+            let gh = Proxy {
+                inner: github,
+                merge_applies_then_errors: AtomicBool::new(false),
+                pr_read_fails_after_ready: AtomicBool::new(false),
+            };
+            let (class, raw) = rejected(&gh, &flow_blocking(lines)).await;
+            assert_eq!(class, FailureClass::CiRed, "{lines}: {raw}");
+        }
+    }
+
+    #[test]
+    fn evaluate_required_treats_a_skipped_required_check_as_red() {
+        let skipped = [CheckRun {
+            name: "build".into(),
+            head_sha: SHA.into(),
+            conclusion: CheckConclusion::Skipped,
+        }];
+        assert_eq!(
+            evaluate_required(&["build".to_string()], &skipped, SHA),
+            CiStatus::Red("build".into())
+        );
+    }
+
+    #[test]
+    fn the_shipped_quiet_period_is_sixty_seconds() {
+        assert_eq!(CiPolicy::default().settle, Duration::from_secs(60));
+        assert_eq!(CiPolicy::default().poll_interval, Duration::from_secs(30));
+        assert_eq!(
+            CiPolicy::default().timeout,
+            Duration::from_secs(2 * 60 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn conclude_honours_the_quiet_period_it_is_given() {
+        let gh = proxy(SMALL);
+        let (class, raw) = {
+            match conclude_with_settle(
+                &gh,
+                &flow_blocking("blocking = \"all\""),
+                Duration::from_secs(120),
+            )
+            .await
+            .0
+            {
+                Concluded::Rejected { class, raw } => (class, raw),
+                other => panic!("expected a rejection, got {other:?}"),
+            }
+        };
+        assert_eq!(class, FailureClass::Timeout, "{raw}");
+        let gh = proxy(SMALL);
+        let (concluded, _) = conclude_with_settle(
+            &gh,
+            &flow_blocking("blocking = \"all\""),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            matches!(concluded, Concluded::Accepted { .. }),
+            "{concluded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_vanishes_before_the_decision_is_ci_red_with_a_clear_reason() {
+        let gh = proxy(SMALL);
+        gh.inner.set_status_polls(
+            "o/r",
+            SHA,
+            vec![vec![check("deploy", CheckConclusion::Pending)], vec![]],
+        );
+        let (class, raw) = rejected(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::CiRed);
+        assert!(
+            raw.contains("`deploy`") && raw.contains("disappeared"),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_red_check_stays_red_in_all_even_when_the_same_name_is_rerun_green() {
+        let clock = FakeClock::new(0);
+        let github = FakeGitHub::new();
+        github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("build", CheckConclusion::Failure),
+                check("build", CheckConclusion::Success),
+            ],
+        );
+        let policy = CiPolicy {
+            poll_interval: Duration::from_secs(10),
+            timeout: Duration::from_secs(60),
+            settle: Duration::ZERO,
+        };
+        let result = wait_for_all(&github, &clock, "o/r", SHA, &[], &policy, 0).await;
+        assert_eq!(result, CiResult::Red("build".into()));
+    }
+
+    #[test]
+    fn only_success_is_green_and_skipped_or_neutral_are_their_own_state() {
+        for conclusion in ["skipped", "neutral", "SKIPPED"] {
+            assert_eq!(
+                CheckConclusion::from_github("completed", Some(conclusion)),
+                CheckConclusion::Skipped,
+                "{conclusion}"
+            );
+        }
+        for conclusion in [
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "stale",
+            "startup_failure",
+            "failure",
+            "",
+            "something_new",
+        ] {
+            assert_eq!(
+                CheckConclusion::from_github("completed", Some(conclusion)),
+                CheckConclusion::Failure,
+                "{conclusion}"
+            );
+        }
+        assert_eq!(
+            CheckConclusion::from_github("completed", Some("success")),
+            CheckConclusion::Success
+        );
+        for status in ["queued", "in_progress", "waiting", "pending", "requested"] {
+            assert_eq!(
+                CheckConclusion::from_github(status, None),
+                CheckConclusion::Pending,
+                "{status}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2030,7 +2574,7 @@ mod round2_safety {
             gh.inner
                 .comments()
                 .iter()
-                .any(|c| c.2.contains("Required checks are green"))
+                .any(|c| c.2.contains("Blocking checks are green"))
         );
     }
 

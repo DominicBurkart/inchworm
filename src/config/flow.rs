@@ -284,10 +284,64 @@ pub enum MergeMethod {
 #[serde(deny_unknown_fields)]
 pub struct Outcome {
     pub mode: OutcomeMode,
-    #[serde(default)]
-    pub required_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_checks: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<Blocking>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<String>,
     #[serde(default)]
     pub merge_method: MergeMethod,
+}
+
+/// Which CI checks block a flow's outcome.
+///
+/// ```
+/// use inchworm::config::{Blocking, BlockingSpec, FlowFile};
+///
+/// let file = FlowFile::parse(r#"
+/// [[flow]]
+/// name = "issue"
+/// trigger = { kind = "label", label = "inchworm" }
+/// [[flow.step]]
+/// name = "implement"
+/// identity = "rust-implementer"
+/// [flow.outcome]
+/// mode = "draft_pr"
+/// blocking = "all"
+/// "#).unwrap();
+/// assert_eq!(file.flow[0].outcome.blocking, Some(Blocking::All));
+/// assert_eq!(file.flow[0].outcome.spec(), BlockingSpec::All);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Blocking {
+    #[default]
+    Required,
+    All,
+}
+
+/// The effective form of a flow's blocking checks, before anything is read from GitHub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockingSpec<'a> {
+    /// Exactly these names (the `required_checks` list; an empty list means no check blocks).
+    Explicit(&'a [String]),
+    /// The base branch's required status checks, read at decision time, plus these names.
+    Required { extra: &'a [String] },
+    /// Every check run and commit status reported on the judged head.
+    All,
+}
+
+impl Outcome {
+    pub fn spec(&self) -> BlockingSpec<'_> {
+        if let Some(list) = &self.required_checks {
+            return BlockingSpec::Explicit(list);
+        }
+        match self.blocking.unwrap_or_default() {
+            Blocking::All => BlockingSpec::All,
+            Blocking::Required => BlockingSpec::Required { extra: &self.extra },
+        }
+    }
 }
 
 impl Judge {
@@ -590,49 +644,71 @@ impl Flow {
     }
 
     fn validate_outcome(&self) -> Result<(), ConfigError> {
-        if self.outcome.required_checks.len() > MAX_REQUIRED_CHECKS {
+        let explicit = self.outcome.required_checks.as_deref().unwrap_or(&[]);
+        if self.outcome.required_checks.is_some()
+            && (self.outcome.blocking.is_some() || !self.outcome.extra.is_empty())
+        {
             return Err(invalid(
                 self,
-                format!("outcome allows at most {MAX_REQUIRED_CHECKS} required_checks"),
+                "required_checks cannot be combined with blocking or extra; use required_checks alone for an explicit list, or blocking/extra",
             ));
         }
-        let mut seen = HashSet::new();
-        for check in &self.outcome.required_checks {
-            if check.chars().any(char::is_control) {
+        if self.outcome.blocking == Some(Blocking::All) && !self.outcome.extra.is_empty() {
+            return Err(invalid(
+                self,
+                "extra has no effect with blocking = \"all\"; remove it",
+            ));
+        }
+        for (field, list) in [
+            ("required_checks", explicit),
+            ("extra", &self.outcome.extra[..]),
+        ] {
+            if list.len() > MAX_REQUIRED_CHECKS {
                 return Err(invalid(
                     self,
-                    "required_checks entry must not contain control characters",
+                    format!("outcome allows at most {MAX_REQUIRED_CHECKS} {field}"),
                 ));
             }
-            if char_len(check) > MAX_REQUIRED_CHECK_LEN {
-                return Err(invalid(
-                    self,
-                    format!(
-                        "required_checks entry must be at most {MAX_REQUIRED_CHECK_LEN} characters"
-                    ),
-                ));
-            }
-            if check.trim().is_empty() || has_edge_whitespace(check) {
-                return Err(invalid(
-                    self,
-                    "required_checks must not contain empty or untrimmed names",
-                ));
-            }
-            if !seen.insert(check.as_str()) {
-                return Err(invalid(
-                    self,
-                    format!("duplicate required_checks entry `{check}`"),
-                ));
+            let mut seen = HashSet::new();
+            for check in list {
+                if check.chars().any(char::is_control) {
+                    return Err(invalid(
+                        self,
+                        format!("{field} entry must not contain control characters"),
+                    ));
+                }
+                if char_len(check) > MAX_REQUIRED_CHECK_LEN {
+                    return Err(invalid(
+                        self,
+                        format!(
+                            "{field} entry must be at most {MAX_REQUIRED_CHECK_LEN} characters"
+                        ),
+                    ));
+                }
+                if check.trim().is_empty() || has_edge_whitespace(check) {
+                    return Err(invalid(
+                        self,
+                        format!("{field} must not contain empty or untrimmed names"),
+                    ));
+                }
+                if !seen.insert(check.as_str()) {
+                    return Err(invalid(self, format!("duplicate {field} entry `{check}`")));
+                }
             }
         }
         if self.outcome.mode == OutcomeMode::MergeWhen {
             if self.judge.is_empty() {
                 return Err(invalid(self, "merge_when requires at least one judge"));
             }
-            if self.outcome.required_checks.is_empty() {
+            if self
+                .outcome
+                .required_checks
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+            {
                 return Err(invalid(
                     self,
-                    "merge_when requires a non-empty required_checks list",
+                    "merge_when requires blocking checks: an explicit empty required_checks list blocks nothing",
                 ));
             }
         }
@@ -747,6 +823,116 @@ mode = "draft_pr"
         assert!(flow.retry_on.is_empty());
         assert!(flow.judge.is_empty());
         assert_eq!(flow.outcome.merge_method, MergeMethod::Merge);
+    }
+
+    fn with_outcome(lines: &str) -> String {
+        minimal().replace(
+            "mode = \"draft_pr\"",
+            &format!("mode = \"draft_pr\"\n{lines}"),
+        )
+    }
+
+    #[test]
+    fn the_blocking_default_is_the_branch_protection_and_the_list_is_the_explicit_form() {
+        let file = FlowFile::parse(&minimal()).unwrap();
+        assert_eq!(
+            file.flow[0].outcome.spec(),
+            BlockingSpec::Required { extra: &[] }
+        );
+        assert_eq!(file.flow[0].outcome.blocking, None);
+        let listed = FlowFile::parse(&with_outcome("required_checks = [\"a\", \"b\"]")).unwrap();
+        let expected = ["a".to_string(), "b".to_string()];
+        assert_eq!(
+            listed.flow[0].outcome.spec(),
+            BlockingSpec::Explicit(&expected)
+        );
+        let empty = FlowFile::parse(&with_outcome("required_checks = []")).unwrap();
+        assert_eq!(empty.flow[0].outcome.spec(), BlockingSpec::Explicit(&[]));
+        let all = FlowFile::parse(&with_outcome("blocking = \"all\"")).unwrap();
+        assert_eq!(all.flow[0].outcome.spec(), BlockingSpec::All);
+        let required = FlowFile::parse(&with_outcome("blocking = \"required\"")).unwrap();
+        assert_eq!(
+            required.flow[0].outcome.spec(),
+            BlockingSpec::Required { extra: &[] }
+        );
+    }
+
+    #[test]
+    fn extra_ratchets_the_required_checks_up_by_name() {
+        let file = FlowFile::parse(&with_outcome("extra = [\"lint\"]")).unwrap();
+        let expected = ["lint".to_string()];
+        assert_eq!(
+            file.flow[0].outcome.spec(),
+            BlockingSpec::Required { extra: &expected }
+        );
+        let explicit =
+            FlowFile::parse(&with_outcome("blocking = \"required\"\nextra = [\"lint\"]"));
+        assert!(explicit.is_ok());
+    }
+
+    #[test]
+    fn the_explicit_list_cannot_be_combined_with_blocking_or_extra() {
+        for lines in [
+            "required_checks = [\"a\"]\nblocking = \"all\"",
+            "required_checks = [\"a\"]\nblocking = \"required\"",
+            "required_checks = []\nextra = [\"b\"]",
+        ] {
+            let text = err_text(&with_outcome(lines));
+            assert!(
+                text.contains("required_checks cannot be combined with blocking or extra"),
+                "{lines}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_is_refused_with_all_and_its_names_follow_the_check_name_rules() {
+        let text = err_text(&with_outcome("blocking = \"all\"\nextra = [\"a\"]"));
+        assert!(text.contains("extra has no effect"), "{text}");
+        for (lines, reason) in [
+            (
+                "extra = [\"\"]",
+                "extra must not contain empty or untrimmed names",
+            ),
+            (
+                "extra = [\" a\"]",
+                "extra must not contain empty or untrimmed names",
+            ),
+            ("extra = [\"a\", \"a\"]", "duplicate extra entry `a`"),
+            (
+                "extra = [\"a\\u0001\"]",
+                "extra entry must not contain control characters",
+            ),
+        ] {
+            let text = err_text(&with_outcome(lines));
+            assert!(text.contains(reason), "{lines}: {text}");
+        }
+        let long = format!("extra = [\"{}\"]", "x".repeat(MAX_REQUIRED_CHECK_LEN + 1));
+        assert!(err_text(&with_outcome(&long)).contains("extra entry must be at most 200"));
+        let many: Vec<String> = (0..=MAX_REQUIRED_CHECKS)
+            .map(|n| format!("\"c{n}\""))
+            .collect();
+        let many = format!("extra = [{}]", many.join(","));
+        assert!(err_text(&with_outcome(&many)).contains("at most 64 extra"));
+    }
+
+    #[test]
+    fn unknown_blocking_values_are_rejected_and_merge_when_accepts_the_derived_forms() {
+        let text = err_text(&with_outcome("blocking = \"some\""));
+        assert!(text.contains("unknown variant"), "{text}");
+        for lines in [
+            "blocking = \"all\"",
+            "blocking = \"required\"",
+            "extra = [\"x\"]",
+        ] {
+            let text = with_outcome(lines)
+                .replace("draft_pr", "merge_when")
+                .replace(
+                    "[flow.outcome]",
+                    "[[flow.judge]]\nkind = \"nanna_clean\"\n\n[flow.outcome]",
+                );
+            assert!(FlowFile::parse(&text).is_ok(), "{lines}");
+        }
     }
 
     fn assert_unknown_field(text: &str) {
@@ -1261,17 +1447,32 @@ mode = "draft_pr"
             ),
             (
                 "empty required check",
-                |f| f.outcome.required_checks.push(String::new()),
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .get_or_insert_with(Vec::new)
+                        .push(String::new())
+                },
                 "empty or untrimmed",
             ),
             (
                 "untrimmed required check",
-                |f| f.outcome.required_checks.push(" x".into()),
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .get_or_insert_with(Vec::new)
+                        .push(" x".into())
+                },
                 "empty or untrimmed",
             ),
             (
                 "duplicate required check",
-                |f| f.outcome.required_checks.push("Tests".into()),
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .get_or_insert_with(Vec::new)
+                        .push("Tests".into())
+                },
                 "duplicate required_checks",
             ),
             (
@@ -1296,17 +1497,32 @@ mode = "draft_pr"
             ),
             (
                 "required check with a newline",
-                |f| f.outcome.required_checks.push("a\nb".into()),
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .get_or_insert_with(Vec::new)
+                        .push("a\nb".into())
+                },
                 "required_checks entry must not contain control characters",
             ),
             (
                 "required check with NUL",
-                |f| f.outcome.required_checks.push("a\0b".into()),
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .get_or_insert_with(Vec::new)
+                        .push("a\0b".into())
+                },
                 "required_checks entry must not contain control characters",
             ),
             (
                 "required check with a tab",
-                |f| f.outcome.required_checks.push("a\tb".into()),
+                |f| {
+                    f.outcome
+                        .required_checks
+                        .get_or_insert_with(Vec::new)
+                        .push("a\tb".into())
+                },
                 "required_checks entry must not contain control characters",
             ),
             (
@@ -1314,6 +1530,7 @@ mode = "draft_pr"
                 |f| {
                     f.outcome
                         .required_checks
+                        .get_or_insert_with(Vec::new)
                         .push("c".repeat(MAX_REQUIRED_CHECK_LEN + 1))
                 },
                 "required_checks entry must be at most 200 characters",
@@ -1321,9 +1538,11 @@ mode = "draft_pr"
             (
                 "too many required checks",
                 |f| {
-                    f.outcome.required_checks = (0..=MAX_REQUIRED_CHECKS)
-                        .map(|n| format!("check{n}"))
-                        .collect()
+                    f.outcome.required_checks = Some(
+                        (0..=MAX_REQUIRED_CHECKS)
+                            .map(|n| format!("check{n}"))
+                            .collect(),
+                    )
                 },
                 "at most 64 required_checks",
             ),
@@ -1449,6 +1668,7 @@ mode = "draft_pr"
                 |f| {
                     f.outcome
                         .required_checks
+                        .get_or_insert_with(Vec::new)
                         .push("\u{e9}".repeat(MAX_REQUIRED_CHECK_LEN + 1))
                 },
                 "required_checks entry must be at most 200 characters",
@@ -1478,8 +1698,8 @@ mode = "draft_pr"
             ),
             (
                 "merge_when without checks",
-                |f| f.outcome.required_checks.clear(),
-                "non-empty required_checks",
+                |f| f.outcome.required_checks = Some(Vec::new()),
+                "blocks nothing",
             ),
         ]
     }
@@ -1593,17 +1813,21 @@ mode = "draft_pr"
             ("required check at the cap", |f| {
                 f.outcome
                     .required_checks
+                    .get_or_insert_with(Vec::new)
                     .push("c".repeat(MAX_REQUIRED_CHECK_LEN))
             }),
             ("required check of 200 multi-byte characters", |f| {
                 f.outcome
                     .required_checks
+                    .get_or_insert_with(Vec::new)
                     .push("\u{e9}".repeat(MAX_REQUIRED_CHECK_LEN))
             }),
             ("required checks at the count cap", |f| {
-                f.outcome.required_checks = (0..MAX_REQUIRED_CHECKS)
-                    .map(|n| format!("check{n}"))
-                    .collect()
+                f.outcome.required_checks = Some(
+                    (0..MAX_REQUIRED_CHECKS)
+                        .map(|n| format!("check{n}"))
+                        .collect(),
+                )
             }),
             ("forbid glob at the cap", |f| {
                 if let Judge::Diff { forbid_paths, .. } = diff(f) {
@@ -1971,7 +2195,9 @@ mode = "draft_pr"
                             } else {
                                 OutcomeMode::DraftPr
                             },
-                            required_checks: checks.into_iter().collect(),
+                            required_checks: Some(checks.into_iter().collect()),
+                            blocking: None,
+                            extra: Vec::new(),
                             merge_method: method,
                         },
                     }

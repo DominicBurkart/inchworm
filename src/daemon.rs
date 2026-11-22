@@ -667,6 +667,7 @@ required_checks = ["build"]
                 ci: CiPolicy {
                     poll_interval: Duration::from_millis(5),
                     timeout: Duration::from_secs(5),
+                    settle: Duration::ZERO,
                 },
                 grace: Duration::from_millis(300),
             }
@@ -1633,6 +1634,9 @@ required_checks = ["build"]
         fn check_runs(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
             self.inner.check_runs(r, s)
         }
+        fn commit_statuses(&self, r: &str, s: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            self.inner.commit_statuses(r, s)
+        }
         fn mark_ready(&self, r: &str, n: u64) -> Result<(), GitHubError> {
             self.inner.mark_ready(r, n)
         }
@@ -1733,6 +1737,7 @@ required_checks = ["build"]
             ci: CiPolicy {
                 poll_interval: Duration::from_millis(5),
                 timeout: Duration::from_secs(120),
+                settle: Duration::ZERO,
             },
             grace: Duration::from_millis(300),
         };

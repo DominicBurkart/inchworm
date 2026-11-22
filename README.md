@@ -98,7 +98,7 @@ The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH
 - If the initial label swap on an issue fails, the daemon remembers that only in memory; after a restart a stale trigger label next to a finished run can start another run until the label is removed by hand. Known limitation.
 - Text from nanna, `gh` and judges has control characters and bidirectional override characters replaced and is capped before it is printed by `failures`, `run` or the daemon log, or posted to an issue.
 - Branch protection is compared by required check name only. A passing `validate --online` does not check `enforce_admins`, required reviews or app ids, so it says little about merge safety on its own.
-- Skipped, neutral, cancelled and unknown check conclusions are treated as red and fail the attempt as `ci_red`, even where GitHub branch protection accepts a skipped job (a path-filtered or conditional job). Do not list such a job in `required_checks`; there is no opt-in for treating `skipped` or `neutral` as green.
+- Skipped, neutral, cancelled and unknown check conclusions are treated as red and fail the attempt as `ci_red`, even where GitHub branch protection accepts a skipped job (a path-filtered or conditional job). This holds for the `required` form and for an explicit `required_checks` list: a skipped job fails the attempt. `blocking = "all"` is the exception: there a `skipped` or `neutral` check is satisfied, as it is for GitHub's own branch protection (nanna-coder's pull requests carry three skipped jobs), but it never counts as the one successful check `all` needs. Do not list a conditional job in `required_checks`.
 
 ## Platforms
 
@@ -150,7 +150,7 @@ For the global config it checks that `nanna_bin` is an executable file or, for a
 
 The repo-controlled files above (`.inchworm`, `.nanna` and everything read from them) are read only if no component of the path under the repository root is a symlink at the time of the check, each is a regular file, and each is read with a size cap: 256 KiB for `inchworm.toml`, 64 KiB for `protected.toml`, 4 KiB for a `.git` file. The symlink check is a walk of the path before the read, and only the final component is opened without following symlinks, so a directory swapped for a symlink between the walk and the read is not prevented. The global config may itself be a symlink (for example from home-manager), but must resolve to a regular file of at most 256 KiB.
 
-What a passing `validate` proves: the files inchworm reads are well formed, `inchworm.toml` and `.inchworm/**` are declared protected, and nothing it reads escapes the repository through a symlink. The `protected.toml` check mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` as of nanna-coder commit `239a1c94`; it does not run nanna's code, so a later change there is not tracked. Offline, it does not prove that identities named in flows exist or that labels exist (`--online` checks both), and no command checks that branch protection matches `required_checks`.
+What a passing `validate` proves: the files inchworm reads are well formed, `inchworm.toml` and `.inchworm/**` are declared protected, and nothing it reads escapes the repository through a symlink. The `protected.toml` check mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` as of nanna-coder commit `239a1c94`; it does not run nanna's code, so a later change there is not tracked. Offline, it does not prove that identities named in flows exist or that labels exist (`--online` checks both), and only `validate --online` compares branch protection with the flow's blocking checks.
 
 With `--online` it also checks that nanna has an `auditor` identity (`mcp-serve` refuses to start without one), warns when `ollama_url` is not the address nanna itself always uses (`http://localhost:11434`), checks that every step identity resolves with `nanna agents list --repo <path>` and that the trigger label and the `inchworm:running`, `inchworm:failed` and `inchworm:done` labels exist on GitHub (through `gh`). `--online` also compares each flow's `required_checks` with the required status checks of its base branch protection (`gh api repos/<slug>/branches/<base>/protection/required_status_checks`): a listed check the branch does not require is an error; an extra protected check or an unprotected base is a warning, and an error for `merge_when`; if the protection cannot be read because the repository is private on a plan without branch protection (HTTP 403 "Upgrade to GitHub Pro"), that is a warning for `draft_pr` flows and an error for `merge_when`; `--skip-branch-protection` skips the comparison. `--build-images` implies `--online` and runs `nix build git+file://<repo>#devContainerImage --no-link --no-write-lock-file` for each repo.
 
@@ -252,7 +252,7 @@ min_score = 7
 
 [flow.outcome]
 mode = "draft_pr"
-required_checks = ["Tests"]
+blocking = "all"
 ```
 
 - Required: `name`, `trigger`, at least one `step`, and `outcome` with its `mode`. Defaults: `base = "main"`, `max_attempts = 3`, `attempt_timeout_secs = 7200`. `retry_on` defaults to **empty**, so nothing is retried unless you list failure classes, even though `max_attempts` defaults to 3. `judge` defaults to none and `outcome.merge_method` to `merge`.
@@ -260,7 +260,13 @@ required_checks = ["Tests"]
 - Bounds, counted in characters, not bytes: a file holds at most 32 flows; a trigger label is at most 50 characters; a flow has at most 20 steps and at most 20 judges; a step name is at most 64 characters; a model is at most 100 characters; a rubric path is at most 200 characters; a `forbid_paths` glob is at most 200 characters and a diff judge has at most 256 of them; a `required_checks` entry is at most 200 characters and `outcome` has at most 64 of them. Step names, trigger labels, rubric paths, models, base branches, `forbid_paths` entries and `required_checks` entries may not contain control characters (newline, tab and NUL included).
 - A rubric must be a relative path under `.inchworm/` (no `..`, no absolute path), so agents, which cannot write `.inchworm/**`, cannot change what judges read.
 - `retry_on` may not repeat a class or list `cancelled` or `escalated`, and needs `max_attempts` of at least 2. `max_attempts` is 1 to 20 and `attempt_timeout_secs` is 1 to 604800.
-- `mode = "merge_when"` also requires at least one judge and a non-empty `required_checks`. See "Merging has no default" above.
+- `mode = "merge_when"` also requires at least one judge and blocking checks (an explicit empty `required_checks = []` blocks nothing and is refused). See "Merging has no default" above.
+- **Blocking checks** (`[flow.outcome]`): which CI checks must be green on the judged head SHA before the judges' outcome applies.
+  - `blocking = "required"` (the default when nothing else is set): exactly the required status checks of the flow's base branch, read from GitHub when the decision is made. If the branch protection cannot be read, does not exist or lists no checks, the decision fails closed: it never merges, never treats the run as green, and the attempt ends as `blocking_unresolved`. Add `extra = ["name", ...]` to ratchet up by name: the blocking set is the required checks plus those names (never fewer than required).
+  - `blocking = "all"`: every check run and every commit status reported on the judged SHA blocks. It is green only when at least one check succeeded, none is red or pending (`skipped` and `neutral` count as satisfied here and in no other form), every required name of the branch protection (when it can be read) is present, no check seen earlier has disappeared (that is `ci_red`), and no new check name has appeared for 60 seconds (`CiPolicy::settle`), because checks that have not started are invisible until GitHub reports them. A check that never appears within the 2 h limit fails as `timeout`. `extra` has no effect with `all` and is refused.
+  - `required_checks = [...]` is the explicit exact list and keeps its meaning (an empty list blocks nothing). It cannot be combined with `blocking` or `extra` (a config error, not a precedence rule). It can be weaker than the branch protection; `validate --online` warns when it is.
+  - For every form: only checks on the exact judged SHA count, a red run stays red even if a later run of the same name and SHA is green, and runs for other SHAs are ignored. `[merge] allow` remains the only grant for merging.
+  - `validate --online` prints the effective blocking set per flow as a `note:` line and reports an error when `blocking = "required"` could not resolve (branch protection missing, empty or unreadable).
 - Unknown keys are rejected everywhere.
 
 ## State store
@@ -277,14 +283,14 @@ Inchworm itself never applies, commits or pushes anything, and **publishing a pu
 
 1. Each step is an `assign_task` to nanna (previous summary and patch forwarded, previous failure on retries). The first failing step stops the attempt; the failure is classified into a `FailureClass` and retried per `retry_on` and `max_attempts`. A step output touching `.inchworm/**` or an `inchworm.toml` is rejected as `protected_path_violation`.
 2. The last step must leave a PR on `inchworm/<issue>-a<n>`. inchworm records its number and head SHA and the nanna report (denials, QA) and the attempt becomes `published`.
-3. inchworm polls the check-runs of that exact SHA until every name in `required_checks` has a finished run (30 s interval, 2 h limit). A red required check fails the attempt as `ci_red`, a timeout as `timeout`.
+3. inchworm resolves the flow's blocking checks (see "Blocking checks" above) and polls the check runs, plus the commit statuses for `blocking = "all"`, of that exact SHA until they are all green (30 s interval, 2 h limit). A red blocking check fails the attempt as `ci_red`, an unresolvable set as `blocking_unresolved`, a timeout as `timeout`.
 4. The judges (`diff`, `nanna_clean`, `llm`) run against the PR patch fetched from GitHub; the head must still equal the recorded SHA. Verdicts are stored per attempt. The LLM judge shares the single model permit with nanna dispatch.
 5. `policy::decide` picks the outcome. `draft_pr`: comment on the issue with the outcome, swap the labels to `inchworm:done`, leave the PR a draft, run ends `pr_open`. `merge_when` (only in a project that sets `[merge] allow = true`; otherwise the flow is a configuration error): `gh pr ready` then `gh pr merge <n> --match-head-commit <sha> --merge|--squash|--rebase`; never `--admin`; run ends `merged`. A rejection fails the attempt as `judge_rejected` or `merge_blocked` and retries if allowed.
 6. After the last attempt the issue gets `inchworm:failed` and a comment with the failure class.
 
 ## Known limitations
 
-- CI is read from check-runs on the head SHA. Legacy commit-status contexts (some coverage bots post those) are not read, so a `required_checks` entry that branch protection satisfies with a status context would wait until the CI timeout and fail as `timeout`.
+- CI is read from check-runs on the head SHA. Commit-status contexts (some coverage bots post those) are read only for `blocking = "all"`; for `required` and for an explicit list a name that branch protection satisfies with a status context would wait until the CI timeout and fail as `timeout`.
 - The PR of a rejected attempt stays open. A merge refused after `gh pr ready` marks the PR a draft again; if that undo fails the failure text says so.
 - The merge grant is `Denied` unless the project sets `[merge] allow = true`; no shipped config does.
 

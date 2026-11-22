@@ -76,6 +76,7 @@ pub trait GitHub {
     fn pr(&self, repo: &str, number: u64) -> Result<PullRequest, GitHubError>;
     fn pr_patch(&self, repo: &str, number: u64) -> Result<String, GitHubError>;
     fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError>;
+    fn commit_statuses(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError>;
     fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError>;
     fn mark_draft(&self, repo: &str, number: u64) -> Result<(), GitHubError>;
     fn merge_pr(
@@ -95,6 +96,32 @@ pub trait GitHub {
 }
 
 #[derive(Deserialize)]
+struct WireStatus {
+    context: String,
+    state: String,
+}
+
+/// ```
+/// use inchworm::github::status_conclusion;
+/// use inchworm::policy::CheckConclusion;
+///
+/// assert_eq!(status_conclusion("success"), CheckConclusion::Success);
+/// assert_eq!(status_conclusion("pending"), CheckConclusion::Pending);
+/// assert_eq!(status_conclusion("failure"), CheckConclusion::Failure);
+/// assert_eq!(status_conclusion("error"), CheckConclusion::Failure);
+/// assert_eq!(status_conclusion("anything else"), CheckConclusion::Failure);
+/// ```
+pub fn status_conclusion(state: &str) -> CheckConclusion {
+    if state.eq_ignore_ascii_case("success") {
+        CheckConclusion::Success
+    } else if state.eq_ignore_ascii_case("pending") {
+        CheckConclusion::Pending
+    } else {
+        CheckConclusion::Failure
+    }
+}
+
+#[derive(Deserialize)]
 struct WireCheckRun {
     name: String,
     status: String,
@@ -107,8 +134,8 @@ struct WireCheckRun {
 /// use inchworm::policy::CheckConclusion;
 ///
 /// assert_eq!(check_conclusion("completed", Some("success")), CheckConclusion::Success);
-/// assert_eq!(check_conclusion("completed", Some("skipped")), CheckConclusion::Failure);
-/// assert_eq!(check_conclusion("completed", Some("neutral")), CheckConclusion::Failure);
+/// assert_eq!(check_conclusion("completed", Some("skipped")), CheckConclusion::Skipped);
+/// assert_eq!(check_conclusion("completed", Some("neutral")), CheckConclusion::Skipped);
 /// assert_eq!(check_conclusion("completed", Some("timed_out")), CheckConclusion::Failure);
 /// assert_eq!(check_conclusion("in_progress", None), CheckConclusion::Pending);
 /// ```
@@ -429,6 +456,30 @@ impl<R: Runner> GitHub for GhCli<R> {
             .collect()
     }
 
+    fn commit_statuses(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
+        let endpoint = format!("repos/{repo}/commits/{sha}/statuses");
+        #[rustfmt::skip]
+        let args = ["api", "--paginate", &endpoint, "--jq", ".[] | {context, state}"];
+        let out = self.run(&args)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut statuses = Vec::new();
+        for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let wire: WireStatus =
+                serde_json::from_str(line).map_err(|err| GitHubError::Parse {
+                    command: format!("{} {}", self.program, args.join(" ")),
+                    detail: err.to_string(),
+                })?;
+            if seen.insert(wire.context.clone()) {
+                statuses.push(CheckRun {
+                    conclusion: status_conclusion(&wire.state),
+                    name: wire.context,
+                    head_sha: sha.to_string(),
+                });
+            }
+        }
+        Ok(statuses)
+    }
+
     fn mark_ready(&self, repo: &str, number: u64) -> Result<(), GitHubError> {
         let number = number.to_string();
         self.run(&["pr", "ready", &number, "-R", repo]).map(|_| ())
@@ -488,6 +539,8 @@ struct FakeState {
     comments: Vec<(String, u64, String)>,
     patches: BTreeMap<(String, u64), String>,
     check_polls: BTreeMap<(String, String), Vec<Vec<CheckRun>>>,
+    status_polls: BTreeMap<(String, String), Vec<Vec<CheckRun>>>,
+    status_error: Option<String>,
     ready: Vec<(String, u64)>,
     drafted: Vec<(String, u64)>,
     ready_error: Option<String>,
@@ -633,6 +686,19 @@ impl FakeGitHub {
 
     pub fn fail_check_runs_with(&self, message: &str) {
         self.state.lock().unwrap().check_error = Some(message.to_string());
+    }
+
+    pub fn fail_commit_statuses_with(&self, message: &str) {
+        self.state.lock().unwrap().status_error = Some(message.to_string());
+    }
+
+    /// Successive answers for `commit_statuses` on one commit; the last answer repeats.
+    pub fn set_status_polls(&self, repo: &str, sha: &str, polls: Vec<Vec<CheckRun>>) {
+        self.state
+            .lock()
+            .unwrap()
+            .status_polls
+            .insert((repo.to_string(), sha.to_string()), polls);
     }
 
     pub fn ready_calls(&self) -> Vec<(String, u64)> {
@@ -816,6 +882,25 @@ impl GitHub for FakeGitHub {
         }
         let polls = state
             .check_polls
+            .entry((repo.to_string(), sha.to_string()))
+            .or_default();
+        Ok(if polls.len() > 1 {
+            polls.remove(0)
+        } else {
+            polls.first().cloned().unwrap_or_default()
+        })
+    }
+
+    fn commit_statuses(&self, repo: &str, sha: &str) -> Result<Vec<CheckRun>, GitHubError> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(message) = state.status_error.clone() {
+            return Err(GitHubError::Command {
+                command: format!("gh api statuses {sha}"),
+                detail: message,
+            });
+        }
+        let polls = state
+            .status_polls
             .entry((repo.to_string(), sha.to_string()))
             .or_default();
         Ok(if polls.len() > 1 {
@@ -1248,6 +1333,72 @@ mod tests {
             gh.check_runs("o/r", "abc123").unwrap_err(),
             GitHubError::Parse { .. }
         ));
+    }
+
+    #[test]
+    fn gh_reads_commit_statuses_keeping_only_the_newest_per_context() {
+        let lines = concat!(
+            r#"{"context":"coverage","state":"success"}"#,
+            "\n",
+            r#"{"context":"bot","state":"pending"}"#,
+            "\n",
+            r#"{"context":"coverage","state":"failure"}"#,
+            "\n",
+            r#"{"context":"old","state":"error"}"#,
+            "\n",
+            r#"{"context":"bot","state":"success"}"#,
+            "\n",
+        );
+        let gh = GhCli::with_runner(ScriptedRunner::new(vec![
+            ScriptedRunner::ok(lines),
+            ScriptedRunner::ok("not json\n"),
+            ScriptedRunner::fail("HTTP 404"),
+        ]));
+        let statuses = gh.commit_statuses("o/r", "abc123").unwrap();
+        let summary: Vec<_> = statuses
+            .iter()
+            .map(|r| (r.name.as_str(), r.conclusion))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("coverage", CheckConclusion::Success),
+                ("bot", CheckConclusion::Pending),
+                ("old", CheckConclusion::Failure)
+            ]
+        );
+        assert!(statuses.iter().all(|r| r.head_sha == "abc123"));
+        assert_eq!(
+            gh.runner.calls()[0],
+            "gh api --paginate repos/o/r/commits/abc123/statuses --jq .[] | {context, state}"
+        );
+        assert!(matches!(
+            gh.commit_statuses("o/r", "abc123").unwrap_err(),
+            GitHubError::Parse { .. }
+        ));
+        assert!(gh.commit_statuses("o/r", "abc123").is_err());
+    }
+
+    #[test]
+    fn the_fake_replays_status_polls_and_can_fail() {
+        let fake = FakeGitHub::new();
+        assert!(fake.commit_statuses("o/r", "s").unwrap().is_empty());
+        let one = CheckRun {
+            name: "a".into(),
+            head_sha: "s".into(),
+            conclusion: CheckConclusion::Success,
+        };
+        fake.set_status_polls("o/r", "s", vec![vec![], vec![one.clone()]]);
+        assert!(fake.commit_statuses("o/r", "s").unwrap().is_empty());
+        assert_eq!(fake.commit_statuses("o/r", "s").unwrap(), vec![one.clone()]);
+        assert_eq!(fake.commit_statuses("o/r", "s").unwrap(), vec![one]);
+        fake.fail_commit_statuses_with("HTTP 502");
+        assert!(
+            fake.commit_statuses("o/r", "s")
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 502")
+        );
     }
 
     #[test]

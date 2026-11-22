@@ -570,7 +570,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".nanna")).unwrap();
         std::fs::write(
             repo.join("inchworm.toml"),
-            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+            "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []\n",
         )
         .unwrap();
         std::fs::write(
@@ -1128,7 +1128,7 @@ mod tests {
         let f = fakes();
         let path = f.setup.repo.join("inchworm.toml");
         let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("[[flow]]\nname = \"second\"\ntrigger = { kind = \"label\", label = \"second-label\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n");
+        text.push_str("[[flow]]\nname = \"second\"\ntrigger = { kind = \"label\", label = \"second-label\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []\n");
         std::fs::write(&path, text).unwrap();
         let (code, out, err) = f.args(&["run", "o/r", "5"]);
         assert_eq!(code, EXIT_VALID, "{out} {err}");
