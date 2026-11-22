@@ -77,7 +77,9 @@ pub fn evaluate_required(required: &[String], runs: &[CheckRun], sha: &str) -> C
         {
             seen = true;
             match run.conclusion {
-                CheckConclusion::Failure => return CiStatus::Red(name.clone()),
+                CheckConclusion::Failure | CheckConclusion::Skipped => {
+                    return CiStatus::Red(name.clone());
+                }
                 CheckConclusion::Pending => pending = true,
                 CheckConclusion::Success => {}
             }
@@ -535,10 +537,9 @@ pub async fn conclude(
         Resolved::Names(names) => names.clone(),
         Resolved::All { .. } => {
             let mut seen: Vec<String> = Vec::new();
-            for run in checks
-                .iter()
-                .filter(|run| run.head_sha.eq_ignore_ascii_case(sha))
-            {
+            for run in checks.iter().filter(|run| {
+                run.head_sha.eq_ignore_ascii_case(sha) && run.conclusion == CheckConclusion::Success
+            }) {
                 if !seen.contains(&run.name) {
                     seen.push(run.name.clone());
                 }
@@ -2003,6 +2004,10 @@ mod round2_safety {
     }
 
     async fn conclude_on(gh: &Proxy, flow: &Flow) -> (Concluded, Store) {
+        conclude_with_settle(gh, flow, Duration::ZERO).await
+    }
+
+    async fn conclude_with_settle(gh: &Proxy, flow: &Flow, settle: Duration) -> (Concluded, Store) {
         let store = Store::open_in_memory().unwrap();
         let clock = FakeClock::new(1_000);
         let scorer = FakeScorer::new();
@@ -2036,7 +2041,9 @@ mod round2_safety {
             },
         };
         let mut warnings = Vec::new();
-        let concluded = conclude(&ctx, &env(&scorer), flow, &published, &mut warnings)
+        let mut outcome_env = env(&scorer);
+        outcome_env.ci.settle = settle;
+        let concluded = conclude(&ctx, &outcome_env, flow, &published, &mut warnings)
             .await
             .unwrap();
         (concluded, store)
@@ -2370,6 +2377,121 @@ mod round2_safety {
     }
 
     #[tokio::test]
+    async fn all_treats_skipped_and_neutral_checks_as_satisfied_but_never_as_the_success() {
+        let github = github_with_issue();
+        github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        github.set_pr_patch("o/r", 77, SMALL);
+        github.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("build", CheckConclusion::Success),
+                check("release", CheckConclusion::Skipped),
+            ],
+        );
+        let gh = Proxy {
+            inner: github,
+            merge_applies_then_errors: AtomicBool::new(false),
+            pr_read_fails_after_ready: AtomicBool::new(false),
+        };
+        let (concluded, _) = conclude_on(&gh, &flow_blocking("blocking = \"all\"")).await;
+        assert!(
+            matches!(concluded, Concluded::Accepted { .. }),
+            "{concluded:?}"
+        );
+
+        let gh = github_with_issue();
+        gh.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+        gh.set_pr_patch("o/r", 77, SMALL);
+        gh.push_check_poll(
+            "o/r",
+            SHA,
+            vec![
+                check("release", CheckConclusion::Skipped),
+                check("scan", CheckConclusion::Skipped),
+            ],
+        );
+        let only_skipped = Proxy {
+            inner: gh,
+            merge_applies_then_errors: AtomicBool::new(false),
+            pr_read_fails_after_ready: AtomicBool::new(false),
+        };
+        let (class, raw) = rejected(&only_skipped, &flow_blocking("blocking = \"all\"")).await;
+        assert_eq!(class, FailureClass::Timeout, "{raw}");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_check_stays_red_for_the_required_form_and_the_explicit_list() {
+        for lines in ["", "required_checks = [\"build\"]"] {
+            let github = github_with_issue();
+            github.add_pr("o/r", "inchworm/5-a1", pr_at(77, SHA));
+            github.set_pr_patch("o/r", 77, SMALL);
+            github.set_protection("o/r", "main", &["build"]);
+            github.push_check_poll("o/r", SHA, vec![check("build", CheckConclusion::Skipped)]);
+            let gh = Proxy {
+                inner: github,
+                merge_applies_then_errors: AtomicBool::new(false),
+                pr_read_fails_after_ready: AtomicBool::new(false),
+            };
+            let (class, raw) = rejected(&gh, &flow_blocking(lines)).await;
+            assert_eq!(class, FailureClass::CiRed, "{lines}: {raw}");
+        }
+    }
+
+    #[test]
+    fn evaluate_required_treats_a_skipped_required_check_as_red() {
+        let skipped = [CheckRun {
+            name: "build".into(),
+            head_sha: SHA.into(),
+            conclusion: CheckConclusion::Skipped,
+        }];
+        assert_eq!(
+            evaluate_required(&["build".to_string()], &skipped, SHA),
+            CiStatus::Red("build".into())
+        );
+    }
+
+    #[test]
+    fn the_shipped_quiet_period_is_sixty_seconds() {
+        assert_eq!(CiPolicy::default().settle, Duration::from_secs(60));
+        assert_eq!(CiPolicy::default().poll_interval, Duration::from_secs(30));
+        assert_eq!(
+            CiPolicy::default().timeout,
+            Duration::from_secs(2 * 60 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn conclude_honours_the_quiet_period_it_is_given() {
+        let gh = proxy(SMALL);
+        let (class, raw) = {
+            match conclude_with_settle(
+                &gh,
+                &flow_blocking("blocking = \"all\""),
+                Duration::from_secs(120),
+            )
+            .await
+            .0
+            {
+                Concluded::Rejected { class, raw } => (class, raw),
+                other => panic!("expected a rejection, got {other:?}"),
+            }
+        };
+        assert_eq!(class, FailureClass::Timeout, "{raw}");
+        let gh = proxy(SMALL);
+        let (concluded, _) = conclude_with_settle(
+            &gh,
+            &flow_blocking("blocking = \"all\""),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            matches!(concluded, Concluded::Accepted { .. }),
+            "{concluded:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_check_that_vanishes_before_the_decision_is_ci_red_with_a_clear_reason() {
         let gh = proxy(SMALL);
         gh.inner.set_status_polls(
@@ -2407,10 +2529,15 @@ mod round2_safety {
     }
 
     #[test]
-    fn only_success_is_green_for_every_other_conclusion_github_can_report() {
+    fn only_success_is_green_and_skipped_or_neutral_are_their_own_state() {
+        for conclusion in ["skipped", "neutral", "SKIPPED"] {
+            assert_eq!(
+                CheckConclusion::from_github("completed", Some(conclusion)),
+                CheckConclusion::Skipped,
+                "{conclusion}"
+            );
+        }
         for conclusion in [
-            "skipped",
-            "neutral",
             "cancelled",
             "timed_out",
             "action_required",

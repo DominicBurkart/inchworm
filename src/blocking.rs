@@ -77,9 +77,10 @@ pub enum AllStatus {
 /// Decides when "every check on this commit" is settled.
 ///
 /// Checks that have not started are invisible until GitHub reports them, so the set is only
-/// trusted after it has stopped changing: green needs at least one check, none red or pending,
-/// every required name present, no check seen earlier gone again, and no new check name for
-/// `quiet` seconds.
+/// trusted after it has stopped changing: green needs at least one successful check, none red
+/// or pending, every required name present, no check seen earlier gone again, and no new check
+/// name for `quiet` seconds. A `skipped` or `neutral` check is satisfied, as it is for GitHub's
+/// own branch protection, but it never counts as the successful check.
 ///
 /// ```
 /// use inchworm::blocking::{AllStatus, Settler};
@@ -122,6 +123,9 @@ impl Settler {
             .filter(|run| run.head_sha.eq_ignore_ascii_case(sha))
             .collect();
         let names: BTreeSet<String> = here.iter().map(|run| run.name.clone()).collect();
+        let any_success = here
+            .iter()
+            .any(|run| run.conclusion == CheckConclusion::Success);
         if let Some(run) = here
             .iter()
             .find(|run| run.conclusion == CheckConclusion::Failure)
@@ -153,7 +157,7 @@ impl Settler {
         let settled = self
             .changed_at
             .is_some_and(|at| now.saturating_sub(at) >= self.quiet);
-        if names.is_empty() || !settled {
+        if !any_success || !settled {
             return AllStatus::Waiting(Vec::new());
         }
         AllStatus::Green
@@ -346,6 +350,30 @@ mod tests {
         assert_eq!(
             settler.observe(&[], &[old, upper], SHA, 1),
             AllStatus::Green
+        );
+    }
+
+    #[test]
+    fn skipped_checks_are_satisfied_but_a_set_of_only_skipped_checks_is_never_green() {
+        let skipped = |name: &str| run(name, SHA, CheckConclusion::Skipped);
+        let mut settler = Settler::new(0);
+        assert_eq!(
+            settler.observe(&[], &[ok("build"), skipped("release")], SHA, 0),
+            AllStatus::Green
+        );
+        let mut settler = Settler::new(0);
+        assert_eq!(
+            settler.observe(&[], &[skipped("release"), skipped("scan")], SHA, 0),
+            AllStatus::Waiting(vec![])
+        );
+        let mut settler = Settler::new(0);
+        assert_eq!(
+            settler.observe(&[], &[ok("build"), skipped("release")], SHA, 0),
+            AllStatus::Green
+        );
+        assert_eq!(
+            settler.observe(&[], &[ok("build")], SHA, 1),
+            AllStatus::Vanished("release".into())
         );
     }
 

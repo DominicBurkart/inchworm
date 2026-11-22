@@ -134,8 +134,8 @@ struct WireCheckRun {
 /// use inchworm::policy::CheckConclusion;
 ///
 /// assert_eq!(check_conclusion("completed", Some("success")), CheckConclusion::Success);
-/// assert_eq!(check_conclusion("completed", Some("skipped")), CheckConclusion::Failure);
-/// assert_eq!(check_conclusion("completed", Some("neutral")), CheckConclusion::Failure);
+/// assert_eq!(check_conclusion("completed", Some("skipped")), CheckConclusion::Skipped);
+/// assert_eq!(check_conclusion("completed", Some("neutral")), CheckConclusion::Skipped);
 /// assert_eq!(check_conclusion("completed", Some("timed_out")), CheckConclusion::Failure);
 /// assert_eq!(check_conclusion("in_progress", None), CheckConclusion::Pending);
 /// ```
