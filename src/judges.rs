@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +57,18 @@ impl Verdict {
             passed: false,
             score: None,
             detail: detail.to_string(),
+            index: 0,
+            step: None,
+            model_error: false,
+        }
+    }
+
+    pub fn from_parts(judge: String, passed: bool, score: Option<u8>, detail: String) -> Verdict {
+        Verdict {
+            judge,
+            passed,
+            score,
+            detail,
             index: 0,
             step: None,
             model_error: false,
@@ -424,6 +437,25 @@ pub trait Scorer {
     ) -> impl Future<Output = Result<String, LlmError>> + Send;
 }
 
+pub type ScoreFuture<'a> = Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + 'a>>;
+
+pub trait DynScorer: Send + Sync {
+    fn complete_dyn<'a>(&'a self, model: &'a str, prompt: &'a str) -> ScoreFuture<'a>;
+}
+
+impl<S: Scorer + Send + Sync> DynScorer for S {
+    fn complete_dyn<'a>(&'a self, model: &'a str, prompt: &'a str) -> ScoreFuture<'a> {
+        Box::pin(self.complete(model, prompt))
+    }
+}
+
+impl Scorer for &dyn DynScorer {
+    async fn complete(&self, model: &str, prompt: &str) -> Result<String, LlmError> {
+        let inner: &dyn DynScorer = *self;
+        inner.complete_dyn(model, prompt).await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
     base_url: String,
@@ -730,6 +762,25 @@ mod tests {
         assert!(!diff_judge(mode, 100, &["publish.sh".to_string()]).passed);
         let deleted = "diff --git a/publish.sh b/publish.sh\ndeleted file mode 100644\n--- a/publish.sh\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
         assert!(!diff_judge(deleted, 100, &["publish.sh".to_string()]).passed);
+    }
+
+    #[test]
+    fn git_headers_with_quotes_or_missing_halves_are_unparsable_and_fail_closed() {
+        for header in [
+            "diff --git \"a/x y\" \"b/x y\"\n",
+            "diff --git a\\x b\\x\n",
+            "diff --git x\n",
+            "diff --git aaaaaaaa\n",
+        ] {
+            assert!(patch_stats(header).unparsable_header, "{header}");
+            assert!(!diff_judge(header, 10, &[]).passed);
+        }
+    }
+
+    #[test]
+    fn invalid_forbid_globs_fail_closed() {
+        let verdict = diff_judge(&patch("a.rs", 1, 0), 10, &["[".to_string()]);
+        assert!(!verdict.passed && verdict.detail.contains("invalid forbid_paths"));
     }
 
     #[test]

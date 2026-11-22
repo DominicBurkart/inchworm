@@ -3,19 +3,24 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
+use crate::clock::{Clock, SystemClock};
 use crate::config::{GlobalConfig, LEGACY_FLOWS_FILE, PROJECT_FILE, ProjectConfig, RepoEntry};
+use crate::daemon::{DaemonDeps, DaemonSettings, NannaFactory, run_daemon};
 use crate::github::GhCli;
-use crate::model::RunState;
+use crate::judges::OllamaClient;
+use crate::model::{RunState, sanitize_text};
 use crate::nanna_client::{NannaClient, SpawnOptions, state_dir_for};
 use crate::online::{ImageBuilder, NannaCatalog, NixBuilder, Online, validate_online};
+use crate::outcome::{CiPolicy, OutcomeEnv};
 use crate::run::{RunContext, preflight, run_issue};
-use crate::store::Store;
-use crate::validate::validate;
+use crate::stats::{parse_class, render_failures, render_stats, render_status};
+use crate::store::{DaemonLock, Store};
+use crate::validate::{resolve_command, validate};
 
 pub const EXIT_VALID: u8 = 0;
 pub const EXIT_REPO_ERRORS: u8 = 1;
@@ -72,6 +77,12 @@ pub struct Cli {
 }
 
 #[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct ValidateArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -83,6 +94,11 @@ pub struct ValidateArgs {
                 This evaluates the repository's own Nix code on this machine; use it only on repositories you trust."
     )]
     pub build_images: bool,
+    #[arg(
+        long,
+        help = "With --online, do not compare each flow's required_checks with the branch protection of its base branch."
+    )]
+    pub skip_branch_protection: bool,
 }
 
 #[derive(Debug, Args)]
@@ -95,17 +111,38 @@ pub struct RunArgs {
     pub flow: Option<String>,
 }
 
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub window: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct FailuresArgs {
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub class: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Check the global config and every registered repository.
     Validate(ValidateArgs),
-    /// Run one flow for one issue in the foreground. It dispatches the steps to nanna; it does not run an auditor, an offramp, a judge, CI waiting or the outcome policy.
+    /// Run one flow for one issue in the foreground: dispatch the steps to nanna, wait for CI, run the judges and apply the outcome. It does not run an auditor or an offramp.
     Run(RunArgs),
     /// List the registered directories (slug, then path, tab separated).
-    List {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+    List(ConfigArgs),
+    /// Show the runs that are queued or in flight and the most recent ones.
+    Status(ConfigArgs),
+    /// Show success rates per repository and flow.
+    Stats(StatsArgs),
+    /// Show failure counts per class and the most recent failures.
+    Failures(FailuresArgs),
+    /// Poll the registered repositories and run issues until stopped by SIGTERM or SIGINT.
+    Daemon(ConfigArgs),
 }
 
 /// Runs the CLI and returns the process exit code: 0 when everything is
@@ -139,11 +176,29 @@ where
         }
     };
     match cli.command {
-        Command::Validate(args) => {
-            validate_command(args.config, args.online, args.build_images, env, out, err)
-        }
-        Command::List { config } => list_command(config, env, out, err),
+        Command::Validate(args) => validate_command(args, env, out, err),
+        Command::List(args) => list_command(args.config, env, out, err),
         Command::Run(args) => run_entry(args, env, out, err),
+        Command::Status(args) => report_command(args.config, env, out, err, |store, _| {
+            Ok(render_status(store)?)
+        }),
+        Command::Stats(args) => report_command(args.config, env, out, err, |store, _| {
+            Ok(render_stats(
+                store,
+                SystemClock.now(),
+                args.window.as_deref(),
+            )?)
+        }),
+        Command::Failures(args) => match args.class.as_deref().map(parse_class).transpose() {
+            Ok(class) => report_command(args.config, env, out, err, |store, _| {
+                Ok(render_failures(store, class)?)
+            }),
+            Err(error) => {
+                let _ = writeln!(err, "error: {error}");
+                EXIT_UNUSABLE
+            }
+        },
+        Command::Daemon(args) => daemon_entry(args.config, env, err),
     }
 }
 
@@ -225,14 +280,13 @@ fn list_command(
     EXIT_VALID
 }
 
-fn validate_command(
-    config: Option<PathBuf>,
-    online: bool,
-    build_images: bool,
-    env: &Env,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> u8 {
+fn validate_command(args: ValidateArgs, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let ValidateArgs {
+        config,
+        online,
+        build_images,
+        skip_branch_protection,
+    } = args;
     let config = match load_config(config, env) {
         Ok(config) => config,
         Err(message) => {
@@ -247,6 +301,7 @@ fn validate_command(
         let online = Online {
             catalog: &catalog,
             github: &github,
+            branch_protection: !skip_branch_protection,
             builder: build_images.then_some(&builder as &dyn ImageBuilder),
         };
         validate_online(&config, &online, env.path.as_deref())
@@ -261,6 +316,114 @@ fn validate_command(
     }
 }
 
+fn prepare_state(config: &GlobalConfig, env: &Env) -> Result<PathBuf> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let state_db = config.state_db_path(env.home.as_deref())?;
+    if let Some(parent) = state_db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot restrict {}", parent.display()))?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&state_db)
+        .with_context(|| format!("cannot create {}", state_db.display()))?;
+    std::fs::set_permissions(&state_db, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict {}", state_db.display()))?;
+    Ok(state_db)
+}
+
+fn report_command(
+    config: Option<PathBuf>,
+    env: &Env,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    report: impl FnOnce(&Store, &GlobalConfig) -> Result<String>,
+) -> u8 {
+    let config = match load_config(config, env) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return EXIT_UNUSABLE;
+        }
+    };
+    let text = prepare_state(&config, env)
+        .and_then(|state_db| Ok(Store::open(&state_db)?))
+        .and_then(|store| report(&store, &config));
+    match text {
+        Ok(text) => {
+            let _ = write!(out, "{text}");
+            EXIT_VALID
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: {error:#}");
+            EXIT_UNUSABLE
+        }
+    }
+}
+
+const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn termination_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+fn daemon_entry(config: Option<PathBuf>, env: &Env, err: &mut dyn Write) -> u8 {
+    let config = match load_config(config, env) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return EXIT_UNUSABLE;
+        }
+    };
+    match daemon_command(config, env, termination_signal) {
+        Ok(()) => EXIT_VALID,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error:#}");
+            EXIT_UNUSABLE
+        }
+    }
+}
+
+fn daemon_command<S: std::future::Future<Output = ()>>(
+    config: GlobalConfig,
+    env: &Env,
+    shutdown: impl FnOnce() -> std::io::Result<S>,
+) -> Result<()> {
+    resolve_command(&config.nanna_bin, env.path.as_deref()).map_err(|message| anyhow!(message))?;
+    let state_db = prepare_state(&config, env)?;
+    let mut spawn_options = SpawnOptions::new(config.nanna_bin.clone(), state_dir_for(&state_db));
+    if let Some(home) = &env.home {
+        spawn_options = spawn_options.with_home(home);
+    }
+    let settings = DaemonSettings::from_config(&config, state_db);
+    let deps = DaemonDeps {
+        github: Arc::new(GhCli::with_program(env.gh.as_deref().unwrap_or("gh"))),
+        clock: Arc::new(SystemClock),
+        dispatchers: Arc::new(NannaFactory::new(spawn_options)),
+        scorer: Arc::new(OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)?),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let _entered = runtime.enter();
+    let shutdown = shutdown().context("cannot install the termination signal handlers")?;
+    runtime.block_on(run_daemon(settings, deps, shutdown))?;
+    Ok(())
+}
+
 fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEntry> {
     for repo in &config.repo {
         if repo.slug == selector || repo.path == Path::new(selector) {
@@ -268,13 +431,6 @@ fn find_repo<'a>(config: &'a GlobalConfig, selector: &str) -> Result<&'a RepoEnt
         }
     }
     Err(anyhow!("repo `{selector}` is not in the config"))
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 fn install_interrupt() -> Result<Arc<AtomicBool>> {
@@ -328,20 +484,17 @@ fn run_command(
         )
     })?;
 
-    let state_db = config.state_db_path(env.home.as_deref())?;
-    if let Some(parent) = state_db.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
+    let state_db = prepare_state(&config, env)?;
+    let _lock = DaemonLock::acquire(&state_db)?;
     let store = Store::open(&state_db)?;
     let github = GhCli::with_program(env.gh.as_deref().unwrap_or("gh"));
-    let clock = now;
+    let clock = SystemClock;
     let ctx = RunContext {
         store: &store,
         github: &github,
         slug: &repo.slug,
         repo_path: &repo.path,
-        now: &clock,
+        clock: &clock,
     };
     preflight(&ctx, selected, issue)?;
     let mut spawn_options = SpawnOptions::new(config.nanna_bin.clone(), state_dir_for(&state_db));
@@ -353,7 +506,17 @@ fn run_command(
     client.set_interrupt(install_interrupt()?);
     client.initialize()?;
 
-    let summary = run_issue(&ctx, selected, issue, &mut client)?;
+    let scorer = OllamaClient::new(&config.ollama_url, OLLAMA_TIMEOUT)?;
+    let outcome_env = OutcomeEnv {
+        scorer: &scorer,
+        model_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        ci: CiPolicy::default(),
+        merge_grant: file.merge.grant(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let summary = runtime.block_on(run_issue(&ctx, &outcome_env, selected, issue, &mut client))?;
     let _ = writeln!(
         out,
         "run {} for {}#{issue}: {} after {} attempt(s)",
@@ -363,16 +526,13 @@ fn run_command(
         let _ = writeln!(out, "pull request: {} (head {})", pr.url, pr.head_sha);
     }
     if let Some((class, raw)) = &summary.failure {
-        let _ = writeln!(out, "failure: {class}: {raw}");
+        let _ = writeln!(out, "failure: {class}: {}", sanitize_text(raw, 2000));
     }
     for warning in &summary.warnings {
-        eprintln!("warning: {warning}");
+        eprintln!("warning: {}", sanitize_text(warning, 2000));
     }
-    if summary.state == RunState::AwaitingCi {
-        let _ = writeln!(
-            out,
-            "auditors, offramps, CI, judges and the outcome policy are not run by this command yet"
-        );
+    if summary.state != RunState::Failed {
+        let _ = writeln!(out, "auditors and offramps are not run by this command yet");
     }
     Ok(summary.state != RunState::Failed)
 }
@@ -682,6 +842,19 @@ mod tests {
             std::fs::write(self.bin.join(name), value).unwrap();
         }
 
+        fn args_when_unlocked(&self, args: &[&str]) -> (u8, String, String) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let result = self.args(args);
+                if !result.2.contains("another inchworm daemon holds")
+                    || std::time::Instant::now() > deadline
+                {
+                    return result;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
         fn args(&self, args: &[&str]) -> (u8, String, String) {
             let mut argv = vec!["inchworm"];
             argv.extend_from_slice(args);
@@ -775,8 +948,8 @@ mod tests {
             "{out}"
         );
         let store = Store::open(&f.setup.dir.path().join("state/state.db")).unwrap();
-        let run = store.active_run("o/r").unwrap().unwrap();
-        assert_eq!(run.state, RunState::AwaitingCi);
+        let run = store.recent_runs(1).unwrap().remove(0);
+        assert_eq!(run.state, RunState::PrOpen);
         assert_eq!(store.attempts(run.id).unwrap()[0].pr_number, Some(9));
     }
 
@@ -841,21 +1014,31 @@ mod tests {
         assert!(degraded.1.contains("for o/r#5"), "{}", degraded.1);
     }
 
+    fn live_run(f: &Fakes) {
+        let db = f.setup.dir.path().join("state/state.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = Store::open(&db).unwrap();
+        store
+            .enqueue_run("o/r", &crate::store::Subject::issue(5).unwrap(), "issue", 1)
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn a_second_run_for_an_issue_with_an_open_run_is_refused_with_exit_two() {
         let f = fakes();
-        assert_eq!(f.args(&["run", "o/r", "5"]).0, EXIT_VALID);
+        live_run(&f);
         let (code, out, err) = f.args(&["run", "o/r", "5"]);
         assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
         assert!(err.contains("already has a run for flow `issue`"), "{err}");
     }
 
     #[test]
-    fn the_note_about_what_run_does_not_do_is_printed_only_when_awaiting_ci() {
+    fn the_note_about_what_run_does_not_do_is_printed_unless_the_run_failed() {
         let ok = fakes().args(&["run", "o/r", "5"]);
         assert_eq!(ok.0, EXIT_VALID, "{ok:?}");
         assert!(
-            ok.1.contains("auditors, offramps, CI, judges and the outcome policy are not run"),
+            ok.1.contains("auditors and offramps are not run by this command yet"),
             "{}",
             ok.1
         );
@@ -865,7 +1048,7 @@ mod tests {
         let failed = f.args(&["run", "o/r", "5"]);
         assert_eq!(failed.0, EXIT_REPO_ERRORS, "{failed:?}");
         assert!(
-            !failed.1.contains("are not run by this command"),
+            !failed.1.contains("are not run by this command yet"),
             "{}",
             failed.1
         );
@@ -876,7 +1059,7 @@ mod tests {
         let (code, out, _) = exec(&["inchworm", "run", "--help"], &Env::default());
         assert_eq!(code, EXIT_VALID);
         assert!(
-            out.contains("does not run an auditor, an offramp, a judge"),
+            out.contains("does not run an auditor or an offramp"),
             "{out}"
         );
     }
@@ -957,6 +1140,156 @@ mod tests {
     }
 
     #[test]
+    fn status_stats_and_failures_read_the_store_after_a_run() {
+        let f = fakes();
+        assert_eq!(f.args(&["status"]).0, EXIT_VALID);
+        assert_eq!(f.args(&["stats"]).0, EXIT_VALID);
+        assert_eq!(f.args(&["failures"]).0, EXIT_VALID);
+        assert_eq!(f.args_when_unlocked(&["run", "o/r", "5"]).0, EXIT_VALID);
+        f.set("state", "task_failed");
+        f.set("result", "result_failed_structured");
+        assert_eq!(
+            f.args_when_unlocked(&["run", "o/r", "5"]).0,
+            EXIT_REPO_ERRORS
+        );
+        let (code, out, _) = f.args(&["status"]);
+        assert_eq!(code, EXIT_VALID);
+        assert!(out.contains("o/r"), "{out}");
+        assert_eq!(f.args(&["stats", "--window", "24h"]).0, EXIT_VALID);
+        let (code, out, _) = f.args(&["failures", "--class", "max_iterations"]);
+        assert_eq!(code, EXIT_VALID);
+        assert!(out.contains("max_iterations"), "{out}");
+        let store = Store::open(&f.setup.dir.path().join("state/state.db")).unwrap();
+        assert_eq!(
+            store.success_rates(SystemClock.now(), None).unwrap()[0].total,
+            2
+        );
+    }
+
+    #[test]
+    fn stats_and_failures_reject_unknown_arguments_with_exit_two() {
+        let f = fakes();
+        let (code, out, err) = f.args(&["stats", "--window", "1y"]);
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("unknown window"), "{err}");
+        let (code, out, err) = f.args(&["failures", "--class", "nope"]);
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("unknown failure class"), "{err}");
+    }
+
+    #[test]
+    fn a_report_command_with_an_unusable_config_exits_two() {
+        let f = fakes();
+        let missing = f.setup.dir.path().join("missing.toml");
+        let (code, out, err) = exec(
+            &["inchworm", "status", "--config", missing.to_str().unwrap()],
+            &f.env,
+        );
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn the_daemon_starts_polls_and_stops_on_shutdown() {
+        let f = fakes();
+        let config = GlobalConfig::load(&f.setup.config, f.env.home.as_deref()).unwrap();
+        daemon_command(config, &f.env, || Ok(std::future::ready(()))).unwrap();
+        assert!(f.setup.dir.path().join("state/state.db").exists());
+    }
+
+    #[test]
+    fn the_daemon_refuses_a_second_instance_and_a_running_foreground_run() {
+        let f = fakes();
+        let config = GlobalConfig::load(&f.setup.config, f.env.home.as_deref()).unwrap();
+        let state_db = prepare_state(&config, &f.env).unwrap();
+        let _held = DaemonLock::acquire(&state_db).unwrap();
+        let err = daemon_command(config, &f.env, || Ok(std::future::ready(()))).unwrap_err();
+        assert!(err.to_string().contains("another"), "{err:#}");
+        let (code, _, err) = f.args(&["run", "o/r", "5"]);
+        assert_eq!(code, EXIT_UNUSABLE);
+        assert!(err.contains("another"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sigterm_sent_before_the_shutdown_future_is_first_polled_is_not_lost() {
+        let shutdown = termination_signal().unwrap();
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("the SIGTERM was handled");
+    }
+
+    #[test]
+    fn the_daemon_refuses_to_start_with_a_missing_nanna_binary_and_creates_nothing() {
+        let f = fakes();
+        let mut config = GlobalConfig::load(&f.setup.config, f.env.home.as_deref()).unwrap();
+        config.nanna_bin = PathBuf::from("/no/such/nanna");
+        let err = daemon_command(config, &f.env, || Ok(std::future::ready(()))).unwrap_err();
+        assert!(err.to_string().contains("nanna_bin"), "{err}");
+        assert!(!f.setup.dir.path().join("state/state.db").exists());
+    }
+
+    #[test]
+    fn the_daemon_command_with_an_unusable_config_exits_two() {
+        let f = fakes();
+        let missing = f.setup.dir.path().join("missing.toml");
+        let (code, out, err) = exec(
+            &["inchworm", "daemon", "--config", missing.to_str().unwrap()],
+            &f.env,
+        );
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn the_daemon_command_reports_a_missing_binary_as_exit_two_on_stderr() {
+        let f = fakes();
+        std::fs::write(
+            &f.setup.config,
+            format!(
+                "nanna_bin = \"/no/such/nanna\"\nstate_db = {}\n[[repo]]\nslug = \"o/r\"\npath = {}\n",
+                quoted(&f.setup.dir.path().join("state/state.db")),
+                quoted(&f.setup.repo)
+            ),
+        )
+        .unwrap();
+        let (code, out, err) = f.args(&["daemon"]);
+        assert_eq!((code, out.as_str()), (EXIT_UNUSABLE, ""));
+        assert!(err.contains("nanna_bin"), "{err}");
+    }
+
+    #[test]
+    fn the_state_directory_and_database_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fakes();
+        let config = GlobalConfig::load(&f.setup.config, f.env.home.as_deref()).unwrap();
+        let state_db = prepare_state(&config, &f.env).unwrap();
+        let db_mode = std::fs::metadata(&state_db).unwrap().permissions().mode();
+        assert_eq!(db_mode & 0o777, 0o600);
+        let parent = state_db.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn an_existing_world_readable_state_directory_is_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fakes();
+        let config = GlobalConfig::load(&f.setup.config, f.env.home.as_deref()).unwrap();
+        let state_db = config.state_db_path(f.env.home.as_deref()).unwrap();
+        let parent = state_db.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_state(&config, &f.env).unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
     fn run_rejects_a_pr_touching_inchworm() {
         let f = fakes();
         f.set("files", "F src/lib.rs\nF .inchworm/flows.toml");
@@ -972,7 +1305,7 @@ mod tests {
         let (code, _, err) = f.args(&["run", "o/r", "5", "--flow", "nope"]);
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("flow nope not found"), "{err}");
-        assert_eq!(f.args(&["run", "o/r", "5"]).0, EXIT_VALID);
+        live_run(&f);
         let (code, _, err) = f.args(&["run", "o/r", "5"]);
         assert_eq!(code, EXIT_UNUSABLE);
         assert!(err.contains("already has a run"), "{err}");

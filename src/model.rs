@@ -56,6 +56,34 @@ failure_classes! {
     MergeBlocked => "merge_blocked",
 }
 
+fn is_unsafe_char(ch: char) -> bool {
+    (ch.is_control() && ch != '\n' && ch != '\t')
+        || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// ```
+/// use inchworm::model::sanitize_text;
+///
+/// assert_eq!(sanitize_text("ok\u{1b}[31mred", 100), "ok?[31mred");
+/// assert_eq!(sanitize_text("abcdef", 3), "abc...(truncated)");
+/// assert_eq!(sanitize_text("a\u{202e}b", 100), "a?b");
+/// ```
+pub fn sanitize_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count == max_chars {
+            out.push_str("...(truncated)");
+            break;
+        }
+        if is_unsafe_char(ch) {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("unknown failure class `{0}`")]
 pub struct UnknownFailureClass(pub String);
@@ -161,8 +189,8 @@ impl RunState {
             (self, to),
             (Queued, Running | Failed | Escalated)
                 | (Running, AwaitingCi | Failed | Escalated | Queued)
-                | (AwaitingCi, Judging | Failed | Escalated)
-                | (Judging, Merged | PrOpen | Failed | Escalated)
+                | (AwaitingCi, Judging | Failed | Escalated | Running)
+                | (Judging, Merged | PrOpen | Failed | Escalated | Running)
         )
     }
 
@@ -206,6 +234,19 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn sanitize_text_strips_control_characters_and_caps_length() {
+        assert_eq!(sanitize_text("a\u{1b}[2Jb\u{7}c\rd", 100), "a?[2Jb?c?d");
+        assert_eq!(
+            sanitize_text("keep\nnewlines\tand tabs", 100),
+            "keep\nnewlines\tand tabs"
+        );
+        assert_eq!(sanitize_text("abc", 3), "abc");
+        assert_eq!(sanitize_text("abcd", 3), "abc...(truncated)");
+        assert_eq!(sanitize_text("\u{9b}x", 10), "?x");
+        assert_eq!(sanitize_text("", 0), "");
+    }
 
     #[test]
     fn names_are_unique_and_snake_case() {
@@ -282,10 +323,12 @@ mod tests {
         (RunState::AwaitingCi, RunState::Judging),
         (RunState::AwaitingCi, RunState::Failed),
         (RunState::AwaitingCi, RunState::Escalated),
+        (RunState::AwaitingCi, RunState::Running),
         (RunState::Judging, RunState::Merged),
         (RunState::Judging, RunState::PrOpen),
         (RunState::Judging, RunState::Failed),
         (RunState::Judging, RunState::Escalated),
+        (RunState::Judging, RunState::Running),
     ];
 
     #[test]
@@ -322,6 +365,13 @@ mod tests {
             assert!(state.can_transition_to(RunState::Escalated), "{state}");
             assert!(state.can_transition_to(RunState::Failed), "{state}");
         }
+    }
+
+    #[test]
+    fn a_rejected_judging_can_return_to_running_for_a_retry() {
+        assert!(RunState::Judging.can_transition_to(RunState::Running));
+        assert!(RunState::AwaitingCi.can_transition_to(RunState::Running));
+        assert!(!RunState::Judging.can_transition_to(RunState::AwaitingCi));
     }
 
     #[test]

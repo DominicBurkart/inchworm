@@ -4,7 +4,7 @@ A daemon and CLI for configuring fallible, repeated agentic processes on local m
 
 ## Status: partial, and not yet aligned with the project design
 
-Milestones 1 and 2 of the MVP: configuration, run state, the SQLite store, offline and online validation, and dispatch of a flow to nanna through `inchworm run`. The judges, the outcome policy and the scheduler exist as library code (merged in #3) but `inchworm run` does not call them. Offramps and auditors are configuration only: `run` runs the steps and does not run an auditor or an offramp. CI waiting, the daemon and stats are not implemented yet.
+Milestones 1 to 4 of the MVP: configuration, run state, the SQLite store, offline and online validation, dispatch of a flow to nanna, CI waiting on the exact head SHA, judges, the outcome policy, the polling daemon and the stats reports. It is functionally complete behind fakes: apart from the `#[ignore]` tests that need a real nanna, nothing in the test suite talks to a real nanna, GitHub or Ollama, so run `inchworm validate --online` and one foreground `inchworm run` on a throwaway issue before trusting the daemon. Offramps and auditors are configuration only: nothing runs an auditor or an offramp. Publishing a pull request is not supported by nanna yet, so a run only reaches `pr_open` when a pull request already exists on the attempt branch (see "How steps hand work to each other").
 
 It was written from a planning conversation, not from the project's design. The design is issue [#1](https://github.com/DominicBurkart/inchworm/issues/1) and `DESIGN.md`, which is now on `main`. Where the two differ, the design wins. The differences are tracked in issue [#6](https://github.com/DominicBurkart/inchworm/issues/6):
 
@@ -19,7 +19,86 @@ Everything below describes what this code does today.
 
 ## Merging has no default
 
-A flow must state its outcome: `outcome` and `outcome.mode` are required and have no default. `merge_when` exists as a mode and is validated, but no shipped example uses it, and `inchworm validate` warns when a flow turns it on. The intended direction is that merging becomes a capability a user grants to a nanna subagent or another agent, with the user defining when and how (nanna-coder issue 1043). Whether merging is possible at all is one switch, `[merge] allow` in `inchworm.toml`, which is `false` unless set. With it `false` a flow in `merge_when` mode is a configuration error, not a warning. `MergeConfig::grant` maps it to `MergeGrantSetting::Denied` or `Granted`, the one place the later policy code reads. Do not enable `merge_when` in a real repository.
+A flow must state its outcome: `outcome` and `outcome.mode` are required and have no default. `merge_when` exists as a mode and is validated, but no shipped example uses it, and `inchworm validate` warns when a flow turns it on. The intended direction is that merging becomes a capability a user grants to a nanna subagent or another agent, with the user defining when and how (nanna-coder issue 1043). Whether merging is possible at all is one switch, `[merge] allow` in `inchworm.toml`, which is `false` unless set. With it `false` a flow in `merge_when` mode is a configuration error, not a warning. `MergeConfig::grant` maps it to `MergeGrantSetting::Denied` or `Granted`, the one place the later policy code reads. Do not enable `merge_when` in a real repository. `inchworm run` and `inchworm daemon` pass the project's `[merge] allow` as the grant, so a `merge_when` flow can only merge in a project that sets `allow = true`; with it unset (the default) such a flow is a configuration error and nothing merges.
+
+
+## Install
+
+```
+cargo install --path .
+install -d -m 700 ~/.config/inchworm ~/.local/state/inchworm
+$EDITOR ~/.config/inchworm/config.toml
+```
+
+Example `~/.config/inchworm/config.toml`:
+
+```toml
+nanna_bin = "~/.local/bin/nanna"
+ollama_url = "http://localhost:11434"
+concurrency = 1
+poll_secs = 120
+state_db = "~/.local/state/inchworm/state.db"
+
+[[repo]]
+slug = "DominicBurkart/marigold"
+path = "~/code/marigold"
+```
+
+inchworm only needs the `nanna` executable and `gh` (logged in with access to the repos) on the machine. nanna reads its identities from `NANNA_CONFIG_DIR` (for example `~/.config/nanna`, holding the global `agents/` catalog) and builds its container images through `skopeo`. The host skopeo lacks the nix transport, so a skopeo built with the nix transport must come first in `PATH` (for example the one from your Nix profile):
+
+```
+export NANNA_CONFIG_DIR=~/.config/nanna
+export PATH="$(dirname "$(readlink -f ~/.nix-profile/bin/skopeo)"):$PATH"
+```
+
+Create the labels in every configured repo (the trigger label plus the three status labels):
+
+```
+for repo in DominicBurkart/marigold; do
+  gh label create inchworm -R "$repo" --color 5319e7 --description "inchworm picks this issue up"
+  gh label create inchworm:running -R "$repo" --color fbca04 --description "inchworm is working on this"
+  gh label create inchworm:failed -R "$repo" --color d73a4a --description "inchworm gave up"
+  gh label create inchworm:done -R "$repo" --color 0e8a16 --description "inchworm opened a judged draft PR"
+done
+```
+
+Every configured repo needs three files before the daemon can work on it (`inchworm validate` checks them):
+
+- `inchworm.toml` at the repository root: the flows, an `[auditor]`, and optionally `[offramp]` and `[merge]` (see Project file and Flows below)
+- `.nanna/protected.toml` containing `extra = ["inchworm.toml", ".inchworm/**"]`, so agents cannot edit their own configuration or judges
+- `.nanna/prompt.md`, the prompt nanna gives its agents (`validate` only warns when it is missing)
+
+Check everything before the first run:
+
+```
+inchworm validate --online
+```
+
+Run it as a systemd user service:
+
+```
+mkdir -p ~/.config/systemd/user
+cp contrib/inchworm.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now inchworm
+journalctl --user -u inchworm -f
+```
+
+The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH_TOKEN` (if you do not rely on `gh auth login`) in `~/.config/inchworm/env`, mode 600, which the unit loads with `EnvironmentFile`; never put it in `Environment=`. The unit restarts on failure every 15 seconds and gives up after 5 starts within 10 minutes (`StartLimitBurst`), so a transient fault recovers while a persistent config error does not loop forever; `systemctl --user reset-failed inchworm` clears the limit. The unit deliberately sets only `NoNewPrivileges`, `RestrictSUIDSGID` and `UMask`: `PrivateTmp`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups` and `LockPersonality` each make `podman unshare` fail under a user service (`newuidmap: write to uid_map failed`), which breaks rootless podman and with it nanna's containers. The state directory is set to mode 700 and the database to mode 600 on every start, and a lock file next to the database (`.state.db.inchworm-lock`) makes a second daemon on the same database refuse to start. To keep it running while logged out: `loginctl enable-linger $USER`.
+
+## Operational notes
+
+- `inchworm daemon` refuses to start when `nanna_bin` is not an executable, and refuses to start while another `inchworm daemon` or a foreground `inchworm run` holds the same state database (one `DaemonLock`, see State store); `inchworm run` refuses while a daemon holds it.
+- Stopping the daemon waits up to 20 seconds for the in-flight run; a run still in flight is marked `orchestrator_lost` on the next start and counts as one attempt. This is a known limitation: there is no cooperative cancel of a dispatched nanna task on shutdown.
+- Every `gh` call is bounded by 60 seconds and runs in its own process group that is killed with it and the poll cycle runs on its own thread, so SIGTERM stops the daemon even while `gh` hangs. The SIGTERM and SIGINT handlers are installed before the daemon starts.
+- A failed dispatch drops the nanna client and the next attempt starts a fresh `nanna mcp-serve`.
+- A foreground `inchworm run` that is killed while waiting for CI leaves an open run in the store; only `inchworm daemon` resumes it, on its next start.
+- `GH_TOKEN` from the unit's `EnvironmentFile` is inherited by `nanna mcp-serve` as well as by `gh`. Whether nanna forwards it into its containers is unverified; give the token only the scopes the flows need.
+- Re-adding the trigger label to an issue whose run finished (`pr_open`, `merged` or `failed`) starts a new run on purpose, once 60 seconds have passed since that run finished (a poll that lands between a run's state write and its label swap does not queue a second run); remove the label when the work is done.
+- If the initial label swap on an issue fails, the daemon remembers that only in memory; after a restart a stale trigger label next to a finished run can start another run until the label is removed by hand. Known limitation.
+- Text from nanna, `gh` and judges has control characters and bidirectional override characters replaced and is capped before it is printed by `failures`, `run` or the daemon log, or posted to an issue.
+- Branch protection is compared by required check name only. A passing `validate --online` does not check `enforce_admins`, required reviews or app ids, so it says little about merge safety on its own.
+- Skipped, neutral, cancelled and unknown check conclusions are treated as red and fail the attempt as `ci_red`, even where GitHub branch protection accepts a skipped job (a path-filtered or conditional job). Do not list such a job in `required_checks`; there is no opt-in for treating `skipped` or `neutral` as green.
 
 ## Platforms
 
@@ -39,10 +118,16 @@ Each item says whether it was observed by running the real `nanna mcp-serve` in 
 ## Commands
 
 ```
-inchworm validate [--config PATH] [--online] [--build-images]
+inchworm validate [--config PATH] [--online] [--build-images] [--skip-branch-protection]
 inchworm run <repo-slug-or-path> <issue> [--flow NAME] [--config PATH]
+inchworm daemon [--config PATH]
+inchworm status [--config PATH]
+inchworm stats [--window 24h|7d|30d|all] [--config PATH]
+inchworm failures [--class CLASS] [--config PATH]
 inchworm list [--config PATH]
 ```
+
+`daemon` polls every registered repository and runs labelled issues until SIGTERM or SIGINT. `status` lists recent runs. `stats` prints runs, successes and success rate per repo, flow and window from SQL aggregates; a run succeeded if it ended `merged` or `pr_open`. `failures` prints the failure class histogram and the most recent raw errors, optionally for one class; `stats` and `failures` exit `2` on an unknown window or class.
 
 `list` prints one line per registered directory, the slug and the path separated by a tab, and exits `0`, or `2` when the config cannot be found, read or parsed.
 
@@ -67,11 +152,11 @@ The repo-controlled files above (`.inchworm`, `.nanna` and everything read from 
 
 What a passing `validate` proves: the files inchworm reads are well formed, `inchworm.toml` and `.inchworm/**` are declared protected, and nothing it reads escapes the repository through a symlink. The `protected.toml` check mirrors `validate_extra` in nanna-coder `harness/src/protected.rs` as of nanna-coder commit `239a1c94`; it does not run nanna's code, so a later change there is not tracked. Offline, it does not prove that identities named in flows exist or that labels exist (`--online` checks both), and no command checks that branch protection matches `required_checks`.
 
-With `--online` it also checks that nanna has an `auditor` identity (`mcp-serve` refuses to start without one), warns when `ollama_url` is not the address nanna itself always uses (`http://localhost:11434`), checks that every step identity resolves with `nanna agents list --repo <path>` and that the trigger label and the `inchworm:running`, `inchworm:failed` and `inchworm:done` labels exist on GitHub (through `gh`). `--build-images` implies `--online` and runs `nix build git+file://<repo>#devContainerImage --no-link --no-write-lock-file` for each repo.
+With `--online` it also checks that nanna has an `auditor` identity (`mcp-serve` refuses to start without one), warns when `ollama_url` is not the address nanna itself always uses (`http://localhost:11434`), checks that every step identity resolves with `nanna agents list --repo <path>` and that the trigger label and the `inchworm:running`, `inchworm:failed` and `inchworm:done` labels exist on GitHub (through `gh`). `--online` also compares each flow's `required_checks` with the required status checks of its base branch protection (`gh api repos/<slug>/branches/<base>/protection/required_status_checks`): a listed check the branch does not require is an error; an extra protected check or an unprotected base is a warning, and an error for `merge_when`; if the protection cannot be read because the repository is private on a plan without branch protection (HTTP 403 "Upgrade to GitHub Pro"), that is a warning for `draft_pr` flows and an error for `merge_when`; `--skip-branch-protection` skips the comparison. `--build-images` implies `--online` and runs `nix build git+file://<repo>#devContainerImage --no-link --no-write-lock-file` for each repo.
 
 **`--build-images` runs the repository's own Nix code on this machine.** Evaluating a flake executes the Nix expressions in `flake.nix` and everything it imports, and builds may fetch from the network. That is the one place inchworm itself runs repo-controlled code on the host, so use the flag only on repositories you trust. It reads tracked files only (`git+file`), so untracked files such as `.env` are not copied into the world-readable Nix store, and it never rewrites the repo's `flake.lock`. Nanna builds the same image for real runs; this flag only checks it early.
 
-`run` executes one flow for one issue in the foreground. Before it creates a run it checks that the issue is open, carries the flow's trigger label, was written by the repository's owner, a member or a collaborator (the issue text is handed to an agent, so text from anyone else is refused), and that no pull request from an earlier attempt is still open on `inchworm/<issue>-a<n>`; otherwise it exits `2`: no run is recorded, nothing is written to GitHub and nanna is not started (the SQLite file `state.db` and its directory are still created when they do not exist). A pull request that is not a draft is rejected as `agent_failed`. Pressing Ctrl-C or sending SIGTERM cancels the running task and ends the run in state `failed` with failure class `cancelled`; a hard kill (SIGKILL, power loss) cannot be handled and leaves the run `running`. It starts `nanna mcp-serve`, sends each step as an `assign_task` to the step's identity (passing the previous step's summary and patch forward), stops at the first failing step, classifies the failure into a `FailureClass`, retries per `retry_on` and `max_attempts`, and records everything in the SQLite store. After the final step it looks up the pull request on `inchworm/<issue>-a<attempt>` with `gh`, records its head SHA, and leaves the run in `awaiting_ci`. A step output (or pull request) that touches `.inchworm/**` or an `inchworm.toml` at any depth is rejected as `protected_path_violation` regardless of nanna's own protected set. A step other than the last (or the only step) that produces no changes fails as `empty_patch`. Exit codes: `0` a draft pull request was found and recorded, `1` the run failed, `2` setup error. `run` does not read `.nanna/protected.toml`: only `validate` checks that `inchworm.toml` and `.inchworm/**` are protected, so run `validate` first. `run` does refuse a pull request that touches `inchworm.toml` or anything under `.inchworm/` at any depth (`flow::touches_protected`). With only the old `.inchworm/flows.toml` present, `run` says it has moved to `inchworm.toml`.
+`run` executes one flow for one issue in the foreground. Before it creates a run it checks that the issue is open, carries the flow's trigger label, was written by the repository's owner, a member or a collaborator (the issue text is handed to an agent, so text from anyone else is refused), and that no pull request from an earlier attempt is still open on `inchworm/<issue>-a<n>`; otherwise it exits `2`: no run is recorded, nothing is written to GitHub and nanna is not started (the SQLite file `state.db` and its directory are still created when they do not exist). A pull request that is not a draft is rejected as `agent_failed`. Pressing Ctrl-C or sending SIGTERM cancels the running task and ends the run in state `failed` with failure class `cancelled`; a hard kill (SIGKILL, power loss) cannot be handled and leaves the run `running`. It starts `nanna mcp-serve`, sends each step as an `assign_task` to the step's identity (passing the previous step's summary and patch forward), stops at the first failing step, classifies the failure into a `FailureClass`, retries per `retry_on` and `max_attempts`, and records everything in the SQLite store. After the final step it looks up the pull request on `inchworm/<issue>-a<attempt>` with `gh`, records its head SHA, and waits for CI on that head, runs the judges and applies the outcome (see "What a run does"). A step output (or pull request) that touches `.inchworm/**` or an `inchworm.toml` at any depth is rejected as `protected_path_violation` regardless of nanna's own protected set. A step other than the last (or the only step) that produces no changes fails as `empty_patch`. Exit codes: `0` the run ended `pr_open` or `merged`, `1` the run failed, `2` setup error. `run` does not read `.nanna/protected.toml`: only `validate` checks that `inchworm.toml` and `.inchworm/**` are protected, so run `validate` first. `run` does refuse a pull request that touches `inchworm.toml` or anything under `.inchworm/` at any depth (`flow::touches_protected`). With only the old `.inchworm/flows.toml` present, `run` says it has moved to `inchworm.toml`.
 
 ## Global config
 
@@ -180,13 +265,32 @@ required_checks = ["Tests"]
 
 ## State store
 
-`inchworm::store` is a SQLite store of runs and attempts. Only `inchworm run` uses it. Runs are keyed by a subject (an issue number, a pull request number or a full commit id) and a flow; only one open run per subject and flow can exist, and a finished subject can run again. Several processes can use the same file. After a crash, `Store::recover_after_crash` needs a `DaemonLock` for the same database, fails attempts the dead daemon left dispatched as `orchestrator_lost`, puts `running` runs back in the queue (or in `awaiting_ci` when a pull request was already recorded) and reports the runs in `awaiting_ci` and `judging` for the daemon to resume. The `DaemonLock` is two exclusive `flock`s: one on the database file itself (identified by device and inode, so symlinks, hard links and a dangling symlink filled in later all lead to one lock) and one on a side file `.<database name>.inchworm-lock` next to it (which keeps excluding a second daemon when the database is unlinked or another file is renamed over it). It refuses in-memory names and every `file:` URI (also one that is not valid UTF-8; `Store::open` refuses them before creating a file), a database file name longer than 240 bytes (its side file name would pass the 255-byte limit) and a name that starts with `.` and ends with `.inchworm-lock` (it would collide with another database's side file). If the database path stops naming the locked file while the lock is held (unlinked, replaced by a restored backup), the lock no longer protects anything and `recover_after_crash` refuses it with `DatabaseMoved`; restart the daemon. Acquire the lock **before** opening any `Store` in the process and keep it for the process lifetime: the lock holds a descriptor on the database file, and on POSIX closing any descriptor of a file releases the process's `fcntl` locks on it, which SQLite uses, so dropping a `DaemonLock` while a `Store` in the same process is mid-transaction can release SQLite's locks. Nothing enforces that order. The lock only protects against processes that also take it. A database created by an earlier unreleased build, or one whose tables, indexes, triggers or views differ from the frozen schema in any way, fails to open with a clear error; delete it.
+`inchworm::store` is a SQLite store of runs and attempts. `inchworm run`, `inchworm daemon`, `status`, `stats` and `failures` use it. Runs are keyed by a subject (an issue number, a pull request number or a full commit id) and a flow; only one open run per subject and flow can exist, and a finished subject can run again. Several processes can use the same file. After a crash, `Store::recover_after_crash` needs a `DaemonLock` for the same database, fails attempts the dead daemon left dispatched as `orchestrator_lost`, puts `running` runs back in the queue (or in `awaiting_ci` when a pull request was already recorded) and reports the runs in `awaiting_ci` and `judging` for the daemon to resume. The `DaemonLock` is two exclusive `flock`s: one on the database file itself (identified by device and inode, so symlinks, hard links and a dangling symlink filled in later all lead to one lock) and one on a side file `.<database name>.inchworm-lock` next to it (which keeps excluding a second daemon when the database is unlinked or another file is renamed over it). It refuses in-memory names and every `file:` URI (also one that is not valid UTF-8; `Store::open` refuses them before creating a file), a database file name longer than 240 bytes (its side file name would pass the 255-byte limit) and a name that starts with `.` and ends with `.inchworm-lock` (it would collide with another database's side file). If the database path stops naming the locked file while the lock is held (unlinked, replaced by a restored backup), the lock no longer protects anything and `recover_after_crash` refuses it with `DatabaseMoved`; restart the daemon. Acquire the lock **before** opening any `Store` in the process and keep it for the process lifetime: the lock holds a descriptor on the database file, and on POSIX closing any descriptor of a file releases the process's `fcntl` locks on it, which SQLite uses, so dropping a `DaemonLock` while a `Store` in the same process is mid-transaction can release SQLite's locks. Nothing enforces that order. The lock only protects against processes that also take it. A database created by an earlier unreleased build, or one whose tables, indexes, triggers or views differ from the frozen schema in any way, fails to open with a clear error; delete it.
 
 ### How steps hand work to each other
 
 Each step is its own nanna task, and nanna creates a fresh worktree from `base` for every task. A later step therefore does not see an earlier step's files. It receives the earlier step's summary, file list and patch as text in its description. The patch is handed over whole or not at all: if a step other than the last produces a patch larger than 100,000 bytes, the flow stops with `patch_apply_failed` and says so; nothing is truncated.
 
-Inchworm itself never applies, commits or pushes anything, and **publishing a pull request is not supported yet, so with nanna as it is a successful `run` (state `awaiting_ci`) is not reachable: nothing can create the pull request it looks for.** `run` looks for a draft pull request on `inchworm/<issue>-a<attempt>` after the last step, but nothing in this repository makes one exist, and with nanna as it is today no step can: nanna creates each task's worktree with `git worktree add <path> <branch>` (no `-b`), so the base branch (default `main`) is either already checked out or gives a detached HEAD; its `git_commit` and `git_push_branch` tools refuse a detached HEAD and `main`/`master`; the `pr-shepherd` card has no branch-creating tool; and a step that does not commit hands the next step only patch text. A flow whose steps finish without such a pull request ends the attempt as `agent_failed` ("no pull request exists") and is not retried, because replaying the steps cannot create one. This is a flaw in the flow model, not something to work around by weakening nanna's protections; it needs nanna to create the per-attempt branch and carry one step's changes to the next, and is an input for the reconciliation work. Everything about the hand-off in this section is therefore design intent, not tested behaviour; what is verified is the wire protocol with the real binary (`tests/real_nanna.rs`) and the flow logic against a fake nanna.
+Inchworm itself never applies, commits or pushes anything, and **publishing a pull request is not supported yet, so with nanna as it is a successful `run` (state `pr_open`) is not reachable: nothing can create the pull request it looks for.** `run` looks for a draft pull request on `inchworm/<issue>-a<attempt>` after the last step, but nothing in this repository makes one exist, and with nanna as it is today no step can: nanna creates each task's worktree with `git worktree add <path> <branch>` (no `-b`), so the base branch (default `main`) is either already checked out or gives a detached HEAD; its `git_commit` and `git_push_branch` tools refuse a detached HEAD and `main`/`master`; the `pr-shepherd` card has no branch-creating tool; and a step that does not commit hands the next step only patch text. A flow whose steps finish without such a pull request ends the attempt as `agent_failed` ("no pull request exists") and is not retried, because replaying the steps cannot create one. This is a flaw in the flow model, not something to work around by weakening nanna's protections; it needs nanna to create the per-attempt branch and carry one step's changes to the next, and is an input for the reconciliation work. Everything about the hand-off in this section is therefore design intent, not tested behaviour; what is verified is the wire protocol with the real binary (`tests/real_nanna.rs`) and the flow logic against a fake nanna.
+
+## What a run does
+
+1. Each step is an `assign_task` to nanna (previous summary and patch forwarded, previous failure on retries). The first failing step stops the attempt; the failure is classified into a `FailureClass` and retried per `retry_on` and `max_attempts`. A step output touching `.inchworm/**` or an `inchworm.toml` is rejected as `protected_path_violation`.
+2. The last step must leave a PR on `inchworm/<issue>-a<n>`. inchworm records its number and head SHA and the nanna report (denials, QA) and the attempt becomes `published`.
+3. inchworm polls the check-runs of that exact SHA until every name in `required_checks` has a finished run (30 s interval, 2 h limit). A red required check fails the attempt as `ci_red`, a timeout as `timeout`.
+4. The judges (`diff`, `nanna_clean`, `llm`) run against the PR patch fetched from GitHub; the head must still equal the recorded SHA. Verdicts are stored per attempt. The LLM judge shares the single model permit with nanna dispatch.
+5. `policy::decide` picks the outcome. `draft_pr`: comment on the issue with the outcome, swap the labels to `inchworm:done`, leave the PR a draft, run ends `pr_open`. `merge_when` (only in a project that sets `[merge] allow = true`; otherwise the flow is a configuration error): `gh pr ready` then `gh pr merge <n> --match-head-commit <sha> --merge|--squash|--rebase`; never `--admin`; run ends `merged`. A rejection fails the attempt as `judge_rejected` or `merge_blocked` and retries if allowed.
+6. After the last attempt the issue gets `inchworm:failed` and a comment with the failure class.
+
+## Known limitations
+
+- CI is read from check-runs on the head SHA. Legacy commit-status contexts (some coverage bots post those) are not read, so a `required_checks` entry that branch protection satisfies with a status context would wait until the CI timeout and fail as `timeout`.
+- The PR of a rejected attempt stays open. A merge refused after `gh pr ready` marks the PR a draft again; if that undo fails the failure text says so.
+- The merge grant is `Denied` unless the project sets `[merge] allow = true`; no shipped config does.
+
+## Daemon
+
+`inchworm daemon` polls every `poll_secs`. On start it marks attempts that were still `dispatched` as `orchestrator_lost`, then resumes queued, running, `awaiting_ci` and `judging` runs from the store (published attempts continue from their stored head SHA; a lost dispatch retries if `orchestrator_lost` is in `retry_on`, else the run fails). Each poll lists open issues with the flow's trigger label, creates a run, and swaps `inchworm` for `inchworm:running`. Each leased run executes on its own thread, so one repo waiting on CI (up to 2 hours) does not block the others. One run is active per repo (FIFO) and `concurrency` (default 1) is the number of model permits shared across repos: nanna dispatch and the LLM judge wait for a permit, CI waiting and GitHub calls do not. A run that errors on GitHub or the store, or panics, is retried with a delay of 1, 2, 4 and then 8 times `poll_secs` (at most 15 minutes) instead of waiting for a restart. SIGTERM or ctrl-c stop polling and give an in-flight run 20 seconds; a run still in flight is recovered on the next start. To retry an issue after `inchworm:failed`, add the `inchworm` label again.
 
 ## LLM judge safety
 
