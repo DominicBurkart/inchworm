@@ -52,6 +52,7 @@ failure_classes! {
     EmptyPatch => "empty_patch",
     PatchApplyFailed => "patch_apply_failed",
     CiRed => "ci_red",
+    BlockingUnresolved => "blocking_unresolved",
     JudgeRejected => "judge_rejected",
     MergeBlocked => "merge_blocked",
 }
