@@ -22,6 +22,82 @@ Everything below describes what this code does today.
 A flow must state its outcome: `outcome` and `outcome.mode` are required and have no default. `merge_when` exists as a mode and is validated, but no shipped example uses it, and `inchworm validate` warns when a flow turns it on. The intended direction is that merging becomes a capability a user grants to a nanna subagent or another agent, with the user defining when and how (nanna-coder issue 1043). Whether merging is possible at all is one switch, `[merge] allow` in `inchworm.toml`, which is `false` unless set. With it `false` a flow in `merge_when` mode is a configuration error, not a warning. `MergeConfig::grant` maps it to `MergeGrantSetting::Denied` or `Granted`, the one place the later policy code reads. Do not enable `merge_when` in a real repository. `inchworm run` and `inchworm daemon` pass the project's `[merge] allow` as the grant, so a `merge_when` flow can only merge in a project that sets `allow = true`; with it unset (the default) such a flow is a configuration error and nothing merges.
 
 
+## Prerequisites
+
+Start here if this is a new machine. The sections after "Install" then take
+you from a registered repository to a first foreground run.
+
+- Linux. nanna needs rootless podman; see "Platforms".
+- `git`, and `gh` logged in (`gh auth status`) with access to every
+  repository you register.
+- [Ollama](https://ollama.com) with the model `gemma4:e4b`
+  (`ollama pull gemma4:e4b`). nanna always talks to `localhost:11434`.
+- `podman`, rootless (`podman info`). nanna runs every agent in a per-repo
+  container.
+- `nix`, only for a repository whose container image is a nix2container flake
+  output (see "Set up a repository").
+- A Rust toolchain to build inchworm. `rustup` fetches the version pinned in
+  `rust-toolchain.toml`.
+
+### The nanna binary
+
+inchworm runs every agent through `nanna`. Build it from
+[nanna-coder](https://github.com/DominicBurkart/nanna-coder) and copy the
+executable to the path `nanna_bin` names:
+
+```sh
+git clone https://github.com/DominicBurkart/nanna-coder
+cd nanna-coder
+cargo build --release -p harness
+install -D target/release/nanna ~/.local/bin/nanna
+nanna agents list --help
+```
+
+`nanna` has no `--version` flag; `nanna --help` lists its commands.
+
+### The global agent catalog
+
+Flows name agent identities ("cards"). nanna reads the global cards from
+`agents/` inside its config directory, which defaults to
+`$XDG_CONFIG_HOME/nanna` or `~/.config/nanna`. A repository's
+`.nanna/agents/` cards may only narrow these. Put one TOML card per identity
+in `~/.config/nanna/agents/`, plus the prompt files the cards reference under
+`~/.config/nanna/agents/prompts/`. The examples in this README use these five:
+`auditor`, `rust-implementer`, `pr-shepherd`, `reviewer` and `docs-writer`.
+Each card lists the repositories it may work on in `[scope] repos`, as
+`github.com/OWNER/NAME`. `nanna agents list` shows what nanna loaded, and
+"Cards that narrow the global ones" below has a card to start from.
+
+`NANNA_CONFIG_DIR` must point at the parent of `agents/`, not at `agents/`
+itself. It is needed only when you do not use the default location, and in the
+systemd unit, which sets it:
+
+```sh
+export NANNA_CONFIG_DIR="$HOME/.config/nanna"
+nanna agents list
+```
+
+`nanna agents list` prints NAME, LOOP, MODEL and MAX_EFFECT per card. If
+`NANNA_CONFIG_DIR` points at the wrong directory it fails with
+`.../agents: No such file or directory`.
+
+### A skopeo that reads nix2container images
+
+The skopeo your distribution ships lacks the `nix:` transport that nix2container
+images need (nanna-coder issue 666). Build nix2container's skopeo and put its
+`bin` directory first on `PATH`, in your shell profile and in the `PATH=` line
+of the systemd unit:
+
+```sh
+SKOPEO_OUT="$(nix build github:nlewo/nix2container#skopeo-nix2container \
+  --no-link --print-out-paths)"
+export PATH="$SKOPEO_OUT/bin:$PATH"
+```
+
+A store path can be garbage collected. `nix profile install
+github:nlewo/nix2container#skopeo-nix2container` gives a stable
+`~/.nix-profile/bin/skopeo` instead.
+
 ## Install
 
 ```
@@ -85,6 +161,208 @@ journalctl --user -u inchworm -f
 ```
 
 The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH_TOKEN` (if you do not rely on `gh auth login`) in `~/.config/inchworm/env`, mode 600, which the unit loads with `EnvironmentFile`; never put it in `Environment=`. The unit restarts on failure every 15 seconds and gives up after 5 starts within 10 minutes (`StartLimitBurst`), so a transient fault recovers while a persistent config error does not loop forever; `systemctl --user reset-failed inchworm` clears the limit. The unit deliberately sets only `NoNewPrivileges`, `RestrictSUIDSGID` and `UMask`: `PrivateTmp`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups` and `LockPersonality` each make `podman unshare` fail under a user service (`newuidmap: write to uid_map failed`), which breaks rootless podman and with it nanna's containers. The state directory is set to mode 700 and the database to mode 600 on every start, and a lock file next to the database (`.state.db.inchworm-lock`) makes a second daemon on the same database refuse to start. To keep it running while logged out: `loginctl enable-linger $USER`.
+
+## Set up a repository
+
+The three files `validate` checks are listed under "Install". A repository
+that nanna can run also needs agent cards and a container image. The layout,
+with the file names it uses:
+
+- `inchworm.toml`: the flows and the `[auditor]`; see "Project file".
+- `.nanna/protected.toml`: `extra = ["inchworm.toml", ".inchworm/**"]`, plus
+  any other path agents must never touch (`publish.sh`, `.github/**`).
+- `.nanna/prompt.md`: layout, how to run the tests, house rules.
+- `.nanna/agents/<identity>.toml`: one card per identity your flows use,
+  narrowing the global card of the same name.
+- `.inchworm/rubric.md`: the rubric of an `llm` judge. It must be protected.
+- `flake.nix` with a `devContainerImage` output, and a `.devcontainer/`
+  directory.
+
+### Cards that narrow the global ones
+
+A card under `.nanna/agents/` must have the same `name` as a global card and
+may only narrow it: never wider paths, read paths, tools or limits; nanna
+enforces the exact rules. The `auditor` is a protected identity: a
+repository cannot override it, so it exists only in the global catalog.
+Narrowing `rust-implementer` for a Rust workspace looks like this:
+
+```toml
+[identity]
+name = "rust-implementer"
+description = "Implements a scoped change in the library crates and tests."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "You work only under src/ and tests/." }
+
+[scope]
+repos = ["github.com/OWNER/NAME"]
+paths = ["src/**", "tests/**"]
+read_paths = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status",
+  "git_diff", "cargo_check", "cargo_test"]
+
+[limits]
+max_iterations = 100
+max_wall_clock_secs = 1800
+max_concurrent = 1
+```
+
+Check the layered catalog after every edit:
+
+```sh
+nanna agents list --repo /path/to/repo
+```
+
+### The container image
+
+nanna runs agents in a container only when the repository has both a
+`flake.nix` and a `.devcontainer/` directory (merely having a flake is not
+enough). The flake must expose a nix2container image as the package
+`devContainerImage`:
+
+```nix
+packages = {
+  inherit devContainerImage;
+};
+```
+
+`.devcontainer/devcontainer.json` can be as small as
+`{"name": "NAME", "workspaceFolder": "/workspace"}`. Define
+`devContainerImage` with `nix2container.buildImage`. Prove it builds
+with `inchworm validate --build-images`, on a repository you trust: it runs the
+repository's Nix code on your machine (see "Commands").
+
+### Decide which checks block
+
+Before a run counts as done, inchworm waits for CI on the exact pull request
+head and the flow's blocking checks decide the outcome; see "Blocking checks"
+under "Flows" for the full rules. Pick one per flow in `[flow.outcome]`:
+
+- Nothing set, or `blocking = "required"`: the required status checks of the
+  flow's base branch, read from GitHub when the decision is made. If the base
+  branch has no branch protection, protects no checks, or the protection
+  cannot be read, every run ends as `blocking_unresolved` (`validate --online`
+  reports an error). This includes a private repository on a plan without
+  branch protection. Add `extra = ["name"]` to require more checks.
+- `blocking = "all"`: every check run and commit status on the judged commit.
+  A `skipped` or `neutral` check counts as satisfied here, and only here; at
+  least one check must have succeeded.
+- `required_checks = ["name", ...]`: an explicit list. A `skipped` or
+  `neutral` check on that list fails the run as `ci_red`. `required_checks = []`
+  blocks nothing.
+
+For a repository without branch protection, set `blocking = "all"` or
+`required_checks`.
+
+## First run
+
+Do this before you enable the daemon, in this order.
+
+1. Offline check: `inchworm validate`. Exit `0` means the files inchworm reads
+   are well formed.
+2. Online check: `inchworm validate --online`. It checks the `auditor`
+   identity, every step identity (`nanna agents list --repo`), the four
+   labels (and prints the `gh label create` command for a missing one) and
+   the blocking checks of every flow: it prints each flow's effective set as a
+   `note:` line and reports an error when `blocking = "required"` cannot
+   resolve. Do not go on until it exits `0`.
+3. Open a throwaway issue in a repository you do not mind experimenting in,
+   with a small, safe request, such as "add one line to the README". It must
+   carry the flow's trigger label and be written by the repository owner, a
+   member or a collaborator, or `run` refuses it. Use a flow whose outcome
+   `mode` is `draft_pr`.
+4. With Ollama running, run it in the foreground. The daemon must not be
+   running, because both hold the state database lock:
+
+   ```sh
+   inchworm run OWNER/NAME 123
+   ```
+
+   `--flow NAME` picks a flow other than the first.
+
+5. Read what happened:
+
+   ```sh
+   inchworm status
+   inchworm stats --window 7d
+   inchworm failures
+   ```
+
+Expect a draft pull request on the branch `inchworm/<issue>-a<attempt>`, a
+comment on the issue and the label `inchworm:done`. Publishing a pull request
+is not supported by nanna yet (see "Status" and "How steps hand work to each
+other"), so today a run reaches `pr_open` only when a pull request already
+exists on that branch. Without one, expect the run to fail and read the class
+with `inchworm failures`; that is a known gap, not a sign your setup is wrong.
+Close the pull request and delete its branch if you do not want them.
+
+## Safety
+
+- Every flow ends in a draft pull request that a human reads and merges. Keep
+  `[merge] allow = false`, which is the default. See "Merging has no default".
+- Merging is off unless two things are both set in the repository's own
+  `inchworm.toml`: `[merge] allow = true` and a flow with
+  `mode = "merge_when"`. `inchworm run` and `inchworm daemon` both honour them,
+  so a project that sets both gets pull requests merged without a human.
+  Neither is set by default, and this guide never needs them: do not enable
+  either until you have watched draft-only runs on that repository, and see
+  "Merging has no default" first.
+- Safety rests on container isolation in nanna, the protected path list in
+  `.nanna/protected.toml`, and draft pull requests. A configured auditor or
+  offramp is not extra protection yet, and the `llm` judge is a score, not a
+  security boundary (see "LLM judge safety").
+- Start every new repository with a throwaway issue and one foreground `run`.
+
+## Troubleshooting
+
+- **`inchworm: command not found`**: `~/.cargo/bin` is not on `PATH`.
+- **`nanna_bin ... is not an executable file`**: `inchworm validate` reports
+  it as an error in scope `[config]` and exits `1`; `inchworm daemon` refuses
+  to start with the same message and exits `2`. Fix the path and `chmod +x`
+  the binary. A
+  bare name is looked up on `PATH`, and under systemd that is the unit's
+  `Environment=PATH=`, not your shell's.
+- **A label does not exist**: from `validate --online`. Run the
+  `gh label create` command in the message, or the loop under "Install".
+- **`.inchworm/flows.toml has moved to inchworm.toml`**: the repository still
+  has the layout from before the reconciliation. Move the flows into
+  `inchworm.toml` at the repository root and add the `[auditor]` table.
+- **`extra` must contain "inchworm.toml"**: add `inchworm.toml` and
+  `.inchworm/**` to `extra` in `.nanna/protected.toml`.
+- **`has no global identity to narrow`**: from `nanna agents list --repo`. A
+  card in `.nanna/agents/` has no global card with the same `name`. Add the
+  global card (listing the repository in its `[scope] repos`) or rename it.
+- **`may not override a protected identity`**: remove the repository's
+  `auditor` card; it exists only in the global catalog.
+- **Branch protection HTTP 403 "Upgrade to GitHub Pro"**: a private repository
+  on a free plan, so the required checks cannot be read. A flow with the
+  default `blocking = "required"` then fails every run as
+  `blocking_unresolved`, and `validate --online` reports an error. Set
+  `blocking = "all"` or `required_checks = [...]` on the flow.
+  `--skip-branch-protection` leaves the blocking-check lines out of the report;
+  it does not change what a run does.
+- **A run fails as `blocking_unresolved`**: the base branch has no required
+  status checks, has no branch protection, or the protection could not be
+  read. See "Decide which checks block".
+- **A run fails as `ci_red` on a `skipped` check**: only `blocking = "all"`
+  treats `skipped` and `neutral` as satisfied; a skipped job named in
+  `required_checks` or required by the branch protection fails the run.
+- **`gh` rate limit**: HTTP 403 or 429 with "rate limit exceeded". Check
+  `gh api rate_limit`, raise `poll_secs`, and make sure `gh` is
+  authenticated; every tool on the machine shares one quota.
+- **`Text file busy`**: a binary was replaced while it ran. inchworm retries a
+  spawn for about a second; stop the daemon before you `cargo install` or
+  `install` over `inchworm` or `nanna`.
+- **Signed commits hang**: gpg is waiting on a stale lock such as
+  `~/.gnupg/pubring.db.lock` (a hostname change leaves one behind). Remove the
+  lock yourself; do not turn signing off.
+- **Image build fails with an unknown transport `nix:`**: the skopeo nanna
+  found is the distribution's. Put the nix2container skopeo first on `PATH`,
+  in the systemd unit too.
+- **The `llm` judge rejects every run as `model_error`**: `ollama list` must
+  show `gemma4:e4b` and `ollama_url` must be reachable; the judge fails
+  closed.
 
 ## Operational notes
 
