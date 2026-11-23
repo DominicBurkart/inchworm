@@ -51,6 +51,7 @@ pub fn env(scorer: &FakeScorer) -> OutcomeEnv<'_> {
         ci: CiPolicy {
             poll_interval: Duration::from_secs(10),
             timeout: Duration::from_secs(60),
+            settle: Duration::ZERO,
         },
     }
 }
@@ -77,7 +78,7 @@ identity = "pr-shepherd"
     .remove(0)
 }
 
-pub const DRAFT_OUTCOME: &str = "[flow.outcome]\nmode = \"draft_pr\"\n";
+pub const DRAFT_OUTCOME: &str = "[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []\n";
 
 pub fn github_with_issue() -> FakeGitHub {
     let github = FakeGitHub::new();

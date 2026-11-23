@@ -499,7 +499,7 @@ mod tests {
                 "[[flow.step]]\nname = \"{name}\"\nidentity = \"{identity}\"\n"
             ));
         }
-        text.push_str("[flow.outcome]\nmode = \"draft_pr\"\n");
+        text.push_str("[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []\n");
         FlowFile::parse(&text).unwrap().flow.remove(0)
     }
 

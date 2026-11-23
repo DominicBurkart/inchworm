@@ -7,6 +7,9 @@ pub enum CheckConclusion {
     Success,
     Failure,
     Pending,
+    /// A completed check that ran nothing: GitHub's `skipped` or `neutral`. Only the
+    /// `blocking = "all"` form treats it as satisfied; every other form treats it as red.
+    Skipped,
 }
 
 impl CheckConclusion {
@@ -14,8 +17,8 @@ impl CheckConclusion {
     /// use inchworm::policy::CheckConclusion;
     ///
     /// assert_eq!(CheckConclusion::from_github("completed", Some("success")), CheckConclusion::Success);
-    /// assert_eq!(CheckConclusion::from_github("completed", Some("skipped")), CheckConclusion::Failure);
-    /// assert_eq!(CheckConclusion::from_github("completed", Some("neutral")), CheckConclusion::Failure);
+    /// assert_eq!(CheckConclusion::from_github("completed", Some("skipped")), CheckConclusion::Skipped);
+    /// assert_eq!(CheckConclusion::from_github("completed", Some("neutral")), CheckConclusion::Skipped);
     /// assert_eq!(CheckConclusion::from_github("completed", None), CheckConclusion::Failure);
     /// assert_eq!(CheckConclusion::from_github("in_progress", None), CheckConclusion::Pending);
     /// assert_eq!(CheckConclusion::from_github("queued", Some("success")), CheckConclusion::Pending);
@@ -26,6 +29,12 @@ impl CheckConclusion {
         }
         match conclusion {
             Some(value) if value.eq_ignore_ascii_case("success") => CheckConclusion::Success,
+            Some(value)
+                if value.eq_ignore_ascii_case("skipped")
+                    || value.eq_ignore_ascii_case("neutral") =>
+            {
+                CheckConclusion::Skipped
+            }
             _ => CheckConclusion::Failure,
         }
     }
@@ -103,7 +112,7 @@ fn evaluate_checks(input: &PolicyInput<'_>) -> Ci {
         {
             seen = true;
             match run.conclusion {
-                CheckConclusion::Failure => return Ci::Red,
+                CheckConclusion::Failure | CheckConclusion::Skipped => return Ci::Red,
                 CheckConclusion::Pending => waiting = true,
                 CheckConclusion::Success => {}
             }
@@ -336,10 +345,12 @@ mod tests {
     #[test]
     fn red_required_check_rejects_in_both_modes() {
         for mode in [OutcomeMode::DraftPr, OutcomeMode::MergeWhen] {
-            let mut case = Case::merge_ready();
-            case.mode = mode;
-            case.checks[0].conclusion = CheckConclusion::Failure;
-            assert_eq!(case.decide(), Decision::Reject(FailureClass::CiRed));
+            for red in [CheckConclusion::Failure, CheckConclusion::Skipped] {
+                let mut case = Case::merge_ready();
+                case.mode = mode;
+                case.checks[0].conclusion = red;
+                assert_eq!(case.decide(), Decision::Reject(FailureClass::CiRed));
+            }
         }
     }
 
@@ -651,8 +662,9 @@ mod tests {
                 CheckConclusion::Failure,
             ),
             ("completed", Some("stale"), CheckConclusion::Failure),
-            ("completed", Some("skipped"), CheckConclusion::Failure),
-            ("completed", Some("neutral"), CheckConclusion::Failure),
+            ("completed", Some("skipped"), CheckConclusion::Skipped),
+            ("completed", Some("neutral"), CheckConclusion::Skipped),
+            ("completed", Some("SKIPPED"), CheckConclusion::Skipped),
             ("completed", Some("something_new"), CheckConclusion::Failure),
             ("completed", None, CheckConclusion::Failure),
             ("COMPLETED", Some("success"), CheckConclusion::Success),

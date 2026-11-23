@@ -431,6 +431,7 @@ kind = "nanna_clean"
 
 [flow.outcome]
 mode = "draft_pr"
+required_checks = []
 "#;
 
     fn with(head: &str) -> String {
@@ -841,10 +842,9 @@ mode = "draft_pr"
 
     #[test]
     fn merge_is_off_unless_the_project_allows_it() {
-        let merge_flow = FLOW.replace("draft_pr", "merge_when").replace(
-            "[flow.outcome]",
-            "[flow.outcome]\nrequired_checks = [\"Tests\"]",
-        );
+        let merge_flow = FLOW
+            .replace("draft_pr", "merge_when")
+            .replace("required_checks = []", "required_checks = [\"Tests\"]");
         let head = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n";
         assert!(matches!(
             ProjectConfig::parse(&format!("{head}{merge_flow}")),

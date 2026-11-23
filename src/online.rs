@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{FlowFile, GlobalConfig, PROJECT_FILE, ProjectConfig, RepoEntry, Trigger};
+use crate::config::{
+    BlockingSpec, FlowFile, GlobalConfig, PROJECT_FILE, ProjectConfig, RepoEntry, Trigger,
+};
 use crate::exec::{CmdSpec, Runner, SystemRunner};
 use crate::github::GitHub;
 use crate::validate::{Report, Severity, validate};
@@ -204,6 +206,21 @@ fn required_labels(file: &FlowFile) -> BTreeSet<String> {
     labels
 }
 
+fn describe_blocking(spec: &BlockingSpec<'_>, base: &str) -> String {
+    match spec {
+        BlockingSpec::Explicit([]) => "none (required_checks = [] blocks nothing)".to_string(),
+        BlockingSpec::Explicit(list) => format!("exactly [{}]", list.join(", ")),
+        BlockingSpec::Required { extra: [] } => {
+            format!("the required status checks of `{base}`, read when the decision is made")
+        }
+        BlockingSpec::Required { extra } => format!(
+            "the required status checks of `{base}`, read when the decision is made, plus [{}]",
+            extra.join(", ")
+        ),
+        BlockingSpec::All => "all (every check run and commit status on the judged commit)".into(),
+    }
+}
+
 fn check_branch_protection(
     repo: &RepoEntry,
     flow: &crate::config::Flow,
@@ -211,13 +228,41 @@ fn check_branch_protection(
     report: &mut Report,
 ) {
     let slug = Some(repo.slug.as_str());
-    let listed = &flow.outcome.required_checks;
-    if listed.is_empty() {
+    let spec = flow.outcome.spec();
+    report.push(
+        slug,
+        Severity::Note,
+        format!(
+            "flow `{}`: blocking checks are {}",
+            flow.name,
+            describe_blocking(&spec, &flow.base)
+        ),
+    );
+    let merging = flow.outcome.mode == crate::config::OutcomeMode::MergeWhen;
+    if matches!(spec, BlockingSpec::Explicit(list) if list.is_empty()) {
         return;
     }
-    let merging = flow.outcome.mode == crate::config::OutcomeMode::MergeWhen;
-    match online.github.required_checks(&repo.slug, &flow.base) {
-        Ok(Some(protected)) => {
+    let protection = online.github.required_checks(&repo.slug, &flow.base);
+    match (&spec, protection) {
+        (BlockingSpec::All, _) => {}
+        (BlockingSpec::Required { .. }, Ok(Some(protected))) if !protected.is_empty() => {}
+        (BlockingSpec::Required { .. }, Ok(_)) => report.push(
+            slug,
+            Severity::Error,
+            format!(
+                "flow `{}`: branch `{}` has no required status checks, so the blocking checks are undefined and every decision fails closed as `blocking_unresolved`",
+                flow.name, flow.base
+            ),
+        ),
+        (BlockingSpec::Required { .. }, Err(err)) => report.push(
+            slug,
+            Severity::Error,
+            format!(
+                "cannot read the branch protection of `{}`, so every decision of flow `{}` fails closed as `blocking_unresolved`: {err}",
+                flow.base, flow.name
+            ),
+        ),
+        (BlockingSpec::Explicit(listed), Ok(Some(protected))) => {
             for check in listed.iter().filter(|c| !protected.contains(c)) {
                 report.push(
                     slug,
@@ -233,13 +278,13 @@ fn check_branch_protection(
                     slug,
                     if merging { Severity::Error } else { Severity::Warning },
                     format!(
-                        "flow `{}`: branch protection of `{}` also requires `{check}`, which the flow does not wait for",
+                        "flow `{}`: branch protection of `{}` also requires `{check}`, which the flow does not wait for (weaker than the branch protection; use blocking = \"required\" or \"all\")",
                         flow.name, flow.base
                     ),
                 );
             }
         }
-        Ok(None) => report.push(
+        (BlockingSpec::Explicit(_), Ok(None)) => report.push(
             slug,
             if merging { Severity::Error } else { Severity::Warning },
             format!(
@@ -247,7 +292,7 @@ fn check_branch_protection(
                 flow.name, flow.base
             ),
         ),
-        Err(err) => report.push(
+        (BlockingSpec::Explicit(_), Err(err)) => report.push(
             slug,
             if err.is_plan_limit() && !merging {
                 Severity::Warning
@@ -366,6 +411,7 @@ identity = "pr-shepherd"
 kind = "nanna_clean"
 [flow.outcome]
 mode = "draft_pr"
+required_checks = []
 "#;
 
     struct Catalog(Result<Vec<&'static str>, &'static str>);
@@ -422,6 +468,9 @@ mode = "draft_pr"
             unreachable!()
         }
         fn check_runs(&self, _: &str, _: &str) -> Result<Vec<CheckRun>, GitHubError> {
+            unreachable!()
+        }
+        fn commit_statuses(&self, _: &str, _: &str) -> Result<Vec<CheckRun>, GitHubError> {
             unreachable!()
         }
         fn mark_ready(&self, _: &str, _: u64) -> Result<(), GitHubError> {
@@ -486,7 +535,12 @@ mode = "draft_pr"
     ];
 
     fn messages(report: &Report) -> Vec<String> {
-        report.findings.iter().map(|f| f.message.clone()).collect()
+        report
+            .findings
+            .iter()
+            .filter(|f| f.severity != Severity::Note)
+            .map(|f| f.message.clone())
+            .collect()
     }
 
     #[test]
@@ -507,7 +561,16 @@ mode = "draft_pr"
             builder: None,
         };
         let report = validate_online(&config, &online, None);
-        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(messages(&report).is_empty(), "{:?}", report.findings);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Note
+                    && f.message.contains("blocking checks are none")),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -557,7 +620,7 @@ mode = "draft_pr"
 
     fn protection_flow(mode: &str, checks: &str) -> String {
         let flows = FLOWS.replace(
-            "[flow.outcome]\nmode = \"draft_pr\"",
+            "[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []",
             &format!("[flow.outcome]\nmode = \"{mode}\"\nrequired_checks = [{checks}]"),
         );
         if mode == "merge_when" {
@@ -647,6 +710,120 @@ mode = "draft_pr"
             denied
                 .iter()
                 .any(|(s, m)| *s == Severity::Error && m.contains("HTTP 403"))
+        );
+    }
+
+    fn flows_with(lines: &str) -> String {
+        FLOWS.replace("required_checks = []", lines)
+    }
+
+    fn all_findings(flows: &str, github: &FakeGitHub) -> Vec<(Severity, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo(dir.path());
+        std::fs::write(dir.path().join("inchworm.toml"), flows).unwrap();
+        let catalog = Catalog(Ok(vec!["rust-implementer", "pr-shepherd", "auditor"]));
+        let online = Online {
+            catalog: &catalog,
+            github,
+            branch_protection: true,
+            builder: None,
+        };
+        validate_online(&config, &online, None)
+            .findings
+            .into_iter()
+            .map(|f| (f.severity, f.message))
+            .collect()
+    }
+
+    fn note(findings: &[(Severity, String)]) -> String {
+        let notes: Vec<_> = findings
+            .iter()
+            .filter(|(s, m)| *s == Severity::Note && m.contains("blocking checks are"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{findings:?}");
+        notes[0].1.clone()
+    }
+
+    #[test]
+    fn validate_prints_the_effective_blocking_set_of_every_form() {
+        let github = github_with_labels(ALL_LABELS);
+        github.set_protection("o/r", "main", &["build"]);
+        let required = all_findings(&flows_with(""), &github);
+        assert!(note(&required).contains("the required status checks of `main`"));
+        assert!(!note(&required).contains("plus"));
+        let extra = all_findings(&flows_with("extra = [\"lint\"]"), &github);
+        assert!(note(&extra).contains("plus [lint]"), "{extra:?}");
+        let all = all_findings(&flows_with("blocking = \"all\""), &github);
+        assert!(
+            note(&all).contains("all (every check run and commit status"),
+            "{all:?}"
+        );
+        let list = all_findings(&flows_with("required_checks = [\"build\"]"), &github);
+        assert!(note(&list).contains("exactly [build]"), "{list:?}");
+        let none = all_findings(&flows_with("required_checks = []"), &github);
+        assert!(
+            note(&none).contains("none (required_checks = [] blocks nothing)"),
+            "{none:?}"
+        );
+        for findings in [&required, &extra, &all, &list, &none] {
+            assert!(
+                findings.iter().all(|(s, _)| *s != Severity::Error),
+                "{findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_required_form_is_an_error_when_the_decision_would_fail_closed() {
+        let absent = github_with_labels(ALL_LABELS);
+        let findings = all_findings(&flows_with(""), &absent);
+        assert!(
+            findings.iter().any(|(s, m)| *s == Severity::Error
+                && m.contains("no required status checks")
+                && m.contains("blocking_unresolved")),
+            "{findings:?}"
+        );
+        let empty = github_with_labels(ALL_LABELS);
+        empty.set_protection("o/r", "main", &[]);
+        assert!(
+            all_findings(&flows_with(""), &empty)
+                .iter()
+                .any(|(s, m)| *s == Severity::Error && m.contains("blocking_unresolved"))
+        );
+        let denied = github_with_labels(ALL_LABELS);
+        denied.fail_protection_with("HTTP 403");
+        let findings = all_findings(&flows_with("extra = [\"lint\"]"), &denied);
+        assert!(
+            findings.iter().any(|(s, m)| *s == Severity::Error
+                && m.contains("HTTP 403")
+                && m.contains("blocking_unresolved")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn all_and_the_empty_explicit_list_do_not_depend_on_the_branch_protection() {
+        let denied = github_with_labels(ALL_LABELS);
+        denied.fail_protection_with("HTTP 403");
+        for lines in ["blocking = \"all\"", "required_checks = []"] {
+            let findings = all_findings(&flows_with(lines), &denied);
+            assert!(
+                findings.iter().all(|(s, _)| *s == Severity::Note),
+                "{lines}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_list_weaker_than_the_protection_is_still_warned_about() {
+        let github = github_with_labels(ALL_LABELS);
+        github.set_protection("o/r", "main", &["build", "test"]);
+        let findings = all_findings(&flows_with("required_checks = [\"build\"]"), &github);
+        assert!(
+            findings.iter().any(|(s, m)| *s == Severity::Warning
+                && m.contains("`test`")
+                && m.contains("weaker than the branch protection")),
+            "{findings:?}"
         );
     }
 
@@ -840,7 +1017,7 @@ mode = "draft_pr"
             branch_protection: true,
             builder: Some(&ok),
         };
-        assert!(validate_online(&config, &online, None).findings.is_empty());
+        assert!(messages(&validate_online(&config, &online, None)).is_empty());
         assert_eq!(ok.built.borrow().as_slice(), [dir.path().to_path_buf()]);
 
         let bad = Builder {

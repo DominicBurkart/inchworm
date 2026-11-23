@@ -18,7 +18,7 @@ fn good_repo(root: &Path) {
     write(
         root,
         "inchworm.toml",
-        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\n",
+        "[auditor]\nruns_in = { kind = \"nanna\", identity = \"auditor\" }\n[[flow]]\nname = \"issue\"\ntrigger = { kind = \"label\", label = \"inchworm\" }\n[[flow.step]]\nname = \"implement\"\nidentity = \"rust-implementer\"\n[[flow.judge]]\nkind = \"nanna_clean\"\n[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []\n",
     );
     write(
         root,
@@ -257,7 +257,7 @@ const AUDITOR: &str = "[auditor]\nruns_in = { kind = \"nanna\", identity = \"aud
 fn require_build_check(fakes: &Fakes, outcome: &str) {
     let flows = std::fs::read_to_string(fakes.repo.join("inchworm.toml")).unwrap();
     let mut flows = flows.replace(
-        "[flow.outcome]\nmode = \"draft_pr\"",
+        "[flow.outcome]\nmode = \"draft_pr\"\nrequired_checks = []",
         &format!("[flow.outcome]\n{outcome}\nrequired_checks = [\"build\"]"),
     );
     if outcome.contains("merge_when") {
@@ -642,6 +642,7 @@ model = "gemma4:e4b"
 min_score = 7
 [flow.outcome]
 mode = "draft_pr"
+required_checks = []
 "#
         ),
     );

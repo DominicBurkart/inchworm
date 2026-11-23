@@ -19,6 +19,7 @@ const MAX_GITFILE_BYTES: u64 = 4096;
 pub enum Severity {
     Error,
     Warning,
+    Note,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +73,7 @@ impl Report {
             let level = match finding.severity {
                 Severity::Error => "error",
                 Severity::Warning => "warning",
+                Severity::Note => "note",
             };
             let scope = finding.repo.as_deref().unwrap_or("config");
             let _ = writeln!(out, "{level}: [{scope}] {}", finding.message);
@@ -564,6 +566,7 @@ min_score = 7
 
 [flow.outcome]
 mode = "draft_pr"
+required_checks = []
 "#;
 
     fn write(root: &Path, relative: &str, text: &str) {
@@ -1022,7 +1025,7 @@ mode = "draft_pr"
     fn enabling_merge_when_is_a_warning_that_points_at_the_capability_issue() {
         let f = fixture();
         let merging = FLOWS.replace(
-            "mode = \"draft_pr\"",
+            "mode = \"draft_pr\"\nrequired_checks = []",
             "mode = \"merge_when\"\nrequired_checks = [\"Tests\"]",
         );
         let refused = run_with(&f, &merging);
