@@ -65,8 +65,8 @@ in `~/.config/nanna/agents/`, plus the prompt files the cards reference under
 `~/.config/nanna/agents/prompts/`. The examples in this README use these five:
 `auditor`, `rust-implementer`, `pr-shepherd`, `reviewer` and `docs-writer`.
 Each card lists the repositories it may work on in `[scope] repos`, as
-`github.com/OWNER/NAME`. A working set is under `.nanna/catalog/` in
-marigold PR #455 (DominicBurkart/marigold).
+`github.com/OWNER/NAME`. `nanna agents list` shows what nanna loaded, and
+"Cards that narrow the global ones" below has a card to start from.
 
 `NANNA_CONFIG_DIR` must point at the parent of `agents/`, not at `agents/`
 itself. It is needed only when you do not use the default location, and in the
@@ -165,8 +165,7 @@ The unit sets `PATH` and `NANNA_CONFIG_DIR`; edit both for your machine. Put `GH
 ## Set up a repository
 
 The three files `validate` checks are listed under "Install". A repository
-that nanna can run also needs agent cards and a container image. Marigold
-PR #455 (DominicBurkart/marigold) is a complete worked example. The layout,
+that nanna can run also needs agent cards and a container image. The layout,
 with the file names it uses:
 
 - `inchworm.toml`: the flows and the `[auditor]`; see "Project file".
@@ -229,10 +228,32 @@ packages = {
 ```
 
 `.devcontainer/devcontainer.json` can be as small as
-`{"name": "NAME", "workspaceFolder": "/workspace"}`. The marigold example
-defines `devContainerImage` with `nix2container.buildImage`. Prove it builds
+`{"name": "NAME", "workspaceFolder": "/workspace"}`. Define
+`devContainerImage` with `nix2container.buildImage`. Prove it builds
 with `inchworm validate --build-images`, on a repository you trust: it runs the
 repository's Nix code on your machine (see "Commands").
+
+### Decide which checks block
+
+Before a run counts as done, inchworm waits for CI on the exact pull request
+head and the flow's blocking checks decide the outcome; see "Blocking checks"
+under "Flows" for the full rules. Pick one per flow in `[flow.outcome]`:
+
+- Nothing set, or `blocking = "required"`: the required status checks of the
+  flow's base branch, read from GitHub when the decision is made. If the base
+  branch has no branch protection, protects no checks, or the protection
+  cannot be read, every run ends as `blocking_unresolved` (`validate --online`
+  reports an error). This includes a private repository on a plan without
+  branch protection. Add `extra = ["name"]` to require more checks.
+- `blocking = "all"`: every check run and commit status on the judged commit.
+  A `skipped` or `neutral` check counts as satisfied here, and only here; at
+  least one check must have succeeded.
+- `required_checks = ["name", ...]`: an explicit list. A `skipped` or
+  `neutral` check on that list fails the run as `ci_red`. `required_checks = []`
+  blocks nothing.
+
+For a repository without branch protection, set `blocking = "all"` or
+`required_checks`.
 
 ## First run
 
@@ -243,7 +264,9 @@ Do this before you enable the daemon, in this order.
 2. Online check: `inchworm validate --online`. It checks the `auditor`
    identity, every step identity (`nanna agents list --repo`), the four
    labels (and prints the `gh label create` command for a missing one) and
-   branch protection. Do not go on until it exits `0`.
+   the blocking checks of every flow: it prints each flow's effective set as a
+   `note:` line and reports an error when `blocking = "required"` cannot
+   resolve. Do not go on until it exits `0`.
 3. Open a throwaway issue in a repository you do not mind experimenting in,
    with a small, safe request, such as "add one line to the README". It must
    carry the flow's trigger label and be written by the repository owner, a
@@ -278,8 +301,13 @@ Close the pull request and delete its branch if you do not want them.
 
 - Every flow ends in a draft pull request that a human reads and merges. Keep
   `[merge] allow = false`, which is the default. See "Merging has no default".
-- Merging is unreachable today: every entry point passes a denied merge grant,
-  so even a `merge_when` flow degrades to a draft pull request.
+- Merging is off unless two things are both set in the repository's own
+  `inchworm.toml`: `[merge] allow = true` and a flow with
+  `mode = "merge_when"`. `inchworm run` and `inchworm daemon` both honour them,
+  so a project that sets both gets pull requests merged without a human.
+  Neither is set by default, and this guide never needs them: do not enable
+  either until you have watched draft-only runs on that repository, and see
+  "Merging has no default" first.
 - Safety rests on container isolation in nanna, the protected path list in
   `.nanna/protected.toml`, and draft pull requests. A configured auditor or
   offramp is not extra protection yet, and the `llm` judge is a score, not a
@@ -289,8 +317,10 @@ Close the pull request and delete its branch if you do not want them.
 ## Troubleshooting
 
 - **`inchworm: command not found`**: `~/.cargo/bin` is not on `PATH`.
-- **`nanna_bin ... is not an executable file`**: exit `1`, scope `[config]`,
-  and the daemon refuses to start. Fix the path and `chmod +x` the binary. A
+- **`nanna_bin ... is not an executable file`**: `inchworm validate` reports
+  it as an error in scope `[config]` and exits `1`; `inchworm daemon` refuses
+  to start with the same message and exits `2`. Fix the path and `chmod +x`
+  the binary. A
   bare name is looked up on `PATH`, and under systemd that is the unit's
   `Environment=PATH=`, not your shell's.
 - **A label does not exist**: from `validate --online`. Run the
@@ -306,8 +336,18 @@ Close the pull request and delete its branch if you do not want them.
 - **`may not override a protected identity`**: remove the repository's
   `auditor` card; it exists only in the global catalog.
 - **Branch protection HTTP 403 "Upgrade to GitHub Pro"**: a private repository
-  on a free plan. For `draft_pr` flows `validate --online` reports a warning;
-  `--skip-branch-protection` skips the lookup.
+  on a free plan, so the required checks cannot be read. A flow with the
+  default `blocking = "required"` then fails every run as
+  `blocking_unresolved`, and `validate --online` reports an error. Set
+  `blocking = "all"` or `required_checks = [...]` on the flow.
+  `--skip-branch-protection` leaves the blocking-check lines out of the report;
+  it does not change what a run does.
+- **A run fails as `blocking_unresolved`**: the base branch has no required
+  status checks, has no branch protection, or the protection could not be
+  read. See "Decide which checks block".
+- **A run fails as `ci_red` on a `skipped` check**: only `blocking = "all"`
+  treats `skipped` and `neutral` as satisfied; a skipped job named in
+  `required_checks` or required by the branch protection fails the run.
 - **`gh` rate limit**: HTTP 403 or 429 with "rate limit exceeded". Check
   `gh api rate_limit`, raise `poll_secs`, and make sure `gh` is
   authenticated; every tool on the machine shares one quota.
